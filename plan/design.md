@@ -171,7 +171,7 @@ docker engine ── keeps container alive (restart: unless-stopped) ──► d
 ### 4.3 Sequence — one backtest run
 
 ```
-backtest CLI: config(mode=backtest, start, end, base_seed, data_vendor) 
+backtest CLI: config(mode=backtest, start, end, base_seed, data_vendor)
    │
    ├─ build run manifest: hash(config) + hash(data snapshot) + git commit + seed
    ├─ wire: VirtualClock, HistoricalDataProvider(asof-bound), SimBroker(fees+slippage)

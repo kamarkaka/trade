@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keep GitHub Actions (checkout, setup-python, …) current via reviewable PRs,
+  # since we intentionally use major-version tags rather than SHA pins.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # Python dependencies (dev toolchain now; runtime deps from M1 onward).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

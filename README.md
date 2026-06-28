@@ -21,6 +21,43 @@ A single-user service that runs continuously and triggers a configurable number 
 - **Multi-strategy** — multiple strategies, each on its own schedule, dispatched by the orchestrator.
 - **Deployment** — Docker image via docker compose, with an optional read-only, password-gated monitoring web UI.
 
+## Development
+
+Requires **Python 3.11+**.
+
+### Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"              # editable package + dev toolchain
+pre-commit install                   # optional: run the gate automatically on each git commit
+```
+
+### Build, lint & test
+
+Run the same gate CI enforces (lint, format, strict type-check, file hygiene) plus the tests:
+
+```bash
+pre-commit run --all-files           # ruff (lint + format), mypy --strict (src), file hygiene
+pytest -q --cov                      # unit tests
+```
+
+Or run the tools individually:
+
+```bash
+ruff check .            # lint
+ruff format --check .   # formatting
+mypy src                # strict type-check
+pytest -q               # tests
+```
+
+> Tip: `pre-commit` only inspects files git tracks. If you just created files and haven't staged them, run `git add -A` first — otherwise the hooks report "no files to check".
+
+### Continuous integration
+
+Every push and pull request runs the pre-commit gate and the test suite via GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Action and dependency updates are proposed automatically by Dependabot ([`.github/dependabot.yml`](.github/dependabot.yml)).
+
 ## License
 
 See [LICENSE](LICENSE).

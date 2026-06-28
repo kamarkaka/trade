@@ -125,8 +125,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Intent.** Stand up the repository, tooling, and the load-bearing abstractions the whole system is built on: core domain types and Protocol interfaces (so live/backtest parity is structural from day one), the layered+validated pydantic config, structured logging with secret scrubbing, the SQLite state layer + migration runner, the shared test doubles (FakeClock/FakeBroker/FakeMarketData), and a CLI skeleton. Nothing here talks to a network or places an order.
 >
-> **Prerequisites:** None (greenfield).  
-> **New libraries:** `python>=3.11`, `uv (or poetry)`, `ruff`, `mypy`, `pytest`, `pytest-cov`, `pre-commit`, `pydantic`, `pydantic-settings`, `pyyaml`, `structlog`, `typer`  
+> **Prerequisites:** None (greenfield).
+> **New libraries:** `python>=3.11`, `uv (or poetry)`, `ruff`, `mypy`, `pytest`, `pytest-cov`, `pre-commit`, `pydantic`, `pydantic-settings`, `pyyaml`, `structlog`, `typer`
 >
 > **Exit criteria.** `config` loads + validates the §11 example YAML; all core types and Protocols import and typecheck (mypy clean); the migration runner builds the initial SQLite schema (WAL on); `trader status` runs and prints mode + 'not authenticated'; ruff + mypy + pytest + pre-commit all green in CI. No network, no orders.
 
@@ -403,8 +403,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Intent.** Build an in-house, fully-owned Schwab API client (no third-party broker SDK imported) parity-checked against schwab-py/Schwabdev. It provides an httpx transport with a token-bucket rate limiter (~120/min) and tenacity retry/backoff on 429/5xx, an OAuth authorization-code flow with a local HTTPS loopback callback, a SQLite token store with automatic access-token refresh, 401→refresh→retry, 7-day refresh-token age tracking that fires a re-auth alert, and READ-ONLY safe mode when the refresh token is dead. On top of the transport it adds typed models and read endpoints for quotes, pricehistory, and accountNumbers (hashed id), then a SchwabMarketData provider adapter implementing the core MarketDataProvider interface. All verified by recorded-HTTP contract tests using respx and an injected Clock, plus a documented security review of credential handling. NO order placement is built in this milestone — everything is read-only.
 >
-> **Prerequisites:** M0 (core types/Protocols, config, structured logging+scrubbing, SQLite state, CLI).  
-> **New libraries:** `httpx`, `tenacity`, `respx`, `freezegun`  
+> **Prerequisites:** M0 (core types/Protocols, config, structured logging+scrubbing, SQLite state, CLI).
+> **New libraries:** `httpx`, `tenacity`, `respx`, `freezegun`
 >
 > **Exit criteria.** The first-party client can complete the OAuth authorization-code exchange and (via recorded/mocked HTTP, with a manual smoke path documented for real credentials) fetch live quotes and daily candles for the configured universe through the SchwabMarketData adapter; the access token auto-refreshes and a 401 transparently triggers refresh-then-retry; the refresh-token 7-day age alert fires in a unit test using an injected clock; rate-limit (429) backoff and 5xx retry are exercised by contract tests; a dead refresh token flips the client into READ-ONLY safe mode and raises a typed alert instead of crash-looping; tokens are scrubbed from all logs (asserted in tests); all recorded-HTTP contract tests pass in CI with no live network calls; and a written security review of the credential-handling code path is completed. No order-placement code exists; nothing can place a real-money order in M1.
 
@@ -732,8 +732,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Intent.** Build the event-driven backtest harness that runs the SAME strategy/decision code over historical data: VirtualClock, an asof-bound HistoricalDataProvider backed by a Parquet cache, a realistic SimBroker (slippage/fees/partials), portfolio/P&L, the engine loop (single strategy here; multi-strategy interleave is added in M3), a reproducibility manifest, and a report. This milestone OWNS backtest/engine.py and backtest/report.py (later milestones update them).
 >
-> **Prerequisites:** M0; M1 (SchwabMarketData adapter is used by the M2.4 ingestion step).  
-> **New libraries:** `pandas`, `pyarrow`, `duckdb`, `numpy`  
+> **Prerequisites:** M0; M1 (SchwabMarketData adapter is used by the M2.4 ingestion step).
+> **New libraries:** `pandas`, `pyarrow`, `duckdb`, `numpy`
 >
 > **Exit criteria.** A trivial single strategy backtests over cached daily history end-to-end via `trader backtest`; the run is deterministic and a golden run reproduces bit-for-bit; no-lookahead is enforced structurally (asof) and tested; SimBroker fills model slippage/fees/partials. No live trading.
 
@@ -1046,8 +1046,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Intent.** Wire up the full multi-strategy dispatch path that runs identically in backtest and live `paper` mode. Build the seeded jitter module, an XNYS trading-calendar wrapper, merged time-sorted slot/trigger generation with stable tie-break, a durable fired-slot ledger, a StrategyRegistry + bindings loader feeding two stub strategies (threshold, zscore_revert), Decision-to-Order sizing, a `run_cycle` orchestrator serialized by a single global cycle lock with per-strategy attribution, the multi-strategy backtest interleave, and an APScheduler daemon that fires per-(strategy,slot) jobs through the calendar+jitter+ledger into a paper-mode `run_cycle`. SAFETY: everything stays read-only or paper (SimBroker/FakeBroker) — no real orders before M5.
 >
-> **Prerequisites:** M0, M2 (reuses backtest/engine.py + backtest/report.py, SimBroker, the migration runner, and FakeBroker/FakeClock test doubles).  
-> **New libraries:** `exchange_calendars`, `apscheduler<4`, `numpy`  
+> **Prerequisites:** M0, M2 (reuses backtest/engine.py + backtest/report.py, SimBroker, the migration runner, and FakeBroker/FakeClock test doubles).
+> **New libraries:** `exchange_calendars`, `apscheduler<4`, `numpy`
 >
 > **Exit criteria.** Two strategies (threshold + zscore_revert) configured on different per-strategy schedules run successfully in BOTH the multi-strategy backtest interleave AND live `paper` cycles, each dispatched to the correct strategy by strategy_id; the seeded jitter is reproducible per (seed,date,strategy_id,slot_id); the XNYS calendar wrapper correctly gates sessions/half-days with clamp/skip and DST-stable open/close; merged triggers are time-sorted with the stable (fire_ts, strategy_id, slot_id) tie-break; the fired-slot ledger enforces exactly-once per (date,strategy_id,slot_id) across crashes/double-scheduling; overlapping fires serialize through the single global cycle lock; per-strategy attribution appears in the audit log and backtest report; and a strategy exception is isolated without crashing the daemon. All validated by unit + integration tests with injected fakes (FakeBroker/SimBroker, fake Clock, respx-style HTTP avoided since M3 is local) and NO real-money side effects (SimBroker/FakeBroker only — real orders deferred to M5).
 
@@ -1438,8 +1438,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Intent.** Run the full pipeline in PAPER mode against live quotes (SimBroker fills, no real orders) with the real risk gate, reconciliation, audit trail, alerting, and heartbeat — then package the daemon as a Docker image deployed via docker compose with durable volumes and a healthcheck. This is the dress rehearsal before real money.
 >
-> **Prerequisites:** M0, M2, M3 (orchestrator run_cycle + global cycle lock + attribution; replaces M3's approve-all risk stub with the real gate).  
-> **New libraries:** `(docker / docker compose — infra, not pip)`  
+> **Prerequisites:** M0, M2, M3 (orchestrator run_cycle + global cycle lock + attribution; replaces M3's approve-all risk stub with the real gate).
+> **New libraries:** `(docker / docker compose — infra, not pip)`
 >
 > **Exit criteria.** A multi-day in-container paper soak runs with no manual intervention except the weekly re-auth; state survives container recreation; the risk gate is the single chokepoint for every order; reconciliation, alerting, and heartbeat all work. Still zero real orders (SimBroker).
 
@@ -1731,8 +1731,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Intent.** Introduce the FIRST real-money capability behind hard safety gates: the Schwab order endpoints + SchwabBroker adapter, idempotent order placement (write-ahead client order id, reuse-on-retry, reconcile-before-resend), the kill switch, the PDT rule, and a go-live double-confirm. Real orders happen only in the final, manual, smallest-size verification step.
 >
-> **Prerequisites:** M0, M1 (Schwab client/transport), M3 (orchestrator/sizing), M4 (risk gate, reconciliation, kill-switch infra).  
-> **New libraries:** `(none new — reuses M1 httpx client + M4 risk/reconcile)`  
+> **Prerequisites:** M0, M1 (Schwab client/transport), M3 (orchestrator/sizing), M4 (risk gate, reconciliation, kill-switch infra).
+> **New libraries:** `(none new — reuses M1 httpx client + M4 risk/reconcile)`
 >
 > **Exit criteria.** Small-size live trades match intent; idempotency prevents duplicate fills under retry (property-tested); the kill switch halts new orders and survives restart; PDT enforcement works; going live requires an explicit double-confirm; reconciliation is clean; deployed via `docker compose up -d`.
 
@@ -1962,8 +1962,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Intent.** Turn the placeholder strategy layer into a real, extensible one without touching the stable Strategy interface or the live decision path. Deliver a strategy development guide + copyable template, at least one real strategy (zscore_revert) plus shared indicator helpers, an OFFLINE-ONLY vectorized parameter-research harness that reuses the same indicator math but never runs live, and per-strategy + combined backtest comparison/reporting. Exit: adding a new strategy is a pure config binding change plus a class swap, and backtests are reproducible both per-strategy and combined.
 >
-> **Prerequisites:** M0, M2 (engine/report/manifest), M3 (StrategyRegistry M3.6, bindings loader M3.7, attribution M3.9).  
-> **New libraries:** `jinja2`, `matplotlib`  
+> **Prerequisites:** M0, M2 (engine/report/manifest), M3 (StrategyRegistry M3.6, bindings loader M3.7, attribution M3.9).
+> **New libraries:** `jinja2`, `matplotlib`
 >
 > **Exit criteria.** Adding a new strategy requires only (a) a config binding entry (id/name/params/universe/slots) and (b) a strategy class registered in the StrategyRegistry that passes tests/unit/test_strategy_contract.py - no changes to orchestrator, risk gate, broker, or scheduler. At least one real strategy (zscore_revert, mean-reversion using shared indicators) is implemented and unit-tested. A strategy development guide + copyable template exist. `trader backtest` over a >=2-strategy config emits a per-strategy AND combined report (HTML + deterministic JSON) with a run manifest, and the multi-strategy golden-run test (tests/backtest/test_golden_multistrategy.py) reproduces it bit-for-bit across runs and against a committed golden. The optional vectorized parameter-research harness exists in an isolated src/trader/research package proven (by test) to import no broker/auth/schwab/execution/orchestrator code, so it can never touch the live path. Nothing in M6 places real orders: every validation is unit-tested with injected fakes/VirtualClock or run as an offline/backtest-only CLI command (no real-money side effects, consistent with the pre-M5 safety rule).
 
@@ -2244,8 +2244,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Intent.** Build the password-gated, strictly read-only production monitoring UI as a separate FastAPI service (its own container) per §19 and §16.6. It opens the trading state SQLite DB read-only (sqlite mode=ro + PRAGMA query_only=ON), exposes ONLY GET endpoints plus login/logout POSTs, authenticates a single admin via argon2id with a signed stateless session cookie (CSRF + lockout), renders Jinja2+HTMX dashboards with auto-refresh, and is fronted by a Caddy TLS reverse proxy on an internal compose network. The service has no broker code path and writes nothing to the trading system; tests assert no write endpoints exist, the DB handle is read-only, secrets never appear in responses, and a UI crash never affects the trader.
 >
-> **Prerequisites:** M0, M3, M4 (read-only over the consolidated §12 state schema: orders/fills/positions/attributed_position/audit/kill-switch/heartbeat/fired-slot ledger/tokens). Read-only; no broker import.  
-> **New libraries:** `fastapi`, `uvicorn[standard]`, `jinja2`, `itsdangerous`, `argon2-cffi`, `python-multipart`, `httpx (test client / respx already present)`  
+> **Prerequisites:** M0, M3, M4 (read-only over the consolidated §12 state schema: orders/fills/positions/attributed_position/audit/kill-switch/heartbeat/fired-slot ledger/tokens). Read-only; no broker import.
+> **New libraries:** `fastapi`, `uvicorn[standard]`, `jinja2`, `itsdangerous`, `argon2-cffi`, `python-multipart`, `httpx (test client / respx already present)`
 >
 > **Exit criteria.** Admin logs in over TLS (Caddy :443, the only exposed port) and monitors live data across all §19.3 surfaces (system/heartbeat/mode/kill-switch, per-strategy decisions/positions/P&L, account, orders/fills, alerts, config, token-age/re-auth). Automated tests prove: the service exposes NO write endpoints (only GET + login/logout POST), the state DB handle is read-only (mode=ro + PRAGMA query_only; any write raises), trader.web imports no broker/schwab/execution/auth code path, and no OAuth tokens/app secret/password hash appear in any response or rendered page. A request-level exception handler plus separate-container isolation guarantee a UI crash never affects the trader (the trader container stays healthy when web is stopped/crashes). All M7 unit tests pass via injected settings/clock + a seeded temp DB and FastAPI TestClient (no live network, no wall clock). Nothing in M7 places or can place an order — it is strictly read-only monitoring.
 

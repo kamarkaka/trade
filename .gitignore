@@ -23,6 +23,12 @@ secrets/
 *.sqlite-*
 *.parquet
 token*.json
+# TLS cert/key material (OAuth loopback callback M1.5, Caddy/web M7)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
 
 # OS / editor
 .DS_Store

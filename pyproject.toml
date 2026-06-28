@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trader"
+version = "0.0.0"
+description = "Automated equity trading program — scheduled, multi-strategy, backtestable, Schwab API"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Meng Cao" }]
+dependencies = []
+
+[project.optional-dependencies]
+# Dev/tooling only in M0.1. Runtime deps are added per milestone (M1+).
+# Exact versions are pinned in requirements-dev.txt (the lockfile substitute).
+dev = [
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "pytest>=8",
+  "pytest-cov>=5",
+  "pre-commit>=3.8",
+]
+
+[project.scripts]
+# Placeholder entry point in M0.1; the full Typer app is built in M0.9.
+trader = "trader.app.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trader"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+warn_unused_configs = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers --import-mode=importlib"
+markers = [
+  "unit: fast isolated unit test (CI default)",
+  "integration: cross-component test using fakes",
+  "network: opt-in test that hits the network (excluded from CI)",
+]
+
+[tool.coverage.run]
+source = ["src/trader"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true

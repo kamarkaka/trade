@@ -1,0 +1,25 @@
+# Pre-commit hooks. Revs are pinned (run `pre-commit autoupdate` to bump).
+# The mypy hook runs in the active venv (language: system) so it sees project deps.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.20
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+      - id: check-yaml
+      - id: check-toml
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict, src)
+        entry: python -m mypy src
+        language: system
+        types: [python]
+        pass_filenames: false

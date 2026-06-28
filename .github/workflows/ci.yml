@@ -25,11 +25,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install (dev deps + editable project)
+      - name: Install (dev deps + editable project with runtime deps)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-          pip install -e . --no-deps
+          pip install -e .
 
       # Single source of truth for lint/format/type/hygiene: pre-commit owns the
       # pinned ruff + the strict-mypy (system) hook + the file-hygiene hooks, so

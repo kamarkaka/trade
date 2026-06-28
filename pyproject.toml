@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Meng Cao" }]
-dependencies = []
+dependencies = [
+  "pydantic>=2",  # config validation (M0.4); more runtime deps added per milestone
+]
 
 [project.optional-dependencies]
 # Dev/tooling only in M0.1. Runtime deps are added per milestone (M1+).

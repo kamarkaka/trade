@@ -76,6 +76,37 @@ def test_fakebroker_dedupe_by_client_id() -> None:
     assert b.submit_order(order) == b.submit_order(order)  # at-most-once
 
 
+def test_fakebroker_partial_fill() -> None:
+    b = FakeBroker()
+    b.fill_quantity = 1
+    bid = b.submit_order(_order(quantity=3))
+    fill = b.get_order(bid)
+    assert fill.quantity == 1
+    assert fill.status is OrderStatus.PARTIAL_FILL
+
+
+def test_fakebroker_timeout_but_order_landed() -> None:
+    # Simulate "request reached the broker, response was lost": submit raises, but
+    # the fill is recoverable by client order id (idempotency/reconciliation path).
+    b = FakeBroker()
+    b.fail_next_submit = True
+    b.record_on_timeout = True
+    order = _order(client_order_id="c-lost")
+    with pytest.raises(TimeoutError):
+        b.submit_order(order)
+    recovered = b.find_by_client_id("c-lost")
+    assert recovered is not None
+    assert recovered.client_order_id == "c-lost"
+
+
+def test_fakebroker_timeout_without_landing() -> None:
+    b = FakeBroker()
+    b.fail_next_submit = True  # record_on_timeout stays False
+    with pytest.raises(TimeoutError):
+        b.submit_order(_order(client_order_id="c-none"))
+    assert b.find_by_client_id("c-none") is None
+
+
 def test_fakebroker_positions_and_account() -> None:
     b = FakeBroker()
     b.set_position(Position(symbol="AAPL", quantity=10, avg_price=D("100"), market_value=D("1010")))
@@ -105,5 +136,8 @@ def test_fake_market_data_bars_filtered_by_asof() -> None:
         for t in days
     ]
     md = FakeMarketDataProvider(bars={"AAPL": bars})
-    got = md.get_bars("AAPL", days[0], days[2], "daily", asof=days[1])  # excludes day 2
+    got = md.get_bars("AAPL", days[0], days[2], "daily", asof=days[1])  # asof excludes day 2
     assert [b.ts for b in got] == days[:2]
+    # start/end window clips independently of asof
+    windowed = md.get_bars("AAPL", days[1], days[2], "daily", asof=days[2])
+    assert [b.ts for b in windowed] == days[1:]

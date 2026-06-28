@@ -39,7 +39,9 @@ class FakeBroker:
         self.cancelled: list[str] = []
         self.default_fill_price = default_fill_price
         self.fill_status = fill_status
+        self.fill_quantity: int | None = None  # < order qty => PARTIAL_FILL; None => full
         self.fail_next_submit = False  # raise once (simulate timeout / unknown outcome)
+        self.record_on_timeout = False  # on timeout, still record (request landed, response lost)
         self.dedupe_by_client_id = False  # broker-side idempotency
         self.ts = _TS
 
@@ -49,25 +51,37 @@ class FakeBroker:
             return self._by_client[order.client_order_id]
         if self.fail_next_submit:
             self.fail_next_submit = False
+            if self.record_on_timeout:
+                self._record_fill(order)  # the order reached the broker; the response was lost
             raise TimeoutError("simulated broker timeout (outcome unknown)")
+        return self._record_fill(order)
+
+    def _record_fill(self, order: Order) -> str:
         self._seq += 1
         broker_order_id = f"b-{self._seq}"
         price = order.limit_price or self.default_fill_price
+        filled = self.fill_quantity if self.fill_quantity is not None else order.quantity
+        status = OrderStatus.PARTIAL_FILL if filled < order.quantity else self.fill_status
         self._fills[broker_order_id] = Fill(
             client_order_id=order.client_order_id,
             broker_order_id=broker_order_id,
             symbol=order.symbol,
-            quantity=order.quantity,
+            quantity=filled,
             price=price,
             fees=Decimal("0"),
             ts=self.ts,
-            status=self.fill_status,
+            status=status,
         )
         self._by_client[order.client_order_id] = broker_order_id
         return broker_order_id
 
     def get_order(self, broker_order_id: str) -> Fill:
         return self._fills[broker_order_id]
+
+    def find_by_client_id(self, client_order_id: str) -> Fill | None:
+        """Look up a recorded fill by client order id (reconciliation/idempotency)."""
+        broker_order_id = self._by_client.get(client_order_id)
+        return self._fills.get(broker_order_id) if broker_order_id else None
 
     def cancel_order(self, broker_order_id: str) -> None:
         self.cancelled.append(broker_order_id)

@@ -27,7 +27,7 @@ class FakeMarketDataProvider:
         available = [q for q in self._quotes.get(symbol, ()) if q.ts <= asof]
         if not available:
             raise KeyError(f"no quote for {symbol!r} at or before {asof.isoformat()}")
-        return available[-1]
+        return max(available, key=lambda q: q.ts)  # latest at-or-before asof, order-independent
 
     def get_bars(
         self, symbol: str, start: datetime, end: datetime, freq: str, asof: datetime

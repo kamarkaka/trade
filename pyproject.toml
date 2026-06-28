@@ -53,6 +53,7 @@ warn_redundant_casts = true
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+pythonpath = ["tests"]  # makes the shared `fakes` test-double package importable (M0.8)
 addopts = "-ra -q --strict-markers --import-mode=importlib"
 markers = [
   "unit: fast isolated unit test (CI default)",

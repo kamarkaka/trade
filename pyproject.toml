@@ -17,7 +17,7 @@ dependencies = []
 # Exact versions are pinned in requirements-dev.txt (the lockfile substitute).
 dev = [
   "ruff>=0.6",
-  "mypy>=1.11",
+  "mypy>=2.1.0",
   "pytest>=8",
   "pytest-cov>=5",
   "pre-commit>=3.8",

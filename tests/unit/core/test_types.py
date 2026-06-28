@@ -2,7 +2,7 @@
 immutability, enum coercion, and per-type domain rules."""
 
 import dataclasses
-from datetime import UTC, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -10,6 +10,7 @@ import pytest
 from trader.core import (
     Account,
     Bar,
+    DayState,
     Decision,
     Fill,
     MarketSnapshot,
@@ -239,3 +240,38 @@ def test_constructs_account_and_position() -> None:
     pos = Position(symbol="AAPL", quantity=-5, avg_price=D("100"), market_value=D("-500"))
     assert acct.equity == D("1500")
     assert pos.quantity == -5  # short positions allowed
+
+
+def make_day_state(**kw: object) -> DayState:
+    base: dict[str, object] = {
+        "trading_date": date(2026, 6, 28),
+        "start_of_day_equity": D("10000"),
+        "realized_pnl": D("0"),
+        "unrealized_pnl": D("0"),
+        "trades_today": 0,
+        "loss_today": D("0"),
+    }
+    base.update(kw)
+    return DayState(**base)  # type: ignore[arg-type]
+
+
+def test_day_state_constructs_and_defaults_kill_switch_off() -> None:
+    ds = make_day_state(trades_today=3, loss_today=D("-120.50"))
+    assert ds.kill_switch_engaged is False
+    assert ds.trades_today == 3
+
+
+def test_day_state_trading_date_must_be_plain_date() -> None:
+    with pytest.raises(TypeError):
+        make_day_state(trading_date=datetime(2026, 6, 28, tzinfo=UTC))  # datetime, not date
+    with pytest.raises(TypeError):
+        make_day_state(trading_date="2026-06-28")
+
+
+def test_day_state_validates_money_and_counts() -> None:
+    with pytest.raises(TypeError):
+        make_day_state(start_of_day_equity=10000.0)  # float
+    with pytest.raises(ValueError):
+        make_day_state(trades_today=-1)
+    with pytest.raises(TypeError):
+        make_day_state(kill_switch_engaged="yes")

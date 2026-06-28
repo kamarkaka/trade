@@ -18,6 +18,7 @@ from .enums import (
 from .types import (
     Account,
     Bar,
+    DayState,
     Decision,
     Fill,
     MarketSnapshot,
@@ -35,6 +36,7 @@ __all__ = [
     "Action",
     "Bar",
     "ConflictPolicy",
+    "DayState",
     "Decision",
     "Distribution",
     "DriftDirection",

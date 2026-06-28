@@ -13,8 +13,8 @@ build/
 htmlcov/
 
 # Runtime state, data & secrets — never commit (see plan/design.md §13)
-state/
-data/
+/state/
+/data/
 secrets/
 .env
 *.env

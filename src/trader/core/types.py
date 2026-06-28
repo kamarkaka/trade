@@ -14,7 +14,7 @@ Enum-typed fields accept either an enum member or its string value (coerced).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 
 from .enums import (
@@ -351,9 +351,48 @@ class TriggerSlot:
             object.__setattr__(self, "seed", _require_int(self.seed, "seed"))
 
 
+@dataclass(frozen=True)
+class DayState:
+    """Per-session risk/accounting state consumed by the risk gate (design §10/§12).
+
+    Populated by the state + reconciliation layers in later milestones; defined
+    here so the ``RiskManager`` protocol has a concrete contract to check against.
+    """
+
+    trading_date: date
+    start_of_day_equity: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
+    trades_today: int
+    loss_today: Decimal
+    kill_switch_engaged: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.trading_date, date) or isinstance(self.trading_date, datetime):
+            raise TypeError("trading_date must be a datetime.date (not a datetime)")
+        object.__setattr__(
+            self,
+            "start_of_day_equity",
+            _require_decimal(self.start_of_day_equity, "start_of_day_equity"),
+        )
+        object.__setattr__(
+            self, "realized_pnl", _require_decimal(self.realized_pnl, "realized_pnl")
+        )
+        object.__setattr__(
+            self, "unrealized_pnl", _require_decimal(self.unrealized_pnl, "unrealized_pnl")
+        )
+        object.__setattr__(
+            self, "trades_today", _require_int(self.trades_today, "trades_today", nonneg=True)
+        )
+        object.__setattr__(self, "loss_today", _require_decimal(self.loss_today, "loss_today"))
+        if not isinstance(self.kill_switch_engaged, bool):
+            raise TypeError("kill_switch_engaged must be a bool")
+
+
 __all__ = [
     "Account",
     "Bar",
+    "DayState",
     "Decision",
     "Fill",
     "MarketSnapshot",

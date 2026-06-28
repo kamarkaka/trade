@@ -13,6 +13,7 @@ authors = [{ name = "Meng Cao" }]
 dependencies = [
   "pydantic>=2",  # config validation (M0.4); more runtime deps added per milestone
   "pyyaml>=6",  # YAML config parsing (M0.5)
+  "structlog>=24",  # structured logging + secret scrubbing (M0.6)
 ]
 
 [project.optional-dependencies]

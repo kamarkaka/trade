@@ -19,7 +19,7 @@ jobs:
     steps:
       # Actions use major-version tags, kept current by Dependabot
       # (.github/dependabot.yml). SHA-pinning intentionally not used.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:

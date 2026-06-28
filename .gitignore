@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Runtime state, data & secrets — never commit (see plan/design.md §13)
+state/
+data/
+secrets/
+.env
+*.env
+!*.env.example
+*.sqlite
+*.sqlite-*
+*.parquet
+token*.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

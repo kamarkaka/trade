@@ -1,8 +1,10 @@
-"""Configuration schema (design §11). The layered loader is added in M0.5; this
-package currently exposes the validated pydantic models."""
+"""Configuration: the validated pydantic schema (`models`) and the layered
+loader (`loader`) that assembles defaults < file < env < CLI into an
+:class:`AppConfig` (design §11)."""
 
 from __future__ import annotations
 
+from .loader import DEFAULT_CONFIG_PATH, load_config, resolved_sources
 from .models import (
     AccountConfig,
     AlertingConfig,
@@ -19,6 +21,7 @@ from .models import (
 )
 
 __all__ = [
+    "DEFAULT_CONFIG_PATH",
     "AccountConfig",
     "AlertingConfig",
     "AppConfig",
@@ -31,4 +34,6 @@ __all__ = [
     "SlippageModelConfig",
     "SlotConfig",
     "StrategyBindingConfig",
+    "load_config",
+    "resolved_sources",
 ]

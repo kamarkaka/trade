@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "Meng Cao" }]
 dependencies = [
   "pydantic>=2",  # config validation (M0.4); more runtime deps added per milestone
+  "pyyaml>=6",  # YAML config parsing (M0.5)
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,7 @@ dev = [
   "pytest>=9.1.1",
   "pytest-cov>=7.1.0",
   "pre-commit>=4.6.0",
+  "types-PyYAML>=6",  # mypy stubs for pyyaml
 ]
 
 [project.scripts]

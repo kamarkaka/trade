@@ -18,6 +18,9 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from trader.core import Fill
+from trader.core.enums import Side
+
+from .portfolio import Portfolio
 
 # Manifest fields that vary by environment and must be dropped before a golden compare.
 VOLATILE_MANIFEST_FIELDS = ("git_commit", "lib_versions", "python_version")
@@ -102,6 +105,33 @@ class BacktestReport:
             "equity_curve": [{"ts": ts.isoformat(), "equity": str(eq)} for ts, eq in equity_curve],
             "blotter": [_fill_row(f) for f in fills],
         }
+
+
+def build_multi_report(
+    per_strategy_trades: dict[str, list[tuple[Fill, Side]]],
+    equity_curve: Sequence[EquityPoint],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Multi-strategy report: per-strategy blotter + realized P&L, plus the combined
+    equity curve (design §9.6). Per-strategy realized P&L comes from a per-strategy
+    book fed only that strategy's fills."""
+    per_strategy: dict[str, Any] = {}
+    for strategy_id in sorted(per_strategy_trades):
+        trades = per_strategy_trades[strategy_id]
+        book = Portfolio(Decimal("0"))  # zero-cash book: tracks realized P&L from fills
+        for fill, side in trades:
+            book.apply_fill(fill, side)
+        per_strategy[strategy_id] = {
+            "num_trades": len(trades),
+            "realized_pnl": str(book.realized_pnl()),
+            "total_fees": str(book.total_fees()),
+            "blotter": [_fill_row(fill) for fill, _ in trades],
+        }
+    return {
+        "manifest": manifest,
+        "equity_curve": [{"ts": ts.isoformat(), "equity": str(eq)} for ts, eq in equity_curve],
+        "per_strategy": per_strategy,
+    }
 
 
 def strip_volatile(report: dict[str, Any]) -> dict[str, Any]:

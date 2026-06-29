@@ -15,13 +15,21 @@ accepted now for that forward-compatibility but is unused while there is no jitt
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
+from trader.config.models import ScheduleConfig
 from trader.core import Fill, MarketSnapshot, Order, Quote
 from trader.core.enums import Action, OrderType, Side
 from trader.core.protocols import Broker, Clock, MarketDataProvider, Strategy
+from trader.core.types import StrategyBinding
+from trader.orchestrator.cycle import CycleResult, Orchestrator, Sizer
+from trader.orchestrator.lock import NullLock
+from trader.scheduler.calendar import TradingCalendar
+from trader.scheduler.triggers import SlotScheduler
+from trader.state.attribution import AttributionLedger
+from trader.strategy.registry import REGISTRY, StrategyRegistry
 
 from .portfolio import Portfolio
 
@@ -144,3 +152,65 @@ def _triggers(start: date, end: date, slots: Sequence[time]) -> list[datetime]:
         triggers.extend(datetime.combine(day, slot, tzinfo=UTC) for slot in ordered_slots)
         day += timedelta(days=1)
     return triggers
+
+
+# --------------------------------------------------------------------------- #
+# Multi-strategy interleave (M3.10)                                            #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class MultiStrategyResult:
+    """Outputs of a multi-strategy backtest: per-trigger cycles, the combined equity
+    curve (broker mark-to-market per trigger), and per-strategy (fill, side) trades."""
+
+    cycle_results: list[CycleResult] = field(default_factory=list)
+    equity_curve: list[tuple[datetime, Decimal]] = field(default_factory=list)
+    per_strategy_trades: dict[str, list[tuple[Fill, Side]]] = field(default_factory=dict)
+
+
+def run_multi_strategy(
+    *,
+    bindings: Sequence[StrategyBinding],
+    schedule: ScheduleConfig,
+    calendar: TradingCalendar,
+    data: MarketDataProvider,
+    broker: Broker,
+    attribution: AttributionLedger,
+    sizer: Sizer,
+    clock: Clock,
+    start: date,
+    end: date,
+    registry: StrategyRegistry = REGISTRY,
+) -> MultiStrategyResult:
+    """Walk merged, time-sorted triggers across all enabled strategies, running the
+    SAME ``run_cycle`` per trigger against the SimBroker. Identical to live except for
+    the injected VirtualClock / HistoricalDataProvider / SimBroker (design §4.3/§9).
+    """
+    scheduler = SlotScheduler(bindings, calendar, schedule.base_seed)
+    orchestrator = Orchestrator(
+        broker=broker,
+        data=data,
+        clock=clock,
+        cycle_lock=NullLock(),  # single-threaded backtest: no contention to serialize
+        attribution=attribution,
+        sizer=sizer,
+    )
+    by_id = {b.strategy_id: b for b in bindings}
+    advance_to = getattr(clock, "advance_to", None)
+    result = MultiStrategyResult(per_strategy_trades={b.strategy_id: [] for b in bindings})
+
+    for session in calendar.sessions(start, end):
+        for trigger in scheduler.triggers_for(session):
+            if callable(advance_to):
+                advance_to(trigger.fire_ts)
+            binding = by_id[trigger.strategy_id]
+            strategy = registry.create(binding.strategy_name, dict(binding.params))
+            cycle = orchestrator.run_cycle(
+                strategy, binding.universe, trigger.strategy_id, trigger.fire_ts
+            )
+            result.cycle_results.append(cycle)
+            for order, fill in zip(cycle.orders, cycle.fills, strict=True):
+                result.per_strategy_trades[trigger.strategy_id].append((fill, order.side))
+            result.equity_curve.append((trigger.fire_ts, broker.get_account().equity))
+    return result

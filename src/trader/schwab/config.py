@@ -7,9 +7,13 @@ component (M1) and a few system settings.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+
+from .errors import SchwabAuthError
 
 
 class SchwabClientConfig(BaseModel):
@@ -34,3 +38,37 @@ class SchwabClientConfig(BaseModel):
         if not v.startswith("https://"):
             raise ValueError(f"redirect_uri must use https://, got {v!r}")
         return v
+
+
+def schwab_config_from_env(
+    *,
+    default_token_store: str | Path,
+    rate_limit_per_min: int = 100,
+    environ: Mapping[str, str] | None = None,
+    require_credentials: bool = False,
+) -> SchwabClientConfig:
+    """Assemble a SchwabClientConfig from process env (the secrets boundary, §13).
+
+    Credentials come only from the environment (never the YAML config, never the
+    repo): ``SCHWAB_APP_KEY`` / ``SCHWAB_APP_SECRET``; the redirect URI and an
+    optional token-store path override may also be set. ``require_credentials``
+    is True for commands that hit the network (e.g. ``reauth``) and False for
+    read-only inspection (e.g. ``status`` reading token age), which needs only the
+    token-store path. ``default_token_store`` / ``rate_limit_per_min`` are passed
+    by the caller (from AppConfig) so this stays decoupled from the app config.
+    """
+    env = os.environ if environ is None else environ
+    app_key = env.get("SCHWAB_APP_KEY", "")
+    app_secret = env.get("SCHWAB_APP_SECRET", "")
+    if require_credentials and not (app_key and app_secret):
+        raise SchwabAuthError(
+            "Schwab credentials missing; set SCHWAB_APP_KEY and SCHWAB_APP_SECRET"
+        )
+    token_store = env.get("SCHWAB_TOKEN_STORE_PATH") or str(default_token_store)
+    return SchwabClientConfig(
+        app_key=app_key,
+        app_secret=SecretStr(app_secret),
+        redirect_uri=env.get("SCHWAB_REDIRECT_URI", "https://127.0.0.1:8182"),
+        token_store_path=Path(token_store),
+        rate_limit_per_min=rate_limit_per_min,
+    )

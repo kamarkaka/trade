@@ -35,7 +35,9 @@ from trader.scheduler.jitter import compute_drift
 from trader.state.ledger import FiredSlotLedger
 from trader.strategy.registry import REGISTRY, StrategyRegistry
 
-Alerter = Callable[[str], None]
+# A plain string-message sink (distinct from observability.alerting.Alerter, which takes a
+# typed AlertEvent). M4.6/M4.7 adapts the daemon to emit AlertEvents through that gate.
+AlertFn = Callable[[str], None]
 
 
 class SchedulerDaemon:
@@ -51,7 +53,7 @@ class SchedulerDaemon:
         orchestrator: Orchestrator,
         clock: Clock,
         registry: StrategyRegistry = REGISTRY,
-        alerter: Alerter | None = None,
+        alerter: AlertFn | None = None,
         sleep: Callable[[float], None] = _time.sleep,
     ) -> None:
         self._bindings = bindings
@@ -63,7 +65,7 @@ class SchedulerDaemon:
         self._registry = registry
         self._tz = ZoneInfo(schedule.timezone)
         self._log = get_logger("daemon")
-        self._alert: Alerter = alerter or (
+        self._alert: AlertFn = alerter or (
             lambda msg: self._log.warning("daemon alert", detail=msg)
         )
         self._sleep = sleep

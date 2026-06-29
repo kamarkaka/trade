@@ -165,6 +165,7 @@ def run(
     from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
     from trader.orchestrator.lock import GlobalCycleLock
     from trader.risk.gate import RiskManager
+    from trader.risk.kill_switch import KillSwitch
     from trader.scheduler.calendar import TradingCalendar
     from trader.scheduler.daemon import SchedulerDaemon
     from trader.sizing.sizer import size_decision
@@ -233,6 +234,10 @@ def run(
         data = SchwabMarketData(SchwabClient(http), clock)
         broker = SimBroker(data, clock, starting_cash=cash)  # PAPER: SimBroker only, never real
         attribution = AttributionLedger(state)
+        # Read the persisted kill switch fresh each cycle: an engage (CLI or auto-trip) halts
+        # the daemon at the next cycle start AND pre-submit (gate). Its own connection so the
+        # worker thread never shares one cross-thread.
+        kill_switch = KillSwitch(connect(Path(cfg.observability.db_path)), alerter=alerter)
         orchestrator = Orchestrator(
             broker=broker,
             data=data,
@@ -242,6 +247,7 @@ def run(
             sizer=lambda d, sid: size_decision(d, sid, cfg.execution),
             risk=risk,  # the real fail-closed gate is the single chokepoint
             audit=SqliteAuditSink(state),  # durable audit chain
+            kill_switch=kill_switch.is_engaged,
         )
         # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
         # only for a broker whose positions survive a restart; SimBroker is in-memory (always
@@ -381,11 +387,26 @@ def kill(
     on: Annotated[
         bool, typer.Option("--on/--off", help="Engage or release the kill switch.")
     ] = False,
+    reason: Annotated[
+        str, typer.Option("--reason", help="Why the switch is being engaged (for the audit/log).")
+    ] = "manual kill via CLI",
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Engage/release the kill switch (implemented in M5)."""
-    state = "on" if on else "off"
-    typer.echo(f"kill: not implemented yet (kill switch arrives in M5); requested {state}")
+    """Engage/release the persisted kill switch (halts all new orders; survives restarts)."""
+    from trader.risk.kill_switch import KillSwitch
+    from trader.state.db import connect
+    from trader.state.migrate import run_migrations
+
+    cfg = _load(config)
+    conn = connect(Path(cfg.observability.db_path))
+    run_migrations(conn)
+    switch = KillSwitch(conn)
+    if on:
+        newly = switch.engage(reason, source="cli")
+        typer.echo(f"kill switch ENGAGED ({reason})" if newly else "kill switch already engaged")
+    else:
+        switch.disengage(source="cli")
+        typer.echo("kill switch released")
 
 
 @app.command()

@@ -74,6 +74,7 @@ class SlotConfig(_Base):
     drift_direction: DriftDirection = DriftDirection.FORWARD
     distribution: Distribution = Distribution.UNIFORM
     on_overshoot: OnOvershoot = OnOvershoot.CLAMP
+    catch_up: bool | None = None  # None => inherit schedule.catch_up (§7.1)
 
     @field_validator("time")
     @classmethod

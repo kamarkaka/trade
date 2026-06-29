@@ -1,0 +1,17 @@
+{# Alert-worthy audit events, most recent first (refreshable). M7.9. #}
+{% if alerts %}
+<table>
+  <tr><th class="l">Time</th><th class="l">Strategy</th><th class="l">Kind</th><th class="l">Detail</th></tr>
+  {% for a in alerts %}
+  <tr>
+    <td class="l">{{ a.ts | nyt }}</td>
+    <td class="l">{{ a.strategy_id or '—' }}</td>
+    <td class="l"><span class="{{ 'alert' | badge }}">{{ a.kind }}</span></td>
+    <td class="l">{{ a.payload }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">No alerts.</p>
+{% endif %}
+<p class="muted">updated {{ updated_at | nyt }}</p>

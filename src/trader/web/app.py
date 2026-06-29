@@ -26,7 +26,15 @@ from fastapi.staticfiles import StaticFiles
 from trader.web.auth import install_session_refresh
 from trader.web.db import ReadOnlyStateDB
 from trader.web.repository import MonitoringRepo
-from trader.web.routes import account_routes, auth_routes, strategy_routes, system_routes
+from trader.web.routes import (
+    account_routes,
+    alerts_routes,
+    auth_routes,
+    config_routes,
+    orders_routes,
+    strategy_routes,
+    system_routes,
+)
 from trader.web.security import LoginThrottle
 from trader.web.settings import WebSettings
 from trader.web.templating import make_templates
@@ -74,6 +82,9 @@ def create_app(settings: WebSettings, *, now: Callable[[], datetime] | None = No
     app.include_router(system_routes.router)
     app.include_router(strategy_routes.router)
     app.include_router(account_routes.router)
+    app.include_router(orders_routes.router)
+    app.include_router(alerts_routes.router)
+    app.include_router(config_routes.router)
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:

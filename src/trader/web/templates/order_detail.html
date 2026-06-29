@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Order {{ order.client_order_id }} — trader monitor{% endblock %}
+{% block content %}
+<p class="muted"><a href="/orders">← all orders</a></p>
+<h1>Order {{ order.client_order_id }}</h1>
+<table>
+  <tr><th class="l">Strategy</th><td class="l">{{ order.strategy_id }}</td>
+      <th class="l">Symbol</th><td class="l">{{ order.symbol }}</td></tr>
+  <tr><th class="l">Side</th><td class="l">{{ order.side }}</td>
+      <th class="l">Quantity</th><td>{{ order.quantity }}</td></tr>
+  <tr><th class="l">Type</th><td class="l">{{ order.order_type }}{% if order.limit_price %} @ {{ order.limit_price }}{% endif %}</td>
+      <th class="l">TIF</th><td class="l">{{ order.tif }}</td></tr>
+  <tr><th class="l">Status</th><td class="l">{{ order.status }}</td>
+      <th class="l">Broker id</th><td class="l">{{ order.broker_order_id or '—' }}</td></tr>
+  <tr><th class="l">Created</th><td class="l">{{ order.created_at | nyt }}</td>
+      <th class="l">Updated</th><td class="l">{{ order.updated_at | nyt }}</td></tr>
+</table>
+
+<h2>Fills</h2>
+{% if fills %}
+<table>
+  <tr><th class="l">Time</th><th>Qty</th><th>Price</th><th>Fees</th><th class="l">Status</th>
+      <th class="l">Broker id</th></tr>
+  {% for f in fills %}
+  <tr><td class="l">{{ f.ts | nyt }}</td><td>{{ f.quantity }}</td><td>{{ f.price }}</td>
+      <td>{{ f.fees }}</td><td class="l">{{ f.status }}</td><td class="l">{{ f.broker_order_id or '—' }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">No fills recorded for this order.</p>{% endif %}
+{% endblock %}

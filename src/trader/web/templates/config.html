@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Config — trader monitor{% endblock %}
+{% block content %}
+<h1>Effective config</h1>
+<p class="muted">
+  Read-only view of the mounted <code>config.yaml</code> with secrets scrubbed. Changes are
+  made via the CLI / config file (this page executes nothing): <code>trader kill</code>,
+  <code>trader reauth</code>, edit config + restart.
+</p>
+
+{% set risk = config.get('risk', {}) %}
+{% if risk %}
+<h2>Risk limits</h2>
+<table>
+  {% for k, v in risk.items() %}
+  <tr><th class="l">{{ k }}</th><td class="l">{{ v }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if config.get('strategies') %}
+<h2>Strategies</h2>
+<table>
+  <tr><th class="l">Id</th><th class="l">Name</th><th class="l">Enabled</th>
+      <th class="l">Universe</th><th class="l">Params</th></tr>
+  {% for s in config.get('strategies') %}
+  <tr><td class="l">{{ s.get('id') }}</td><td class="l">{{ s.get('name') }}</td>
+      <td class="l">{{ s.get('enabled') }}</td>
+      <td class="l">{{ (s.get('universe') or []) | join(', ') }}</td>
+      <td class="l">{{ s.get('params') }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% for section in ['schedule', 'execution', 'alerting'] %}
+  {% set blk = config.get(section, {}) %}
+  {% if blk %}
+  <h2>{{ section | capitalize }}</h2>
+  <table>
+    {% for k, v in blk.items() %}
+    <tr><th class="l">{{ k }}</th><td class="l">{{ v }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+{% endfor %}
+
+<h2>Mode</h2>
+<p><span class="{{ 'ok' | badge }}">{{ config.get('mode', '?') }}</span></p>
+<p class="muted">updated {{ updated_at | nyt }}</p>
+{% endblock %}

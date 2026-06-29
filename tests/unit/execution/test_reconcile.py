@@ -58,6 +58,40 @@ def test_unattributed_delta_parked_in_unknown(tmp_path: Path) -> None:
     assert attribution.get_attributed(UNKNOWN)[0].quantity == 4
 
 
+def test_attributed_exceeds_broker_reports_negative_delta(tmp_path: Path) -> None:
+    attribution = _attribution(tmp_path)
+    _buy(attribution, "momentum", "AAPL", 6)  # attributed 6
+    broker = FakeBroker()  # broker flat -> local claims a position the broker doesn't have
+    report = reconcile(broker, attribution)
+    disc = report.discrepancies[0]
+    assert (disc.broker_qty, disc.attributed_qty, disc.parked_qty) == (0, 6, -6)
+    assert report.requires_attention
+
+
+def test_reconcile_is_idempotent(tmp_path: Path) -> None:
+    attribution = _attribution(tmp_path)
+    _buy(attribution, "momentum", "AAPL", 6)
+    broker = FakeBroker()
+    broker.set_position(_position("AAPL", 10))
+    first = reconcile(broker, attribution)
+    second = reconcile(broker, attribution)  # unchanged broker -> same residual, no compounding
+    assert first.discrepancies == second.discrepancies
+    assert attribution.get_attributed(UNKNOWN)[0].quantity == 4  # not doubled to 8
+
+
+def test_multi_symbol_reports_all_divergent(tmp_path: Path) -> None:
+    attribution = _attribution(tmp_path)
+    _buy(attribution, "momentum", "AAPL", 6)
+    _buy(attribution, "momentum", "TSLA", 5)  # ties out below
+    broker = FakeBroker()
+    broker.set_position(_position("AAPL", 10))  # over by 4
+    broker.set_position(_position("MSFT", 3))  # absent locally
+    broker.set_position(_position("TSLA", 5))  # clean
+    report = reconcile(broker, attribution)
+    parked = {d.symbol: d.parked_qty for d in report.discrepancies}
+    assert parked == {"AAPL": 4, "MSFT": 3}  # both divergences reported, TSLA excluded
+
+
 def test_clean_state_no_discrepancy(tmp_path: Path) -> None:
     attribution = _attribution(tmp_path)
     _buy(attribution, "momentum", "AAPL", 10)

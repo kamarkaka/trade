@@ -6,6 +6,10 @@ attributed sums, parks any unattributed delta under the ``'unknown'`` strategy (
 books tie out), and returns a discrepancy report. Any non-clean result flags
 ``requires_attention`` — the hook the kill switch (M5) escalates on unexplained
 divergence. Runs on startup (before acting), after submits, and at EOD.
+
+Scope (M4.1): position/attribution reconciliation only. Open-order vs broker-fill
+reconciliation (idempotent re-submit recovery) is M5.3; account-total (cash/equity)
+diff is layered on alongside it.
 """
 
 from __future__ import annotations

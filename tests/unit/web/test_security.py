@@ -14,6 +14,7 @@ from trader.web.security import (
     make_csrf_token,
     make_session_token,
     read_session_token,
+    refresh_session_token,
     validate_csrf,
     verify_password,
 )
@@ -36,6 +37,49 @@ def test_verify_wrong_password() -> None:
 
 def test_verify_malformed_hash_is_false() -> None:
     assert verify_password("x", "not-a-real-hash") is False
+
+
+def test_verify_none_inputs_are_false() -> None:
+    # Defensive: non-str inputs must fail closed, never raise (the module never raises).
+    assert verify_password(None, "x") is False  # type: ignore[arg-type]
+    assert verify_password("x", None) is False  # type: ignore[arg-type]
+
+
+def test_session_naive_now_returns_none_not_crash() -> None:
+    # A naive `now` (caller bug) must yield None, NOT an aware/naive subtraction TypeError.
+    token = make_session_token(SECRET, "admin", NOW)
+    naive_now = datetime(2026, 6, 29, 12, 0)
+    assert (
+        read_session_token(SECRET, token, naive_now, idle_seconds=IDLE, absolute_seconds=ABS)
+        is None
+    )
+
+
+def test_refresh_slides_idle_but_preserves_absolute() -> None:
+    token = make_session_token(SECRET, "admin", NOW)
+    # Refresh near the idle edge: new token is valid, but the ORIGINAL issued_at still binds.
+    mid = NOW + timedelta(seconds=IDLE - 1)
+    refreshed = refresh_session_token(SECRET, token, mid, idle_seconds=IDLE, absolute_seconds=ABS)
+    assert refreshed is not None
+    # The refreshed token reads fine just after `mid` (idle slid forward)...
+    soon = mid + timedelta(seconds=10)
+    assert (
+        read_session_token(SECRET, refreshed, soon, idle_seconds=IDLE, absolute_seconds=ABS)
+        == "admin"
+    )
+    # ...but past the ORIGINAL absolute cap it dies even though last_seen is recent.
+    past_abs = NOW + timedelta(seconds=ABS + 1)
+    assert (
+        read_session_token(SECRET, refreshed, past_abs, idle_seconds=IDLE, absolute_seconds=ABS)
+        is None
+    )
+
+
+def test_refresh_invalid_token_returns_none() -> None:
+    assert (
+        refresh_session_token(SECRET, "garbage", NOW, idle_seconds=IDLE, absolute_seconds=ABS)
+        is None
+    )
 
 
 def test_session_roundtrip() -> None:

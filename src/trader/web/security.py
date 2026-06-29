@@ -35,7 +35,8 @@ def verify_password(plain: str, stored_hash: str) -> bool:
     mismatch / malformed hash returns False (fail closed)."""
     try:
         return _HASHER.verify(stored_hash, plain)
-    except (Argon2Error, InvalidHashError):  # mismatch OR malformed/unparseable hash
+    except (Argon2Error, InvalidHashError, TypeError, AttributeError):
+        # mismatch / malformed hash / non-str input -> fail closed (never raise)
         return False
 
 
@@ -49,9 +50,40 @@ def _session_serializer(secret: str) -> URLSafeSerializer:
 
 
 def make_session_token(secret: str, username: str, now: datetime) -> str:
-    """Mint a signed session token stamped issued_at = last_seen = ``now``."""
+    """Mint a fresh signed session token stamped issued_at = last_seen = ``now`` (resets the
+    absolute clock — use ``refresh_session_token`` to slide the idle window WITHOUT resetting
+    the 8h cap)."""
     payload = {"user": username, "issued_at": now.isoformat(), "last_seen": now.isoformat()}
     return _session_serializer(secret).dumps(payload)
+
+
+def _load_session(
+    secret: str, token: str, now: datetime, *, idle_seconds: int, absolute_seconds: int
+) -> dict[str, str] | None:
+    """Validate signature + idle/absolute windows; return the payload dict or ``None``.
+    Never raises — a tampered signature, malformed/naive-timestamp payload, or expiry all
+    yield ``None`` (fail closed)."""
+    try:
+        data = _session_serializer(secret).loads(token)
+        if not isinstance(data, dict):
+            return None
+        user = data.get("user")
+        issued_at = datetime.fromisoformat(data["issued_at"])
+        last_seen = datetime.fromisoformat(data["last_seen"])
+        # All session timestamps MUST be tz-aware (UTC); a naive one is invalid -- reject it
+        # rather than letting an aware/naive subtraction raise (the whole module never raises).
+        if now.tzinfo is None or issued_at.tzinfo is None or last_seen.tzinfo is None:
+            return None
+        if not isinstance(user, str):
+            return None
+        # Negative deltas (token from the "future" under clock skew) are treated as fresh.
+        if (now - last_seen).total_seconds() > idle_seconds:
+            return None
+        if (now - issued_at).total_seconds() > absolute_seconds:
+            return None
+    except (BadSignature, KeyError, TypeError, ValueError):
+        return None
+    return {"user": user, "issued_at": data["issued_at"]}
 
 
 def read_session_token(
@@ -64,27 +96,36 @@ def read_session_token(
 ) -> str | None:
     """Return the username if ``token`` is validly signed AND within both the idle window
     (``now - last_seen``) and the absolute window (``now - issued_at``); else ``None``
-    (tampered signature, malformed payload, or expired)."""
-    try:
-        data = _session_serializer(secret).loads(token)
-    except BadSignature:
+    (tampered signature, malformed/naive payload, or expired)."""
+    payload = _load_session(
+        secret, token, now, idle_seconds=idle_seconds, absolute_seconds=absolute_seconds
+    )
+    return payload["user"] if payload is not None else None
+
+
+def refresh_session_token(
+    secret: str,
+    token: str,
+    now: datetime,
+    *,
+    idle_seconds: int,
+    absolute_seconds: int,
+) -> str | None:
+    """If ``token`` is still valid, return a re-signed token with ``last_seen`` slid to
+    ``now`` but the ORIGINAL ``issued_at`` PRESERVED (so the absolute cap still binds). Else
+    ``None``. The route layer (M7.4) calls this per authenticated request to renew the cookie
+    — it must use THIS, not ``make_session_token`` (which would reset the absolute clock)."""
+    payload = _load_session(
+        secret, token, now, idle_seconds=idle_seconds, absolute_seconds=absolute_seconds
+    )
+    if payload is None:
         return None
-    if not isinstance(data, dict):
-        return None
-    user = data.get("user")
-    try:
-        issued_at = datetime.fromisoformat(data["issued_at"])
-        last_seen = datetime.fromisoformat(data["last_seen"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if not isinstance(user, str):
-        return None
-    # Negative deltas (token from the "future" under clock skew) are treated as fresh.
-    if (now - last_seen).total_seconds() > idle_seconds:
-        return None
-    if (now - issued_at).total_seconds() > absolute_seconds:
-        return None
-    return user
+    refreshed = {
+        "user": payload["user"],
+        "issued_at": payload["issued_at"],
+        "last_seen": now.isoformat(),
+    }
+    return _session_serializer(secret).dumps(refreshed)
 
 
 # --------------------------------------------------------------------------- #
@@ -144,6 +185,7 @@ class LoginThrottle:
 
     def record_failure(self, key: str, now: datetime) -> None:
         self._failures.setdefault(key, []).append(now)
+        self._recent(key, now)  # prune this key to the window so a spammer can't grow it
 
     def record_success(self, key: str) -> None:
         self._failures.pop(key, None)

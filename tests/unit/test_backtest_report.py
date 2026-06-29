@@ -148,6 +148,29 @@ def test_json_is_deterministic() -> None:
     assert a.index('"combined"') < a.index('"manifest"') < a.index('"per_strategy"')
 
 
+def test_json_deterministic_under_hostile_ambient_context() -> None:
+    # The golden's byte-reproducibility must not depend on the caller's decimal context.
+    import decimal
+
+    baseline = build_report(_run_result(with_per_strategy_equity=True), MANIFEST).json_str()
+    for ctx in (decimal.Context(prec=3), decimal.Context(prec=50, rounding=decimal.ROUND_FLOOR)):
+        with decimal.localcontext(ctx):
+            assert build_report(
+                _run_result(with_per_strategy_equity=True), MANIFEST
+            ).json_str() == (baseline)
+
+
+def test_combined_blotter_tie_break_is_order_independent() -> None:
+    # Two fills at the SAME timestamp across strategies must sort deterministically,
+    # independent of the per_strategy_trades dict insertion order (golden contract).
+    f_a = (_fill("a-1", "AAA", 1, "10", 0), Side.BUY)
+    f_z = (_fill("z-1", "ZZZ", 1, "20", 0), Side.BUY)  # identical ts (day 0)
+    curve = _curve(["100000", "100000"])
+    forward = BacktestRunResult(curve, {"alpha": [f_a], "zeta": [f_z]})
+    reverse = BacktestRunResult(curve, {"zeta": [f_z], "alpha": [f_a]})
+    assert build_report(forward, MANIFEST).json_str() == build_report(reverse, MANIFEST).json_str()
+
+
 def test_to_json_and_to_html_write_files(tmp_path) -> None:
     doc = build_report(_run_result(), MANIFEST)
     jp = tmp_path / "r.json"

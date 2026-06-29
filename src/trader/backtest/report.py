@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Context, Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -39,15 +39,23 @@ VOLATILE_MANIFEST_FIELDS = ("git_commit", "lib_versions", "python_version")
 # context precision into the golden).
 _RATIO_SCALE = Decimal("0.00000001")  # 8 dp
 
+# Pinned context for ALL report arithmetic, so output is immune to the caller's ambient
+# decimal context — a low-precision ambient context would otherwise make ``quantize``
+# raise InvalidOperation (or a division round wrong) and break the golden's byte
+# reproducibility. prec 28 matches strategy.indicators / metrics so values are identical.
+_CTX = Context(prec=28, rounding=ROUND_HALF_EVEN)
+
 EquityPoint = tuple[datetime, Decimal]
 
 
 def _q(value: Decimal) -> Decimal:
-    return value.quantize(_RATIO_SCALE, rounding=ROUND_HALF_UP)
+    with localcontext(_CTX):
+        return value.quantize(_RATIO_SCALE, rounding=ROUND_HALF_UP)
 
 
 def _safe_div(numerator: Decimal, denominator: Decimal) -> Decimal:
-    return numerator / denominator if denominator != 0 else Decimal("0")
+    with localcontext(_CTX):
+        return numerator / denominator if denominator != 0 else Decimal("0")
 
 
 def _max_drawdown(curve: Sequence[EquityPoint]) -> Decimal:
@@ -55,10 +63,11 @@ def _max_drawdown(curve: Sequence[EquityPoint]) -> Decimal:
         return Decimal("0")
     peak = curve[0][1]  # track the true running max from the start (handles all-negative)
     worst = Decimal("0")
-    for _, equity in curve:
-        peak = max(peak, equity)
-        if peak > 0:
-            worst = max(worst, (peak - equity) / peak)
+    with localcontext(_CTX):
+        for _, equity in curve:
+            peak = max(peak, equity)
+            if peak > 0:
+                worst = max(worst, (peak - equity) / peak)
     return _q(worst)
 
 
@@ -68,11 +77,13 @@ def _hit_rate(curve: Sequence[EquityPoint]) -> Decimal:
     if len(curve) < 2:
         return Decimal("0")
     ups = sum(1 for i in range(1, len(curve)) if curve[i][1] > curve[i - 1][1])
-    return _q(Decimal(ups) / Decimal(len(curve) - 1))
+    with localcontext(_CTX):
+        return _q(Decimal(ups) / Decimal(len(curve) - 1))
 
 
 def _turnover(fills: Sequence[Fill], starting_equity: Decimal) -> Decimal:
-    notional = sum((Decimal(f.quantity) * f.price for f in fills), Decimal("0"))
+    with localcontext(_CTX):
+        notional = sum((Decimal(f.quantity) * f.price for f in fills), Decimal("0"))
     return _q(_safe_div(notional, starting_equity))
 
 
@@ -230,6 +241,12 @@ def _fire_row(fire: FireRecord) -> dict[str, Any]:
     }
 
 
+def _sorted_fire(fire_log: Sequence[FireRecord]) -> list[FireRecord]:
+    # Defensive deterministic order: the M6.7 engine should emit firings chronologically,
+    # but sorting here keeps the report's JSON byte-stable regardless of how it assembles.
+    return sorted(fire_log, key=lambda f: (f.fire_ts, f.strategy_id, f.slot_id))
+
+
 def _equity_points(curve: Sequence[EquityPoint]) -> list[dict[str, str]]:
     return [{"ts": ts.isoformat(), "equity": str(eq)} for ts, eq in curve]
 
@@ -243,19 +260,23 @@ def _per_strategy_block(
     fire_log: Sequence[FireRecord],
 ) -> dict[str, Any]:
     # Realized P&L from a zero-cash book fed only this strategy's fills (the honest
-    # per-strategy P&L, independent of the shared account curve).
-    book = Portfolio(Decimal("0"))
-    for fill, side in trades:
-        book.apply_fill(fill, side)
+    # per-strategy P&L, independent of the shared account curve). Run the book's Decimal
+    # arithmetic under the pinned context so its output is ambient-context-independent
+    # (avg-cost division would otherwise inherit the caller's precision -> golden drift).
+    with localcontext(_CTX):
+        book = Portfolio(Decimal("0"))
+        for fill, side in trades:
+            book.apply_fill(fill, side)
+        realized_pnl, total_fees = book.realized_pnl(), book.total_fees()
     block: dict[str, Any] = {
         "num_trades": len(trades),
         "hit_rate": _opt_ratio(M.hit_rate(records, strategy_id=sid)),
         # Turnover uses the shared account's average equity as the denominator.
         "turnover": _ratio_str(M.turnover(records, combined_avg_equity, strategy_id=sid)),
-        "realized_pnl": str(book.realized_pnl()),
-        "total_fees": str(book.total_fees()),
+        "realized_pnl": str(realized_pnl),
+        "total_fees": str(total_fees),
         "blotter": [_fill_row(fill) for fill, _ in trades],
-        "fire_log": [_fire_row(f) for f in fire_log if f.strategy_id == sid],
+        "fire_log": [_fire_row(f) for f in _sorted_fire(fire_log) if f.strategy_id == sid],
     }
     if per_strategy_equity is not None:
         m = M.summarize(per_strategy_equity, records, strategy_id=sid)
@@ -282,13 +303,22 @@ def build_report(
     curve = M.build_equity_curve(run_result.combined_equity_curve)
     records = M.trade_records_from_multi(run_result.per_strategy_trades)
     combined_avg_equity = M.avg_equity(curve)
-    all_fills = [(f, s) for trades in run_result.per_strategy_trades.values() for f, s in trades]
+    # Carry the owning strategy_id so the combined blotter has a deterministic tie-break
+    # (sorting on ts alone would otherwise leak the per_strategy_trades dict order when
+    # two fills share a timestamp — breaking the golden's byte reproducibility).
+    all_fills = [
+        (fill, sid) for sid, trades in run_result.per_strategy_trades.items() for fill, _ in trades
+    ]
+    ordered_fills = sorted(
+        all_fills, key=lambda t: (t[0].ts, t[1], t[0].symbol, t[0].client_order_id)
+    )
 
     combined = _metrics_dict(M.summarize(curve, records))
-    combined["total_fees"] = str(sum((f.fees for f, _ in all_fills), Decimal("0")))
-    combined["blotter"] = [_fill_row(f) for f, _ in sorted(all_fills, key=lambda t: t[0].ts)]
+    with localcontext(_CTX):
+        combined["total_fees"] = str(sum((f.fees for f, _ in all_fills), Decimal("0")))
+    combined["blotter"] = [_fill_row(f) for f, _ in ordered_fills]
     combined["equity_curve"] = _equity_points(curve)
-    combined["fire_log"] = [_fire_row(f) for f in run_result.fire_log]
+    combined["fire_log"] = [_fire_row(f) for f in _sorted_fire(run_result.fire_log)]
 
     # One section per enabled strategy (zero-trade strategies still get a section).
     sids = (

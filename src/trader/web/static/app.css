@@ -1,12 +1,48 @@
-/* Minimal monitoring-UI styles (no external assets). M7.4+. */
-:root { --fg: #1a1a1a; --muted: #777; --err: #b00020; --line: #e2e2e2; }
+/* Minimal monitoring-UI styles (no external assets). M7.4 + M7.6. */
+:root {
+  --fg: #1a1a1a; --muted: #777; --line: #e2e2e2; --bg: #fafafa;
+  --ok-bg: #e6f4ea; --ok-fg: #137333;
+  --warn-bg: #fef7e0; --warn-fg: #b06000;
+  --alert-bg: #fce8e6; --alert-fg: #c5221f;
+  --err: #b00020;
+}
 * { box-sizing: border-box; }
 body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-       color: var(--fg); margin: 0; line-height: 1.45; }
+       color: var(--fg); margin: 0; line-height: 1.45; background: var(--bg); }
 .muted { color: var(--muted); }
 .error { color: var(--err); font-weight: 600; }
 
-body.login { display: grid; place-items: center; min-height: 100vh; background: #fafafa; }
+/* --- top bar / nav --- */
+.topbar { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+          padding: .6rem 1rem; background: #fff; border-bottom: 1px solid var(--line); }
+.brand { font-weight: 700; }
+.nav { display: flex; gap: .85rem; flex: 1; }
+.nav a { color: var(--fg); text-decoration: none; font-size: .92rem; }
+.nav a:hover { text-decoration: underline; }
+.status { display: flex; align-items: center; gap: .6rem; }
+.status .user { color: var(--muted); font-size: .85rem; }
+.logout { margin: 0; }
+.logout button { border: 1px solid var(--line); background: #fff; border-radius: 6px;
+                 padding: .3rem .6rem; cursor: pointer; font-size: .85rem; }
+
+/* --- badges --- */
+.badge { display: inline-block; padding: .15rem .5rem; border-radius: 999px;
+         font-size: .8rem; font-weight: 600; }
+.badge-ok { background: var(--ok-bg); color: var(--ok-fg); }
+.badge-warn { background: var(--warn-bg); color: var(--warn-fg); }
+.badge-alert { background: var(--alert-bg); color: var(--alert-fg); }
+
+/* --- content / tables --- */
+.content { padding: 1.25rem; max-width: 1100px; margin: 0 auto; }
+h1, h2 { font-weight: 600; }
+table { border-collapse: collapse; width: 100%; margin: .5rem 0 1.5rem; font-size: .9rem; }
+th, td { border: 1px solid var(--line); padding: .35rem .6rem; text-align: right; }
+th { background: #f5f5f5; text-align: left; }
+td.l, th.l { text-align: left; }
+.refresh .muted { font-size: .85rem; }
+
+/* --- login (M7.4) --- */
+body.login { display: grid; place-items: center; min-height: 100vh; }
 .login-card { width: 320px; padding: 1.5rem 1.75rem; border: 1px solid var(--line);
               border-radius: 10px; background: #fff; }
 .login-card h1 { margin: 0 0 .25rem; font-size: 1.25rem; }

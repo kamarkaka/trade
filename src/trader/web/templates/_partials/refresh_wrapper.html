@@ -1,0 +1,10 @@
+{# Reusable auto-refresh wrapper (M7.6).
+   Polls `fragment_url` every `refresh_seconds`s (via the local HTMX shim) and swaps the
+   fragment into this div. Used by each monitoring view so the page chrome loads once and only
+   the data fragment refreshes. #}
+<div class="refresh"
+     hx-get="{{ fragment_url }}"
+     hx-trigger="every {{ refresh_seconds }}s"
+     hx-swap="innerHTML">
+  <p class="muted">Loading…</p>
+</div>

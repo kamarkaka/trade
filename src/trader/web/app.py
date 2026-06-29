@@ -20,21 +20,34 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 
 from trader.web.auth import install_session_refresh, require_session
 from trader.web.db import ReadOnlyStateDB
+from trader.web.repository import MonitoringRepo
 from trader.web.routes import auth_routes
-from trader.web.security import LoginThrottle
+from trader.web.security import LoginThrottle, make_csrf_token
 from trader.web.settings import WebSettings
+from trader.web.templating import make_templates
 
 _WEB_DIR = Path(__file__).resolve().parent
 _STATIC_DIR = _WEB_DIR / "static"
-_TEMPLATES_DIR = _WEB_DIR / "templates"
 
 logger = logging.getLogger("trader.web")  # web's OWN logger (stdout) — never the trading DB
+
+
+def _config_loader(settings: WebSettings) -> Callable[[], dict[str, object]]:
+    """A loader that returns the resolved config as a plain dict (for config_view). Imported
+    lazily so a config-read failure can't break app construction; trader.config is not a
+    broker/schwab/auth path (web isolation preserved)."""
+
+    def _load() -> dict[str, object]:
+        from trader.config import load_config
+
+        return dict(load_config(settings.config_path).model_dump(mode="json"))
+
+    return _load
 
 
 def create_app(settings: WebSettings, *, now: Callable[[], datetime] | None = None) -> FastAPI:
@@ -46,7 +59,8 @@ def create_app(settings: WebSettings, *, now: Callable[[], datetime] | None = No
     app.state.settings = settings
     app.state.now = now if now is not None else (lambda: datetime.now(UTC))
     app.state.db = ReadOnlyStateDB(settings.db_path)
-    app.state.templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+    app.state.templates = make_templates()
+    app.state.repo = MonitoringRepo(ReadOnlyStateDB(settings.db_path), _config_loader(settings))
     app.state.login_throttle = LoginThrottle(
         settings.login_max_attempts, settings.login_lockout_seconds
     )
@@ -56,13 +70,24 @@ def create_app(settings: WebSettings, *, now: Callable[[], datetime] | None = No
     app.include_router(auth_routes.router)  # PUBLIC: /login, /logout
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, user: str = Depends(require_session)) -> HTMLResponse:
-        # Placeholder protected root (real dashboards land in M7.5+). Exists now so the auth
-        # guard is exercised end-to-end.
-        return HTMLResponse(
-            f"<!DOCTYPE html><html><body><h1>trader monitor</h1>"
-            f"<p>signed in as {user}</p></body></html>"
+    def dashboard(request: Request, user: str = Depends(require_session)) -> Response:
+        # Page chrome (base.html). The real data fragments land in M7.7+; this renders the
+        # shared layout (nav, mode + kill-switch badges, logout form with CSRF).
+        repo: MonitoringRepo = request.app.state.repo
+        kill = repo.system_status().get("kill_switch") or {}
+        page: Response = request.app.state.templates.TemplateResponse(
+            request,
+            "base.html",
+            {
+                "user": user,
+                "mode": repo.config_view().get("mode", "?"),
+                "kill_switch_engaged": bool(kill.get("engaged")),
+                "csrf_token": make_csrf_token(
+                    settings.session_secret.get_secret_value(), request.app.state.now()
+                ),
+            },
         )
+        return page
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}trader monitor{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">trader monitor</div>
+    <nav class="nav">
+      <a href="/">System</a>
+      <a href="/schedule">Schedule</a>
+      <a href="/strategies">Strategies</a>
+      <a href="/account">Account</a>
+      <a href="/orders">Orders</a>
+      <a href="/alerts">Alerts</a>
+      <a href="/config">Config</a>
+    </nav>
+    <div class="status">
+      <span class="{{ 'ok' | badge }}">mode: {{ mode | default('?') }}</span>
+      {% if kill_switch_engaged %}
+        <span class="{{ 'alert' | badge }}">KILL SWITCH ENGAGED</span>
+      {% else %}
+        <span class="{{ 'ok' | badge }}">running</span>
+      {% endif %}
+      <span class="user">{{ user | default('—') }}</span>
+      <form method="post" action="/logout" class="logout">
+        <input type="hidden" name="csrf" value="{{ csrf_token | default('') }}">
+        <button type="submit">Sign out</button>
+      </form>
+    </div>
+  </header>
+  <main class="content">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

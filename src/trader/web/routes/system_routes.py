@@ -66,7 +66,10 @@ def _system_data(request: Request) -> dict[str, Any]:
     status = repo.system_status()
     heartbeat = status.get("heartbeat")
     cfg = repo.config_view()
-    heartbeat_minutes = float(cfg.get("alerting", {}).get("heartbeat_minutes", 60) or 60)
+    try:
+        heartbeat_minutes = float(cfg.get("alerting", {}).get("heartbeat_minutes", 60) or 60)
+    except (TypeError, ValueError):
+        heartbeat_minutes = 60.0  # degrade gracefully on an odd config value (never 500)
     threshold_s = heartbeat_minutes * 60 * 2  # tolerate one missed beat
     stale = True
     age_minutes: float | None = None

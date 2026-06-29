@@ -1,6 +1,19 @@
 """Individual risk rules (design §10). Each is a pure function ``(order, ctx) ->
 RuleResult`` evaluated on the RESULTING position and **fail-closed**: missing, stale,
 or uncertain data rejects. The gate (M4.3) composes these into the single chokepoint.
+
+Two invariants from §10 shape these rules:
+
+1. **Evaluate the resulting position, not the order in isolation.** Caps look at where
+   the book ends up after the order fills.
+2. **Never block de-risking.** An order that does not *increase* a symbol's absolute
+   exposure (a reduce/flatten/partial-exit) can never breach a sizing cap, so the
+   notional / position-size / gross-exposure rules exempt it. (Bad-data and policy gates
+   such as ``price_sanity`` / ``allowlist_denylist`` still apply to every order — with
+   auto-flatten OFF by default we deliberately do not force trades on uncertain data.)
+
+The kill-switch check (``DayState.kill_switch_engaged``) and the per-strategy vs
+account-wide limit-scope merge are owned by the gate in M4.3, not by these primitives.
 """
 
 from __future__ import annotations
@@ -53,11 +66,21 @@ def _signed(order: Order) -> int:
     return order.quantity if order.side is Side.BUY else -order.quantity
 
 
+def _reduces_or_holds_exposure(order: Order, ctx: RuleContext) -> bool:
+    """True when the order does not increase the symbol's absolute position (a
+    de-risking / flattening order). Such an order cannot raise notional, position
+    size, or gross exposure, so the sizing caps must let it through — we must never
+    prevent cutting risk, even when already over a cap (design §10)."""
+    current = _position_qty(order.symbol, ctx.positions)
+    return abs(current + _signed(order)) <= abs(current)
+
+
 def allowlist_denylist(order: Order, ctx: RuleContext) -> RuleResult:
-    if order.symbol in ctx.config.denylist:
-        return _reject(f"{order.symbol} is denylisted")
-    if ctx.config.allowlist and order.symbol not in ctx.config.allowlist:
-        return _reject(f"{order.symbol} not in allowlist")
+    symbol = order.symbol.strip().upper()
+    if symbol in ctx.config.denylist:
+        return _reject(f"{symbol} is denylisted")
+    if ctx.config.allowlist and symbol not in ctx.config.allowlist:
+        return _reject(f"{symbol} not in allowlist")
     return RuleResult(ok=True)
 
 
@@ -82,10 +105,22 @@ def price_sanity(order: Order, ctx: RuleContext) -> RuleResult:
     age_s = (ctx.now - quote.ts).total_seconds()
     if age_s > ctx.config.max_staleness_seconds:
         return _reject(f"stale quote ({age_s:.0f}s > {ctx.config.max_staleness_seconds}s)")
+    band = ctx.config.max_deviation_from_prev_close_pct
+    if band > 0 and quote.prev_close is not None and quote.prev_close > 0:
+        deviation = abs(quote.last - quote.prev_close) / quote.prev_close * 100
+        if deviation > Decimal(str(band)):
+            return _reject(
+                f"price {quote.last} deviates {deviation:.1f}% from prev close "
+                f"{quote.prev_close} (> {band}% band; bad tick)"
+            )
     return RuleResult(ok=True)
 
 
 def max_order_notional(order: Order, ctx: RuleContext) -> RuleResult:
+    if _reduces_or_holds_exposure(order, ctx):
+        return RuleResult(ok=True)  # exits/reductions are not subject to the entry cap
+    if ctx.quote is None:
+        return _reject("no quote (fail closed)")
     price = _ref_price(order, ctx)
     if price is None or price <= 0:
         return _reject("no price (fail closed)")
@@ -99,6 +134,10 @@ def max_order_notional(order: Order, ctx: RuleContext) -> RuleResult:
 
 
 def max_position_size(order: Order, ctx: RuleContext) -> RuleResult:
+    if _reduces_or_holds_exposure(order, ctx):
+        return RuleResult(ok=True)  # reducing the position can never breach its cap
+    if ctx.quote is None:
+        return _reject("no quote (fail closed)")
     price = _ref_price(order, ctx)
     if price is None or price <= 0:
         return _reject("no price (fail closed)")
@@ -114,15 +153,24 @@ def max_position_size(order: Order, ctx: RuleContext) -> RuleResult:
 
 
 def max_gross_exposure(order: Order, ctx: RuleContext) -> RuleResult:
+    if _reduces_or_holds_exposure(order, ctx):
+        return RuleResult(ok=True)  # a reduction lowers (never raises) gross exposure
+    if ctx.quote is None:
+        return _reject("no quote (fail closed)")
     price = _ref_price(order, ctx)
     if price is None or price <= 0:
         return _reject("no price (fail closed)")
-    gross = sum((abs(p.market_value) for p in ctx.positions), Decimal(0))
-    new_notional = Decimal(order.quantity) * price
-    if gross + new_notional > ctx.config.max_gross_exposure_usd:
-        return _reject(
-            f"gross exposure {gross + new_notional} exceeds cap {ctx.config.max_gross_exposure_usd}"
-        )
+    # Gross on the RESULTING book: keep every other symbol at its mark, revalue the
+    # order's symbol at its resulting size. (Adding full new notional on top of the
+    # existing same-symbol market value would double-count and is wrong for add-ons.)
+    resulting_qty = _position_qty(order.symbol, ctx.positions) + _signed(order)
+    gross = sum(
+        (abs(p.market_value) for p in ctx.positions if p.symbol != order.symbol), Decimal(0)
+    )
+    gross += abs(Decimal(resulting_qty) * price)
+    cap = ctx.config.max_gross_exposure_usd
+    if gross > cap:
+        return _reject(f"gross exposure {gross} exceeds cap {cap}")
     return RuleResult(ok=True)
 
 

@@ -24,8 +24,19 @@ def _order(side: Side = Side.BUY, qty: int = 10, symbol: str = "AAPL", cid: str 
     return Order(cid, "s1", symbol, side, qty, OrderType.MARKET)
 
 
-def _quote(last: str = "100", bid: str = "99.5", ask: str = "100.5", ts: datetime = NOW) -> Quote:
-    return Quote("AAPL", ts, Decimal(last), Decimal(bid), Decimal(ask), 1000)
+def _limit(side: Side = Side.BUY, qty: int = 10, limit: str = "100", symbol: str = "AAPL") -> Order:
+    return Order("c1", "s1", symbol, side, qty, OrderType.LIMIT, Decimal(limit))
+
+
+def _quote(
+    last: str = "100",
+    bid: str = "99.5",
+    ask: str = "100.5",
+    ts: datetime = NOW,
+    prev_close: str | None = None,
+) -> Quote:
+    pc = Decimal(prev_close) if prev_close is not None else None
+    return Quote("AAPL", ts, Decimal(last), Decimal(bid), Decimal(ask), 1000, pc)
 
 
 _UNSET = object()  # sentinel so quote=None is distinguishable from "use default"
@@ -150,6 +161,16 @@ def test_price_sanity_rejects_zero_negative_wide_spread_and_stale() -> None:
 # --- fail-closed on missing data -------------------------------------------- #
 
 
+def test_price_sanity_rejects_bad_tick_beyond_prev_close_band() -> None:
+    # 10x bad tick (last=100 vs prev_close=10 => 900% deviation > 20% default band)
+    bad = _ctx(quote=_quote(last="100", prev_close="10"))
+    assert rules.price_sanity(_order(), bad).ok is False
+    within = _ctx(quote=_quote(last="110", prev_close="100"))  # 10% <= 20% band
+    assert rules.price_sanity(_order(), within).ok is True
+    no_pc = _ctx(quote=_quote(last="100"))  # prev_close None => band check skipped
+    assert rules.price_sanity(_order(), no_pc).ok is True
+
+
 def test_fail_closed_on_missing_quote() -> None:
     ctx = _ctx(quote=None)
     for rule in (
@@ -159,3 +180,71 @@ def test_fail_closed_on_missing_quote() -> None:
         rules.max_gross_exposure,
     ):
         assert rule(_order(), ctx).ok is False, rule.__name__
+
+
+def test_limit_order_fail_closed_on_missing_quote() -> None:
+    # H1 regression: a LIMIT order carries its own price, but missing market data
+    # must still fail closed in the cap rules (not just price_sanity).
+    ctx = _ctx(quote=None)
+    for rule in (rules.max_order_notional, rules.max_position_size, rules.max_gross_exposure):
+        assert rule(_limit(qty=10), ctx).ok is False, rule.__name__
+
+
+# --- never block de-risking (design §10) ------------------------------------ #
+
+
+def test_reducing_sell_exempt_from_notional_cap() -> None:
+    # Hold 100; SELL 10 with a tiny cap that would clamp/reject a fresh entry.
+    held = (Position("AAPL", 100, Decimal("100"), Decimal("10000")),)
+    ctx = _ctx(positions=held, config=RiskConfig(max_order_notional_usd=Decimal("50")))
+    result = rules.max_order_notional(_order(side=Side.SELL, qty=10), ctx)
+    assert result.ok is True and result.clamped_quantity is None
+
+
+def test_reducing_sell_exempt_from_gross_when_over_cap() -> None:
+    # Already over the gross cap; a reduction must still be allowed.
+    held = (Position("AAPL", 300, Decimal("100"), Decimal("30000")),)  # $30k > $25k cap
+    ctx = _ctx(positions=held)
+    assert rules.max_gross_exposure(_order(side=Side.SELL, qty=100), ctx).ok is True
+
+
+def test_reducing_sell_exempt_from_position_cap_when_over() -> None:
+    # Position already over its size cap (e.g. adopted via reconciliation); de-risk allowed.
+    held = (Position("AAPL", 300, Decimal("100"), Decimal("30000")),)  # cap is 100 shares
+    ctx = _ctx(positions=held)
+    assert rules.max_position_size(_order(side=Side.SELL, qty=50), ctx).ok is True
+
+
+def test_position_cap_flip_through_zero_into_large_short_rejected() -> None:
+    # SELL 300 from long 100 => resulting short 200 (abs 200 > 100 cap), an exposure
+    # INCREASE on the short side -> not exempt, must be rejected.
+    held = (Position("AAPL", 100, Decimal("100"), Decimal("10000")),)
+    assert (
+        rules.max_position_size(_order(side=Side.SELL, qty=300), _ctx(positions=held)).ok is False
+    )
+
+
+def test_cover_short_exempt() -> None:
+    held = (Position("AAPL", -100, Decimal("100"), Decimal("-10000")),)  # short 100
+    assert rules.max_position_size(_order(side=Side.BUY, qty=50), _ctx(positions=held)).ok is True
+
+
+def test_gross_exposure_counts_short_market_value() -> None:
+    held = (Position("MSFT", -100, Decimal("100"), Decimal("-10000")),)  # |mv| = 10000
+    ok = rules.max_gross_exposure(_order(qty=150), _ctx(positions=held))  # 10000 + 15000 == cap
+    assert ok.ok is True
+    over = rules.max_gross_exposure(_order(qty=160), _ctx(positions=held))  # 26000 > cap
+    assert over.ok is False
+
+
+def test_gross_exposure_addon_does_not_double_count() -> None:
+    # Existing AAPL 100 ($10k), BUY 100 more -> resulting 200 ($20k), not $30k.
+    held = (Position("AAPL", 100, Decimal("100"), Decimal("10000")),)
+    assert rules.max_gross_exposure(_order(qty=100), _ctx(positions=held)).ok is True  # 20k <= 25k
+
+
+def test_daily_loss_limit_allows_gain() -> None:
+    gain = DayState(
+        date(2024, 7, 8), Decimal("100000"), Decimal("0"), Decimal("0"), 0, Decimal("-500")
+    )  # negative loss == a gain
+    assert rules.daily_loss_limit(_order(), _ctx(day_state=gain)).ok is True

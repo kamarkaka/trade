@@ -27,8 +27,10 @@ from trader.core.types import SlotSpec
 
 def stable_seed(base_seed: int | None, slot_date: date, strategy_id: str, slot_id: str) -> int:
     """A 64-bit seed, deterministic for a fixed ``base_seed`` and fresh entropy when None."""
+    # 63-bit so the seed fits a signed SQLite INTEGER (the ledger persists it) and
+    # numpy's Generator; 63 bits is ample entropy.
     if base_seed is None:
-        return secrets.randbits(64)  # live: unpredictable, different each day
+        return secrets.randbits(63)  # live: unpredictable, different each day
     # Length-prefix each field so the encoding is unambiguous (a plain delimiter could
     # collide, e.g. ('a|b','c') vs ('a','b|c') — strategy_id/slot_id are user-controlled).
     digest = hashlib.blake2b(digest_size=8)
@@ -36,7 +38,7 @@ def stable_seed(base_seed: int | None, slot_date: date, strategy_id: str, slot_i
         encoded = part.encode("utf-8")
         digest.update(len(encoded).to_bytes(4, "big"))
         digest.update(encoded)
-    return int.from_bytes(digest.digest(), "big")
+    return int.from_bytes(digest.digest(), "big") >> 1  # drop the sign bit -> 63-bit
 
 
 def _bounds(direction: DriftDirection, max_seconds: int) -> tuple[int, int]:

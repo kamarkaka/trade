@@ -1,0 +1,35 @@
+# Frozen backtest config for the M6.8 multi-strategy golden run.
+#
+# Pinned: two strategies (momentum=threshold, meanrev=zscore_revert), a fixed base_seed,
+# zero drift (so fills land on known session bars), and distinct universes (clean
+# per-strategy attribution). The data_cache is a placeholder — the golden test/regen
+# overrides it to a tmp dir holding the in-code bar fixture (observability is excluded
+# from config_hash, so this override never affects the hash).
+mode: backtest
+
+schedule:
+  timezone: America/New_York
+  market_calendar: XNYS
+  base_seed: 20240701          # fixed => reproducible (no entropy)
+
+strategies:
+  - id: momentum
+    name: threshold
+    enabled: true
+    params: { band: 0.02, lot: 10 }
+    universe: [AAPL]
+    slots:
+      - { id: open, time: "10:00", drift_max_minutes: 0 }
+  - id: meanrev
+    name: zscore_revert
+    enabled: true
+    params: { lookback: 5, z_entry: 1.0, z_exit: 0.4, lot: 10 }
+    universe: [MSFT]
+    slots:
+      - { id: mid, time: "11:00", drift_max_minutes: 0 }
+
+risk:
+  allowlist: [AAPL, MSFT]
+
+observability:
+  data_cache: "."              # overridden by the test/regen to the tmp fixture cache

@@ -1,0 +1,564 @@
+{
+  "combined": {
+    "avg_exposure": null,
+    "blotter": [
+      {
+        "client_order_id": "bt-0",
+        "fees": "0",
+        "price": "85.87",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-01T14:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-1",
+        "fees": "0",
+        "price": "83.29",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-02T14:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-2",
+        "fees": "0",
+        "price": "264.00",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "MSFT",
+        "ts": "2024-07-02T15:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-3",
+        "fees": "0",
+        "price": "80.79",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-03T14:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-4",
+        "fees": "0",
+        "price": "76.02",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-05T14:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-5",
+        "fees": "0",
+        "price": "73.74",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-08T14:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-6",
+        "fees": "0",
+        "price": "71.53",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-09T14:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-7",
+        "fees": "0",
+        "price": "69.38",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-10T14:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-8",
+        "fees": "0",
+        "price": "67.30",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-11T14:00:00+00:00"
+      },
+      {
+        "client_order_id": "bt-9",
+        "fees": "0",
+        "price": "65.28",
+        "quantity": 10,
+        "status": "FILLED",
+        "symbol": "AAPL",
+        "ts": "2024-07-12T14:00:00+00:00"
+      }
+    ],
+    "cagr": "-0.16586001",
+    "equity_curve": [
+      {
+        "equity": "100000.00",
+        "ts": "2024-07-01T14:00:00+00:00"
+      },
+      {
+        "equity": "100000.00",
+        "ts": "2024-07-01T15:00:00+00:00"
+      },
+      {
+        "equity": "99974.20",
+        "ts": "2024-07-02T14:00:00+00:00"
+      },
+      {
+        "equity": "99974.20",
+        "ts": "2024-07-02T15:00:00+00:00"
+      },
+      {
+        "equity": "99924.20",
+        "ts": "2024-07-03T14:00:00+00:00"
+      },
+      {
+        "equity": "99924.20",
+        "ts": "2024-07-03T15:00:00+00:00"
+      },
+      {
+        "equity": "99992.30",
+        "ts": "2024-07-05T14:00:00+00:00"
+      },
+      {
+        "equity": "99992.30",
+        "ts": "2024-07-05T15:00:00+00:00"
+      },
+      {
+        "equity": "99901.10",
+        "ts": "2024-07-08T14:00:00+00:00"
+      },
+      {
+        "equity": "99901.10",
+        "ts": "2024-07-08T15:00:00+00:00"
+      },
+      {
+        "equity": "99790.60",
+        "ts": "2024-07-09T14:00:00+00:00"
+      },
+      {
+        "equity": "99790.60",
+        "ts": "2024-07-09T15:00:00+00:00"
+      },
+      {
+        "equity": "99661.60",
+        "ts": "2024-07-10T14:00:00+00:00"
+      },
+      {
+        "equity": "99661.60",
+        "ts": "2024-07-10T15:00:00+00:00"
+      },
+      {
+        "equity": "99516.00",
+        "ts": "2024-07-11T14:00:00+00:00"
+      },
+      {
+        "equity": "99516.00",
+        "ts": "2024-07-11T15:00:00+00:00"
+      },
+      {
+        "equity": "99354.40",
+        "ts": "2024-07-12T14:00:00+00:00"
+      },
+      {
+        "equity": "99354.40",
+        "ts": "2024-07-12T15:00:00+00:00"
+      }
+    ],
+    "final_equity": "99354.40",
+    "fire_log": [
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-01T14:00:00+00:00",
+        "seed": 2581868721684395846,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-01T15:00:00+00:00",
+        "seed": 9115125907512928726,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-02T14:00:00+00:00",
+        "seed": 6890861119595913532,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-02T15:00:00+00:00",
+        "seed": 2599859060606768289,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-03T14:00:00+00:00",
+        "seed": 8451179973438493761,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-03T15:00:00+00:00",
+        "seed": 8999864367341655235,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-05T14:00:00+00:00",
+        "seed": 5327691682688013550,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-05T15:00:00+00:00",
+        "seed": 754851454191542839,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-08T14:00:00+00:00",
+        "seed": 8373206468148324632,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-08T15:00:00+00:00",
+        "seed": 1010066379273354952,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-09T14:00:00+00:00",
+        "seed": 2472823987506912054,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-09T15:00:00+00:00",
+        "seed": 7530243050002257515,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-10T14:00:00+00:00",
+        "seed": 6780125036126663252,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-10T15:00:00+00:00",
+        "seed": 6503730297336704767,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-11T14:00:00+00:00",
+        "seed": 8841837441803842749,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-11T15:00:00+00:00",
+        "seed": 5827984158359099405,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-12T14:00:00+00:00",
+        "seed": 5857806642580086617,
+        "slot_id": "open",
+        "strategy_id": "momentum"
+      },
+      {
+        "drift_seconds": 0,
+        "fire_ts": "2024-07-12T15:00:00+00:00",
+        "seed": 8761840304637391361,
+        "slot_id": "mid",
+        "strategy_id": "meanrev"
+      }
+    ],
+    "hit_rate": null,
+    "max_dd_window": [
+      "2024-07-01T14:00:00+00:00",
+      "2024-07-12T14:00:00+00:00"
+    ],
+    "max_drawdown_pct": "0.00645600",
+    "num_trades": 10,
+    "start_equity": "100000.00",
+    "total_fees": "0",
+    "total_return": "-0.00645600",
+    "turnover": "0.09391677"
+  },
+  "manifest": {
+    "config_hash": "3b2129a0660d347b9ce4f0d3abd90dea581562a70ae273ac5492aa731b4fe0c3",
+    "data_hashes": {
+      "AAPL": "a0d5de881932a07c25b68f4b89d55b1e4f45b1ad5fe1b4672ae0106121c9d5fc",
+      "MSFT": "bf9ef933c564376d588cb8e50b1387ea018550bf0f6200c230af1e562ce95232"
+    },
+    "seed": 20240701
+  },
+  "per_strategy": {
+    "meanrev": {
+      "blotter": [
+        {
+          "client_order_id": "bt-2",
+          "fees": "0",
+          "price": "264.00",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "MSFT",
+          "ts": "2024-07-02T15:00:00+00:00"
+        }
+      ],
+      "equity_curve": [],
+      "equity_metrics": null,
+      "fire_log": [
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-01T15:00:00+00:00",
+          "seed": 9115125907512928726,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-02T15:00:00+00:00",
+          "seed": 2599859060606768289,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-03T15:00:00+00:00",
+          "seed": 8999864367341655235,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-05T15:00:00+00:00",
+          "seed": 754851454191542839,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-08T15:00:00+00:00",
+          "seed": 1010066379273354952,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-09T15:00:00+00:00",
+          "seed": 7530243050002257515,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-10T15:00:00+00:00",
+          "seed": 6503730297336704767,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-11T15:00:00+00:00",
+          "seed": 5827984158359099405,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-12T15:00:00+00:00",
+          "seed": 8761840304637391361,
+          "slot_id": "mid",
+          "strategy_id": "meanrev"
+        }
+      ],
+      "hit_rate": null,
+      "num_trades": 1,
+      "realized_pnl": "0",
+      "total_fees": "0",
+      "turnover": "0.02645543"
+    },
+    "momentum": {
+      "blotter": [
+        {
+          "client_order_id": "bt-0",
+          "fees": "0",
+          "price": "85.87",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-01T14:00:00+00:00"
+        },
+        {
+          "client_order_id": "bt-1",
+          "fees": "0",
+          "price": "83.29",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-02T14:00:00+00:00"
+        },
+        {
+          "client_order_id": "bt-3",
+          "fees": "0",
+          "price": "80.79",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-03T14:00:00+00:00"
+        },
+        {
+          "client_order_id": "bt-4",
+          "fees": "0",
+          "price": "76.02",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-05T14:00:00+00:00"
+        },
+        {
+          "client_order_id": "bt-5",
+          "fees": "0",
+          "price": "73.74",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-08T14:00:00+00:00"
+        },
+        {
+          "client_order_id": "bt-6",
+          "fees": "0",
+          "price": "71.53",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-09T14:00:00+00:00"
+        },
+        {
+          "client_order_id": "bt-7",
+          "fees": "0",
+          "price": "69.38",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-10T14:00:00+00:00"
+        },
+        {
+          "client_order_id": "bt-8",
+          "fees": "0",
+          "price": "67.30",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-11T14:00:00+00:00"
+        },
+        {
+          "client_order_id": "bt-9",
+          "fees": "0",
+          "price": "65.28",
+          "quantity": 10,
+          "status": "FILLED",
+          "symbol": "AAPL",
+          "ts": "2024-07-12T14:00:00+00:00"
+        }
+      ],
+      "equity_curve": [],
+      "equity_metrics": null,
+      "fire_log": [
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-01T14:00:00+00:00",
+          "seed": 2581868721684395846,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-02T14:00:00+00:00",
+          "seed": 6890861119595913532,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-03T14:00:00+00:00",
+          "seed": 8451179973438493761,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-05T14:00:00+00:00",
+          "seed": 5327691682688013550,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-08T14:00:00+00:00",
+          "seed": 8373206468148324632,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-09T14:00:00+00:00",
+          "seed": 2472823987506912054,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-10T14:00:00+00:00",
+          "seed": 6780125036126663252,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-11T14:00:00+00:00",
+          "seed": 8841837441803842749,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        },
+        {
+          "drift_seconds": 0,
+          "fire_ts": "2024-07-12T14:00:00+00:00",
+          "seed": 5857806642580086617,
+          "slot_id": "open",
+          "strategy_id": "momentum"
+        }
+      ],
+      "hit_rate": null,
+      "num_trades": 9,
+      "realized_pnl": "0",
+      "total_fees": "0",
+      "turnover": "0.06746134"
+    }
+  }
+}

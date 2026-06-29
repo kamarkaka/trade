@@ -1,6 +1,13 @@
 """Hypothesis fuzz: at-most-once order placement under randomized timeout/crash/retry
 interleavings (M5.3). The core real-money safety property — a naive retry must never
-double a real position."""
+double a real position.
+
+LIMITATION: this proves at-most-once under a PERFECT reconciler (FakeBroker.find_by_client_id
+is exact + synchronous). The real-world risk — a lagging/eventually-consistent Schwab
+open-orders query returning None for an order that DID land — is NOT exercised here; an
+unreliable-reconciler fuzz + the refuse-and-alert guard are exit criteria for go-live
+(M5.6/M5.7), when the production reconciler is built and the Location order id is captured
+at submit so adoption keys on a real id rather than intent-matching."""
 
 import contextlib
 

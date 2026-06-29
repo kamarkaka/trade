@@ -6,7 +6,7 @@ from pathlib import Path
 
 from trader.core import Fill, Position
 from trader.core.enums import OrderStatus, Side
-from trader.state.attribution import UNKNOWN, AttributionLedger
+from trader.state.attribution import UNKNOWN, AttributedPosition, AttributionLedger
 from trader.state.db import connect
 from trader.state.migrate import run_migrations
 
@@ -55,10 +55,46 @@ def test_independent_strategies_same_symbol(tmp_path: Path) -> None:
 
 def test_reconcile_parks_unattributed_delta(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
-    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # attributed 6
+    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # real attributed = 6
     broker = [Position("AAPL", 10, Decimal("100"), Decimal("1000"))]  # broker holds 10
     parked = ledger.reconcile_total(broker)
-    assert parked == [type(parked[0])(UNKNOWN, "AAPL", 4, Decimal("100"))]  # 10 - 6 = 4
+    assert parked == [AttributedPosition(UNKNOWN, "AAPL", 4, Decimal("100"))]  # 10 - 6
     assert ledger.get_attributed(UNKNOWN)[0].quantity == 4
-    # idempotent: re-running now ties out (unknown counted) -> nothing new parked
-    assert ledger.reconcile_total(broker) == []
+    # state-idempotent: re-running with the same broker keeps unknown = 4 (not doubled)
+    assert ledger.reconcile_total(broker) == parked
+    assert ledger.get_attributed(UNKNOWN)[0].quantity == 4
+
+
+def test_reconcile_tracks_drift_and_clears_when_tied(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # real = 6
+
+    ledger.reconcile_total([Position("AAPL", 10, Decimal("100"), Decimal("1000"))])
+    assert ledger.get_attributed(UNKNOWN)[0].quantity == 4  # 10 - 6
+
+    # broker grows: unknown becomes the new residual (9), not 4 + drift
+    ledger.reconcile_total([Position("AAPL", 15, Decimal("100"), Decimal("1500"))])
+    assert ledger.get_attributed(UNKNOWN)[0].quantity == 9  # 15 - 6
+
+    # broker returns to exactly the real attribution: stale unknown row is cleared
+    ledger.reconcile_total([Position("AAPL", 6, Decimal("100"), Decimal("600"))])
+    assert ledger.get_attributed(UNKNOWN) == []
+
+
+def test_reconcile_negative_delta_when_attributed_exceeds_broker(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # real = 6
+    parked = ledger.reconcile_total([])  # broker flat -> residual -6
+    assert parked == [AttributedPosition(UNKNOWN, "AAPL", -6, Decimal("0"))]
+
+
+def test_reconcile_multi_symbol(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    ledger.apply(_fill("AAPL", 5, "100"), "m", Side.BUY)
+    ledger.apply(_fill("MSFT", 3, "200"), "m", Side.BUY)
+    broker = [
+        Position("AAPL", 5, Decimal("100"), Decimal("500")),  # ties out -> no residual
+        Position("MSFT", 4, Decimal("200"), Decimal("800")),  # +1 residual
+    ]
+    parked = ledger.reconcile_total(broker)
+    assert parked == [AttributedPosition(UNKNOWN, "MSFT", 1, Decimal("200"))]

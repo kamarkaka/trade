@@ -48,6 +48,8 @@ class AttributionLedger:
         self._conn = conn
 
     def apply(self, fill: Fill, strategy_id: str, side: Side) -> None:
+        # SELECT-then-upsert is safe under the single global cycle lock (§7.5), which
+        # serializes the only writer; it would be a read-modify-write race without it.
         if fill.quantity == 0:
             return
         signed = fill.quantity if side is Side.BUY else -fill.quantity
@@ -71,25 +73,34 @@ class AttributionLedger:
         ]
 
     def reconcile_total(self, broker_positions: Sequence[Position]) -> list[AttributedPosition]:
-        """Park (broker - attributed) under 'unknown' for every symbol that doesn't tie out."""
-        attributed = {
+        """Set 'unknown' = broker - real-attributed for each symbol; return the residual.
+
+        Idempotent in state: the parked 'unknown' quantity is always exactly the true
+        residual (the *real*, non-'unknown' attribution is excluded from the sum), and a
+        symbol that has come to tie out has its stale 'unknown' row cleared.
+        """
+        real = {
             sym: int(qty)
             for sym, qty in self._conn.execute(
-                "SELECT symbol, SUM(quantity) FROM attributed_position GROUP BY symbol"
+                "SELECT symbol, SUM(quantity) FROM attributed_position "
+                "WHERE strategy_id != ? GROUP BY symbol",
+                (UNKNOWN,),
             ).fetchall()
         }
         broker = {p.symbol: p for p in broker_positions}
-        parked: list[AttributedPosition] = []
-        for symbol in sorted(set(attributed) | set(broker)):
+        # union of broker, real-attributed, and existing 'unknown' rows (so stale
+        # 'unknown' rows are revisited and cleared when they newly tie out)
+        existing_unknown = {p.symbol for p in self.get_attributed(UNKNOWN)}
+        residual: list[AttributedPosition] = []
+        for symbol in sorted(set(real) | set(broker) | existing_unknown):
             broker_pos = broker.get(symbol)
             broker_qty = broker_pos.quantity if broker_pos is not None else 0
-            delta = broker_qty - attributed.get(symbol, 0)
-            if delta == 0:
-                continue
+            delta = broker_qty - real.get(symbol, 0)
             avg = broker_pos.avg_price if broker_pos is not None else Decimal("0")
-            self._upsert(UNKNOWN, symbol, delta, avg)
-            parked.append(AttributedPosition(UNKNOWN, symbol, delta, avg))
-        return parked
+            self._upsert(UNKNOWN, symbol, delta, avg)  # delta == 0 deletes a stale row
+            if delta != 0:
+                residual.append(AttributedPosition(UNKNOWN, symbol, delta, avg))
+        return residual
 
     def _upsert(self, strategy_id: str, symbol: str, quantity: int, avg_price: Decimal) -> None:
         if quantity == 0:

@@ -86,5 +86,51 @@ def test_reauth_without_credentials_errors(monkeypatch: pytest.MonkeyPatch) -> N
     assert "reauth error" in result.output
 
 
+def test_data_fetch_without_credentials_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)
+    monkeypatch.delenv("SCHWAB_APP_SECRET", raising=False)
+    result = runner.invoke(
+        app, ["data", "fetch", "--symbols", "AAPL", "--start", "2023-01-01", "--end", "2023-12-31"]
+    )
+    assert result.exit_code != 0
+    assert "data fetch error" in result.output
+
+
+def test_data_fetch_rejects_bad_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = runner.invoke(
+        app, ["data", "fetch", "--symbols", "AAPL", "--start", "01/01/2023", "--end", "2023-12-31"]
+    )
+    assert result.exit_code != 0
+    assert "YYYY-MM-DD" in result.output
+
+
+def test_data_fetch_rejects_reversed_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = runner.invoke(
+        app, ["data", "fetch", "--symbols", "AAPL", "--start", "2023-12-31", "--end", "2023-01-01"]
+    )
+    assert result.exit_code != 0
+    assert "on or after" in result.output
+
+
+def test_data_fetch_rejects_non_daily(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "data",
+            "fetch",
+            "--symbols",
+            "AAPL",
+            "--start",
+            "2023-01-01",
+            "--end",
+            "2023-12-31",
+            "--freq",
+            "minute",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "only --freq daily" in result.output
+
+
 def test_console_script_entrypoint_is_callable() -> None:
     assert callable(app)  # Typer instances are callable (console_scripts entry point)

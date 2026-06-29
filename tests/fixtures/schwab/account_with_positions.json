@@ -1,0 +1,15 @@
+{
+  "securitiesAccount": {
+    "type": "MARGIN",
+    "accountNumber": "HASHEDACCT",
+    "currentBalances": {
+      "cashBalance": "1000.00",
+      "buyingPower": "5000.00",
+      "liquidationValue": "12345.67"
+    },
+    "positions": [
+      {"instrument": {"symbol": "AAPL", "assetType": "EQUITY"}, "longQuantity": 10, "shortQuantity": 0, "averagePrice": "150.00", "marketValue": "1502.50"},
+      {"instrument": {"symbol": "TSLA", "assetType": "EQUITY"}, "longQuantity": 0, "shortQuantity": 5, "averagePrice": "200.00", "marketValue": "-1000.00"}
+    ]
+  }
+}

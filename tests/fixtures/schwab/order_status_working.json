@@ -1,0 +1,8 @@
+{
+  "orderId": "1003490105",
+  "status": "QUEUED",
+  "quantity": 10,
+  "filledQuantity": 0,
+  "orderType": "LIMIT",
+  "price": "150.25"
+}

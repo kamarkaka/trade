@@ -11,3 +11,4 @@ pytest>=9.1.1
 pytest-cov>=7.1.0
 pre-commit>=4.6.0
 types-PyYAML>=6  # mypy stubs for pyyaml (M0.5)
+respx>=0.21  # httpx mocking for Schwab contract tests (M1.4)

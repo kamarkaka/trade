@@ -13,7 +13,7 @@ Enum-typed fields accept either an enum member or its string value (coerced).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 
@@ -294,6 +294,7 @@ class SlotSpec:
     drift_direction: DriftDirection = DriftDirection.FORWARD
     distribution: Distribution = Distribution.UNIFORM
     on_overshoot: OnOvershoot = OnOvershoot.CLAMP
+    catch_up: bool | None = None  # None => inherit the global schedule.catch_up
 
     def __post_init__(self) -> None:
         if not isinstance(self.at, time):
@@ -306,6 +307,8 @@ class SlotSpec:
         object.__setattr__(self, "drift_direction", DriftDirection(self.drift_direction))
         object.__setattr__(self, "distribution", Distribution(self.distribution))
         object.__setattr__(self, "on_overshoot", OnOvershoot(self.on_overshoot))
+        if self.catch_up is not None and not isinstance(self.catch_up, bool):
+            raise TypeError("catch_up must be a bool or None")
 
 
 @dataclass(frozen=True)
@@ -315,11 +318,13 @@ class StrategyBinding:
 
     strategy_id: str
     strategy_name: str
-    params: dict[str, object]
+    # dict fields are excluded from __hash__ (dicts are unhashable) so a binding can
+    # still be used as a dict key / set member; they remain part of __eq__.
+    params: dict[str, object] = field(hash=False)
     universe: tuple[str, ...]
     slots: tuple[SlotSpec, ...]
     enabled: bool = True
-    risk_overrides: dict[str, object] | None = None
+    risk_overrides: dict[str, object] | None = field(default=None, hash=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "universe", tuple(self.universe))

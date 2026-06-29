@@ -75,6 +75,33 @@ def _load(config: Path) -> AppConfig:
         raise typer.Exit(1) from exc
 
 
+def _heartbeat_fresh(cfg: AppConfig) -> bool:
+    """True iff the daemon's heartbeat exists and is fresh (backs ``--healthcheck``).
+
+    Stale if older than two heartbeat intervals (tolerates one missed beat). Reads
+    defensively: a missing DB / unmigrated state / unreadable row is "not alive" rather
+    than an error, so the probe never crashes the container."""
+    from trader.observability.heartbeat import Heartbeat
+    from trader.state.db import read_only_connect
+
+    db_path = Path(cfg.observability.db_path)
+    if not db_path.exists():
+        return False
+    # The daemon must touch the heartbeat at least every heartbeat_minutes (wired in
+    # M4.7); 2x tolerates a single missed beat.
+    max_age = cfg.alerting.heartbeat_minutes * 60 * 2
+    try:
+        conn = read_only_connect(db_path)
+    except Exception:
+        return False
+    try:
+        return Heartbeat(conn, clock=RealClock(), max_age_seconds=max_age).is_alive()
+    except Exception:
+        return False  # any unexpected read error => unhealthy, never a crashing probe
+    finally:
+        conn.close()
+
+
 def _schwab_config(cfg: AppConfig, *, require_credentials: bool = False) -> SchwabClientConfig:
     """Build the Schwab client config from env + a couple of AppConfig settings."""
     default_token_store = Path(cfg.observability.db_path).parent / "schwab_token.sqlite"
@@ -112,9 +139,9 @@ def status(
     """Show mode, strategies, and auth status (or a healthcheck exit code)."""
     cfg = _load(config)
     if healthcheck:
-        # M0.9: config loads => the binary is healthy. The real heartbeat-based
-        # liveness check is wired in M4.
-        raise typer.Exit(0)
+        # Docker HEALTHCHECK (§16.1): fresh daemon heartbeat => exit 0, stale/missing =>
+        # non-zero so the container is marked unhealthy and restarted.
+        raise typer.Exit(0 if _heartbeat_fresh(cfg) else 1)
     typer.echo(f"mode: {cfg.mode.value}")
     typer.echo(f"strategies: {', '.join(s.id for s in cfg.strategies)}")
     typer.echo(_auth_status_line(cfg))

@@ -196,8 +196,11 @@ def test_replace_order_returns_new_id(tmp_path: Path) -> None:
 def test_poll_status_maps_enums() -> None:
     filled = parse_order_status(_fixture("order_status_filled.json"))
     assert filled.status is OrderStatus.FILLED and filled.filled_quantity == 10
+    # quantity-weighted avg over the execution legs: (6*150.00 + 4*150.25)/10 = 150.10
+    assert filled.average_price == Decimal("150.10") and filled.symbol == "AAPL"
     working = parse_order_status(_fixture("order_status_working.json"))
     assert working.status is OrderStatus.WORKING  # QUEUED (in-flight) maps to WORKING
+    assert working.average_price == Decimal("0") and working.symbol == "MSFT"  # nothing filled
     # unknown / in-flight statuses NEVER map to a fill
     assert map_order_status("AWAITING_MANUAL_REVIEW") is OrderStatus.WORKING
     assert map_order_status("CANCELED") is OrderStatus.CANCELED

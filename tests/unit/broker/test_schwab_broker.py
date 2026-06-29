@@ -119,6 +119,33 @@ def test_status_mapping_working_is_zero_fill() -> None:
     assert fill.status is OrderStatus.WORKING and fill.quantity == 0 and fill.price == Decimal("0")
 
 
+def test_status_mapping_partial_fill() -> None:
+    client = _FakeTradingClient()
+    broker = _broker(client)
+    broker.submit_order(_order(qty=10))
+    client.set_status(
+        "SCHWAB-1",
+        SchwabOrderStatus(
+            "SCHWAB-1", OrderStatus.PARTIAL_FILL, "AAPL", 10, 6, Decimal("150.00"), "PARTIAL_FILL"
+        ),
+    )
+    fill = broker.get_order("SCHWAB-1")
+    assert fill.status is OrderStatus.PARTIAL_FILL
+    assert fill.quantity == 6 and fill.price == Decimal("150.00")  # cumulative filled qty
+
+
+def test_get_order_after_restart_has_empty_cid() -> None:
+    # No submit recorded this process (in-memory map empty) -> client_order_id falls back to
+    # "" and symbol comes from the status (crash-safe recovery is M5.3).
+    client = _FakeTradingClient()
+    client.set_status(
+        "SCHWAB-9",
+        SchwabOrderStatus("SCHWAB-9", OrderStatus.FILLED, "TSLA", 5, 5, Decimal("200"), "FILLED"),
+    )
+    fill = _broker(client).get_order("SCHWAB-9")
+    assert fill.client_order_id == "" and fill.symbol == "TSLA"
+
+
 def test_cancel_delegates() -> None:
     client = _FakeTradingClient()
     _broker(client).cancel_order("SCHWAB-1")

@@ -1,0 +1,43 @@
+# Read-only monitoring web UI image (design §16.6 / §19, M7.11). Separate from the trader
+# image so the UI has its OWN process + (mostly) its own dep surface; it shares NO broker code
+# (enforced by the M7.10 import-isolation tests). Build from the repo root:
+#   docker build --platform=linux/amd64 -f deploy/Dockerfile.web -t trader-web:dev .
+FROM python:3.11-slim AS runtime
+
+# tzdata: the UI renders timestamps in America/New_York. ca-certificates: TLS. curl: the
+# compose healthcheck hits /healthz. No compilers — all deps ship manylinux wheels.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Non-root runtime user. /state is a mounted volume; the web opens it READ-ONLY (mode=ro), so
+# it never needs write ownership — but the dir must exist as a mount point.
+RUN useradd --create-home --uid 10002 --shell /usr/sbin/nologin web \
+    && mkdir -p /state /config \
+    && chown -R web:web /state /config
+
+WORKDIR /app
+
+# Pinned deps first (own cache layer): the shared trader closure, then the web-only additions.
+# wheel-only so a missing wheel fails LOUDLY (no source compile — no toolchain in the image).
+COPY deploy/requirements.txt deploy/web-requirements.txt ./
+RUN pip install --no-cache-dir --only-binary=:all: -r requirements.txt -r web-requirements.txt
+
+# Then the package itself, WITHOUT re-resolving deps (reproducible). NO dev deps, NO secrets.
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip install --no-cache-dir --no-deps .
+
+USER web
+
+# Liveness: /healthz (200 when the read-only state DB answers, 503 otherwise) — never raises.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+
+# Exec form so uvicorn is PID 1 and SIGTERM reaches it for a clean shutdown.
+ENTRYPOINT ["trader-web"]

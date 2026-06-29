@@ -47,6 +47,8 @@ dev = [
 [project.scripts]
 # Placeholder entry point in M0.1; the full Typer app is built in M0.9.
 trader = "trader.app.cli:app"
+# Read-only monitoring web UI server (M7.11); runs in its own container behind Caddy.
+trader-web = "trader.app.web_main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trader"]

@@ -3,6 +3,8 @@ client_order_id uniqueness + injection (M3.8)."""
 
 from decimal import Decimal
 
+import pytest
+
 from trader.config.models import ExecutionConfig
 from trader.core import Decision
 from trader.core.enums import Action, OrderType, Side
@@ -54,6 +56,13 @@ def test_client_order_id_unique() -> None:
     b = size_decision(Decision(Action.BUY, "AAPL", 1), "s1", MARKET)
     assert a is not None and b is not None
     assert a.client_order_id != b.client_order_id
+
+
+def test_limit_without_price_fails_loud() -> None:
+    # a LIMIT exec config with a decision that supplied no limit_price is a bug:
+    # Order() raises rather than silently dropping the intent.
+    with pytest.raises(ValueError, match="LIMIT order requires a limit_price"):
+        size_decision(Decision(Action.BUY, "AAPL", 10), "s1", LIMIT)
 
 
 def test_id_factory_injected() -> None:

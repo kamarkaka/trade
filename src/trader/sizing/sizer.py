@@ -30,6 +30,8 @@ def size_decision(
     side = Side.BUY if decision.action is Action.BUY else Side.SELL
     order_type = exec_cfg.order_type
     # limit_price only travels on LIMIT orders (a MARKET Order must not carry one).
+    # A LIMIT exec config with a decision that supplied no limit_price is a strategy
+    # bug: Order() will raise (fail loud) rather than silently drop the intent.
     limit_price = decision.limit_price if order_type is OrderType.LIMIT else None
     return Order(
         client_order_id=id_factory(),

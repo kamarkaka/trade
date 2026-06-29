@@ -14,7 +14,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SecretStr
 
 
 class WebSettings(BaseModel):
@@ -23,8 +23,11 @@ class WebSettings(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     admin_user: str
-    admin_password_hash: str  # argon2id hash; NEVER the plaintext password
-    session_secret: str  # signs the stateless session cookie (itsdangerous)
+    # SecretStr so the hash + signing key never appear in a repr/str/log/traceback-locals
+    # dump (matches the M1 token convention). Read at the verify/sign call site via
+    # ``.get_secret_value()``.
+    admin_password_hash: SecretStr  # argon2id hash; NEVER the plaintext password
+    session_secret: SecretStr  # signs the stateless session cookie (itsdangerous)
     db_path: Path  # read-only handle onto the trading state DB (observability.db_path)
     config_path: Path = Path("/config/config.yaml")
     session_idle_seconds: int = 1800  # 30 min idle timeout
@@ -47,12 +50,17 @@ class WebSettings(BaseModel):
 
         def _int(key: str, default: int) -> int:
             raw = env.get(key)
-            return default if raw is None or raw == "" else int(raw)
+            if raw is None or raw == "":
+                return default
+            try:
+                return int(raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid integer for web env var {key}: {raw!r}") from exc
 
         return cls(
             admin_user=_required("WEB_ADMIN_USER"),
-            admin_password_hash=_required("WEB_ADMIN_PASSWORD_HASH"),
-            session_secret=_required("SESSION_SECRET"),
+            admin_password_hash=SecretStr(_required("WEB_ADMIN_PASSWORD_HASH")),
+            session_secret=SecretStr(_required("SESSION_SECRET")),
             db_path=Path(env.get("WEB_DB_PATH", "/state/trader.sqlite")),
             config_path=Path(env.get("WEB_CONFIG_PATH", "/config/config.yaml")),
             session_idle_seconds=_int("SESSION_IDLE_SECONDS", 1800),

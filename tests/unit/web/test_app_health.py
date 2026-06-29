@@ -74,3 +74,19 @@ def test_no_openapi_or_docs(client: TestClient) -> None:
     # Attack surface kept minimal: interactive docs / schema are disabled.
     assert client.get("/openapi.json").status_code == 404
     assert client.get("/docs").status_code == 404
+
+
+def test_secrets_not_in_repr(tmp_path: Path) -> None:
+    # The password hash + session secret must never appear in a repr/str (log/traceback leak).
+    settings = WebSettings(
+        admin_user="admin",
+        admin_password_hash="$argon2id$SUPERSECRETHASH",
+        session_secret="SUPERSECRETKEY",
+        db_path=tmp_path / "x.sqlite",
+    )
+    for blob in (repr(settings), str(settings)):
+        assert "SUPERSECRETHASH" not in blob
+        assert "SUPERSECRETKEY" not in blob
+    # but the values are still retrievable for verification/signing
+    assert settings.admin_password_hash.get_secret_value() == "$argon2id$SUPERSECRETHASH"
+    assert settings.session_secret.get_secret_value() == "SUPERSECRETKEY"

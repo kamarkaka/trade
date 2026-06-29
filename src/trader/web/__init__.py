@@ -7,3 +7,8 @@ code path — nothing under ``trader.web`` may import ``trader.broker``, ``trade
 ``trader.execution``, or ``trader.auth`` (enforced by the M7 import-isolation tests). All
 control (kill switch, enable/disable, config) is via the CLI + config file, never the UI.
 """
+
+from trader.web.app import create_app
+from trader.web.settings import WebSettings
+
+__all__ = ["WebSettings", "create_app"]

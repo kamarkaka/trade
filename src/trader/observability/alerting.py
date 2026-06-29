@@ -126,7 +126,10 @@ class TelegramAlerter(Alerter):
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise AlertSendError(f"telegram send failed: HTTP {exc.response.status_code}") from None
-        except httpx.HTTPError as exc:
+        except Exception as exc:
+            # Catch-all (not just httpx.HTTPError): some httpx errors are NOT HTTPError
+            # subclasses, and any of them may stringify the token-bearing URL. Surface only
+            # the exception TYPE so the token can never escape through this raise.
             raise AlertSendError(f"telegram send failed: {type(exc).__name__}") from None
 
     def close(self) -> None:
@@ -242,7 +245,14 @@ class MultiAlerter(Alerter):
         for channel in self._channels:
             closer = getattr(channel, "close", None)
             if callable(closer):
-                closer()
+                try:
+                    closer()
+                except Exception as exc:  # one channel's cleanup must not abort the rest
+                    self._log.warning(
+                        "alert channel close failed",
+                        channel=type(channel).__name__,
+                        error_type=type(exc).__name__,
+                    )
 
 
 def build_alerter(

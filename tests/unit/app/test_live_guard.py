@@ -1,5 +1,6 @@
-"""Go-live guard: double-confirm refusal, conservative preflight, and the mandatory
-startup-live alert (M5.6). CI-enforced so the real-money gate is never manual."""
+"""Go-live guard: double-confirm refusal, conservative preflight (effective per-strategy
+caps, alert channel, idempotency blocker), and the startup-live alert (M5.6). CI-enforced
+so the real-money gate is never manual."""
 
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,7 @@ from trader.app.live_guard import (
     live_preflight,
 )
 from trader.config.models import AppConfig
+from trader.core.types import StrategyBinding
 
 runner = CliRunner()
 
@@ -37,6 +39,40 @@ def _cfg(**risk: object) -> AppConfig:
     return AppConfig.model_validate(base)
 
 
+def _bindings(*, overrides: dict[str, object] | None = None) -> list[StrategyBinding]:
+    return [
+        StrategyBinding(
+            strategy_id="m",
+            strategy_name="threshold",
+            params={},
+            universe=("AAPL",),
+            slots=(),
+            enabled=True,
+            risk_overrides=overrides,
+        )
+    ]
+
+
+# safe account config that clears every NON-idempotency check
+def _safe_cfg() -> AppConfig:
+    return _cfg(
+        allowlist=["AAPL"],
+        max_order_notional_usd=Decimal("500"),
+        max_position_size_pct=2.0,
+        max_gross_exposure_usd=Decimal("4000"),
+    )
+
+
+def _pf(config: AppConfig, bindings: list[StrategyBinding], **kw: object) -> list[PreflightProblem]:
+    defaults: dict[str, object] = {
+        "kill_switch_engaged": False,
+        "token_valid": True,
+        "alert_channel_count": 1,
+    }
+    defaults.update(kw)
+    return live_preflight(config, bindings, **defaults)  # type: ignore[arg-type]
+
+
 # --- double confirm --------------------------------------------------------- #
 
 
@@ -44,9 +80,8 @@ def test_live_confirmed_signals() -> None:
     assert live_confirmed(confirm_flag=False, environ={}) is False
     assert live_confirmed(confirm_flag=True, environ={}) is True
     assert live_confirmed(confirm_flag=False, environ={CONFIRM_ENV_VAR: "I_UNDERSTAND"}) is True
-    assert (
-        live_confirmed(confirm_flag=False, environ={CONFIRM_ENV_VAR: "yes"}) is False
-    )  # wrong phrase
+    assert live_confirmed(confirm_flag=False, environ={CONFIRM_ENV_VAR: "yes"}) is False
+    assert live_confirmed(confirm_flag=False, environ={CONFIRM_ENV_VAR: ""}) is False
 
 
 def test_refuses_live_without_confirm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,39 +97,59 @@ def test_refuses_live_without_confirm(tmp_path: Path, monkeypatch: pytest.Monkey
     assert "SECOND confirmation" in result.output  # exits at the gate, before any network
 
 
-# --- preflight -------------------------------------------------------------- #
+# --- preflight: idempotency blocker (M5.6 refuses live until M5.7) ----------- #
 
 
-def test_preflight_requires_allowlist_and_small_caps() -> None:
-    # Default RiskConfig: no allowlist, notional 5000 > 1000, position 10% > 5%.
-    problems = live_preflight(_cfg(), kill_switch_engaged=False, token_valid=True)
-    checks = {p.check for p in problems}
-    assert "allowlist" in checks
-    assert "max_order_notional_usd" in checks
-    assert "max_position_size_pct" in checks
+def test_preflight_refuses_until_idempotent_by_default() -> None:
+    # A fully clean config still cannot go live in M5.6: the submit path isn't idempotent yet.
+    problems = _pf(_safe_cfg(), _bindings())
+    assert [p.check for p in problems] == ["idempotency"]
 
 
-def test_preflight_clean_passes() -> None:
-    problems = live_preflight(
-        _cfg(
-            allowlist=["AAPL"],
-            max_order_notional_usd=Decimal("500"),
-            max_position_size_pct=2.0,
-        ),
-        kill_switch_engaged=False,
-        token_valid=True,
+def test_preflight_clean_passes_when_order_path_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("trader.app.live_guard.LIVE_ORDER_PATH_READY", True)  # simulate M5.7
+    assert _pf(_safe_cfg(), _bindings()) == []
+
+
+# --- preflight: conservative checks (with the blocker simulated off) --------- #
+
+
+def test_preflight_requires_allowlist_and_small_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("trader.app.live_guard.LIVE_ORDER_PATH_READY", True)
+    # default RiskConfig: no allowlist, notional 5000 > 1000, position 10% > 5%, gross 25k > 5k
+    checks = {p.check for p in _pf(_cfg(), _bindings())}
+    assert {
+        "allowlist",
+        "max_order_notional_usd",
+        "max_position_size_pct",
+        "max_gross_exposure_usd",
+    } <= checks
+
+
+def test_preflight_blocks_per_strategy_override_exceeding_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The key bypass: account caps are tiny, but a strategy raises notional above the ceiling.
+    monkeypatch.setattr("trader.app.live_guard.LIVE_ORDER_PATH_READY", True)
+    cfg = _safe_cfg()
+    bindings = _bindings(overrides={"max_order_notional_usd": 50000})
+    problems = _pf(cfg, bindings)
+    assert any(p.check == "max_order_notional_usd" and "m" in p.detail for p in problems)
+
+
+def test_preflight_requires_alert_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("trader.app.live_guard.LIVE_ORDER_PATH_READY", True)
+    problems = _pf(_safe_cfg(), _bindings(), alert_channel_count=0)
+    assert any(p.check == "alerting" for p in problems)
+
+
+def test_preflight_blocks_on_kill_switch_token_reconcile(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("trader.app.live_guard.LIVE_ORDER_PATH_READY", True)
+    assert any(
+        p.check == "kill_switch" for p in _pf(_safe_cfg(), _bindings(), kill_switch_engaged=True)
     )
-    assert problems == []
-
-
-def test_preflight_blocks_on_kill_switch_and_token() -> None:
-    cfg = _cfg(allowlist=["AAPL"], max_order_notional_usd=Decimal("500"), max_position_size_pct=2.0)
-    ks = live_preflight(cfg, kill_switch_engaged=True, token_valid=True)
-    assert any(p.check == "kill_switch" for p in ks)
-    tok = live_preflight(cfg, kill_switch_engaged=False, token_valid=False)
-    assert any(p.check == "token" for p in tok)
-    recon = live_preflight(cfg, kill_switch_engaged=False, token_valid=True, reconcile_clean=False)
-    assert any(p.check == "reconcile" for p in recon)
+    assert any(p.check == "token" for p in _pf(_safe_cfg(), _bindings(), token_valid=False))
+    assert any(p.check == "reconcile" for p in _pf(_safe_cfg(), _bindings(), reconcile_clean=False))
 
 
 # --- startup alert ---------------------------------------------------------- #
@@ -110,8 +165,3 @@ def test_startup_alert_on_live() -> None:
     announce_live(_Rec())
     assert len(events) == 1
     assert "LIVE" in events[0].message and events[0].severity.value == "CRITICAL"
-
-
-def test_preflight_problem_is_structured() -> None:
-    p = PreflightProblem("x", "y")
-    assert (p.check, p.detail) == ("x", "y")

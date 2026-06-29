@@ -240,22 +240,26 @@ def run(
     run_migrations(state)
     cash = Decimal(_BACKTEST_STARTING_CASH)
 
+    # Redundant alerting + per-strategy risk overrides assembled once for the run.
+    alerter = build_alerter(cfg.alerting.channels, environ=os.environ)
+    overrides = {b.strategy_id: b.risk_overrides for b in bindings if b.risk_overrides}
+
     if is_live:
         # Conservative go-live preflight: refuse to start a REAL-MONEY run unless the rollout
-        # is safe (default-deny allowlist, small caps, kill switch off, valid token).
+        # is safe. Validates EFFECTIVE per-strategy caps (overrides can't exceed the ceiling),
+        # an alert channel (never silent), default-deny allowlist, kill switch off, valid
+        # token -- and, until M5.7 wires the idempotent submit path, refuses live entirely.
         problems = live_preflight(
             cfg,
+            bindings,
             kill_switch_engaged=KillSwitch(connect(Path(cfg.observability.db_path))).is_engaged(),
             token_valid=_token_valid(cfg),
+            alert_channel_count=len(alerter._channels),
         )
         if problems:
             for p in problems:
                 typer.echo(f"live preflight FAILED [{p.check}]: {p.detail}", err=True)
             raise typer.Exit(1)
-
-    # Redundant alerting + per-strategy risk overrides assembled once for the run.
-    alerter = build_alerter(cfg.alerting.channels, environ=os.environ)
-    overrides = {b.strategy_id: b.risk_overrides for b in bindings if b.risk_overrides}
     risk = RiskManager(
         account_config=cfg.risk,
         clock=clock,
@@ -280,9 +284,14 @@ def run(
             from trader.schwab.orders import SchwabTradingClient
 
             # Resolve the hashed account id (the raw number is PII and never used directly).
+            # Refuse on ambiguity rather than silently trade the wrong account with real money.
             mappings = SchwabClient(http).get_account_numbers()
-            if not mappings:
-                typer.echo("run error: no Schwab account available", err=True)
+            if len(mappings) != 1:
+                typer.echo(
+                    f"run error: expected exactly 1 Schwab account, found {len(mappings)}; "
+                    "explicit multi-account selection is required before live",
+                    err=True,
+                )
                 raise typer.Exit(1)
             broker = SchwabBroker(SchwabTradingClient(http), mappings[0].hash_value, clock=clock)
             # Live state is NEVER silent: log it loud and alert at startup (design §10).

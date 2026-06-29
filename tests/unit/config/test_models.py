@@ -127,6 +127,15 @@ def test_risk_override_keys_subset() -> None:
         AppConfig.model_validate(bad)
 
 
+def test_risk_override_cannot_loosen_safety_floor() -> None:
+    # A data-integrity / account-wide-only key is a valid RiskConfig field but is NOT
+    # tunable per strategy -- a strategy must never weaken a safety floor.
+    bad = copy.deepcopy(EXAMPLE)
+    bad["strategies"][0]["risk_overrides"] = {"max_staleness_seconds": 999999}
+    with pytest.raises(ValidationError, match="not tunable per strategy"):
+        AppConfig.model_validate(bad)
+
+
 def test_mode_and_conflict_enums_reject_invalid() -> None:
     with pytest.raises(ValidationError):
         AppConfig.model_validate(cfg(mode="bogus"))

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, time
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 import trader.strategy  # noqa: F401 - registers built-in strategies (threshold)
@@ -136,12 +137,13 @@ observability:
     )
 
 
-def test_run_refuses_live_mode(tmp_path: Path) -> None:
+def test_run_refuses_live_without_confirm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TRADER_CONFIRM_LIVE", raising=False)
     cfg = tmp_path / "c.yaml"
     _write_config(cfg, "live", tmp_path / "state.sqlite")
     result = runner.invoke(app, ["run", "--config", str(cfg)])
     assert result.exit_code != 0
-    assert "live mode is refused" in result.output
+    assert "SECOND confirmation" in result.output  # live double-confirm gate (M5.6)
 
 
 # --- daemon-level wiring (heartbeat + audit through the real fire path) ------ #

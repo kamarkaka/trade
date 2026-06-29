@@ -75,6 +75,19 @@ def _load(config: Path) -> AppConfig:
         raise typer.Exit(1) from exc
 
 
+def _token_valid(cfg: AppConfig) -> bool:
+    """True iff a non-expired Schwab refresh token is on disk (no network)."""
+    from trader.auth.token_store import TokenStore
+
+    schwab_cfg = _schwab_config(cfg)
+    if not schwab_cfg.token_store_path.exists():
+        return False
+    tok = TokenStore(schwab_cfg.token_store_path).load()
+    if tok is None:
+        return False
+    return schwab_cfg.refresh_token_max_age_days - tok.refresh_age_days(RealClock()) > 0
+
+
 def _heartbeat_fresh(cfg: AppConfig) -> bool:
     """True iff the daemon's heartbeat exists and is fresh (backs ``--healthcheck``).
 
@@ -153,15 +166,26 @@ def run(
     once: Annotated[
         bool, typer.Option("--once", help="Fire each slot once and exit (no blocking loop).")
     ] = False,
+    confirm_live: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-live",
+            help="Second go-live signal (or set TRADER_CONFIRM_LIVE=I_UNDERSTAND). REAL MONEY.",
+        ),
+    ] = False,
 ) -> None:
-    """Run the PAPER trading daemon (SimBroker against live quotes; no real orders)."""
+    """Run the trading daemon. PAPER (default) uses SimBroker against live quotes (no real
+    orders). LIVE places REAL orders and requires mode=live PLUS a second confirmation."""
     import os
     import time as _time
 
+    from trader.app.live_guard import announce_live, live_confirmed, live_preflight
     from trader.broker import SimBroker
     from trader.core.enums import Mode
+    from trader.core.protocols import Broker
     from trader.observability.alerting import build_alerter
     from trader.observability.heartbeat import Heartbeat
+    from trader.observability.logging import get_logger
     from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
     from trader.orchestrator.lock import GlobalCycleLock
     from trader.risk.gate import RiskManager
@@ -176,14 +200,19 @@ def run(
     from trader.strategy import load_bindings
 
     cfg = _load(config)
-    # SAFETY GATE (pre-M5): the daemon never places real orders. Refuse live.
-    if cfg.mode is Mode.LIVE:
+    if cfg.mode not in (Mode.PAPER, Mode.LIVE):
         typer.echo(
-            "run error: live mode is refused until M5 (no real orders); set mode=paper", err=True
+            f"run error: `run` requires mode=paper or mode=live, got {cfg.mode.value}", err=True
         )
         raise typer.Exit(1)
-    if cfg.mode is not Mode.PAPER:
-        typer.echo(f"run error: `run` requires mode=paper, got {cfg.mode.value}", err=True)
+    is_live = cfg.mode is Mode.LIVE
+    # FIRST signal is mode: live in config; SECOND is this out-of-band confirmation.
+    if is_live and not live_confirmed(confirm_flag=confirm_live, environ=dict(os.environ)):
+        typer.echo(
+            "run error: live mode requires a SECOND confirmation (REAL MONEY): set "
+            "TRADER_CONFIRM_LIVE=I_UNDERSTAND or pass --confirm-live",
+            err=True,
+        )
         raise typer.Exit(1)
 
     schedule, bindings = load_bindings(cfg)
@@ -211,6 +240,19 @@ def run(
     run_migrations(state)
     cash = Decimal(_BACKTEST_STARTING_CASH)
 
+    if is_live:
+        # Conservative go-live preflight: refuse to start a REAL-MONEY run unless the rollout
+        # is safe (default-deny allowlist, small caps, kill switch off, valid token).
+        problems = live_preflight(
+            cfg,
+            kill_switch_engaged=KillSwitch(connect(Path(cfg.observability.db_path))).is_engaged(),
+            token_valid=_token_valid(cfg),
+        )
+        if problems:
+            for p in problems:
+                typer.echo(f"live preflight FAILED [{p.check}]: {p.detail}", err=True)
+            raise typer.Exit(1)
+
     # Redundant alerting + per-strategy risk overrides assembled once for the run.
     alerter = build_alerter(cfg.alerting.channels, environ=os.environ)
     overrides = {b.strategy_id: b.risk_overrides for b in bindings if b.risk_overrides}
@@ -232,7 +274,22 @@ def run(
     with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
         http = SchwabHttp(schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock)
         data = SchwabMarketData(SchwabClient(http), clock)
-        broker = SimBroker(data, clock, starting_cash=cash)  # PAPER: SimBroker only, never real
+        broker: Broker
+        if is_live:
+            from trader.broker import SchwabBroker
+            from trader.schwab.orders import SchwabTradingClient
+
+            # Resolve the hashed account id (the raw number is PII and never used directly).
+            mappings = SchwabClient(http).get_account_numbers()
+            if not mappings:
+                typer.echo("run error: no Schwab account available", err=True)
+                raise typer.Exit(1)
+            broker = SchwabBroker(SchwabTradingClient(http), mappings[0].hash_value, clock=clock)
+            # Live state is NEVER silent: log it loud and alert at startup (design §10).
+            get_logger("cli").warning("STARTING IN LIVE MODE — REAL ORDERS ENABLED")
+            announce_live(alerter)
+        else:
+            broker = SimBroker(data, clock, starting_cash=cash)  # PAPER: SimBroker, never real
         attribution = AttributionLedger(state)
         # Read the persisted kill switch fresh each cycle: an engage (CLI or auto-trip) halts
         # the daemon at the next cycle start AND pre-submit (gate). Its own connection so the
@@ -264,15 +321,17 @@ def run(
             alerter=alerter,
             heartbeat=heartbeat,
         )
+        mode_label = "LIVE" if is_live else "paper"
         if once:
             for binding in bindings:
                 for slot in binding.slots if binding.enabled else ():
                     daemon.fire(binding.strategy_id, slot.slot_id)  # callbacks built at init
-            typer.echo("run: one tick complete (--once)")
+            typer.echo(f"run: one {mode_label} tick complete (--once)")
             return
         daemon.start()
         typer.echo(
-            f"run: paper daemon started ({len(daemon.scheduler.get_jobs())} jobs); Ctrl-C to stop"
+            f"run: {mode_label} daemon started ({len(daemon.scheduler.get_jobs())} jobs); "
+            "Ctrl-C to stop"
         )
         try:
             while True:

@@ -11,8 +11,13 @@ if [ "$#" -eq 0 ]; then
     set -- run
 fi
 
-# Forward args to the trader CLI, injecting --config unless the caller already passed one.
-case " $* " in
-    *" --config "*) exec trader "$@" ;;
-    *) exec trader "$@" --config "$CONFIG" ;;
-esac
+# Forward args to the trader CLI, injecting --config unless the caller already passed one
+# (check each arg so a value containing "--config" can't false-match; cover -c/--config=).
+for arg in "$@"; do
+    case "$arg" in
+        -c | --config | --config=*)
+            exec trader "$@"
+            ;;
+    esac
+done
+exec trader "$@" --config "$CONFIG"

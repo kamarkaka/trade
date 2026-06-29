@@ -1,5 +1,6 @@
 # Slim, non-root, healthchecked image of the trading daemon (design §16.1).
-# Build from the repo root: docker build -f deploy/Dockerfile -t trader:dev .
+# Build from the repo root, targeting the deploy arch (the VPS is x86_64):
+#   docker build --platform=linux/amd64 -f deploy/Dockerfile -t trader:dev .
 FROM python:3.11-slim AS runtime
 
 # tzdata: the scheduler localizes slot times to America/New_York (§7.1).
@@ -22,11 +23,16 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin trader \
 
 WORKDIR /app
 
-# Install the package (and its runtime deps) from project metadata. NO dev deps, NO secrets.
+# Install pinned runtime deps first (own cache layer), wheel-only so a missing wheel fails
+# the build LOUDLY instead of silently trying to compile from source (no toolchain here).
+COPY deploy/requirements.txt ./
+RUN pip install --no-cache-dir --only-binary=:all: -r requirements.txt
+
+# Then the package itself, WITHOUT re-resolving deps (reproducible). NO dev deps, NO secrets.
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 COPY config ./config
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps .
 
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

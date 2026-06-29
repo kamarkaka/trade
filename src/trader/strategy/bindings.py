@@ -18,6 +18,7 @@ from datetime import datetime
 from trader.config.models import AppConfig, ScheduleConfig, SlotConfig
 from trader.core.types import SlotSpec, StrategyBinding
 
+from .params import validate_params
 from .registry import REGISTRY, StrategyRegistry
 
 
@@ -49,7 +50,9 @@ def load_bindings(
             StrategyBinding(
                 strategy_id=sb.id,
                 strategy_name=sb.name,
-                params=dict(sb.params),
+                # Validate params against the strategy's model (if any) at load time, so a
+                # bad/typo'd param fails fast instead of at the first cycle.
+                params=validate_params(sb.name, dict(sb.params)),
                 universe=tuple(sb.universe),
                 slots=tuple(_to_slotspec(slot, config.schedule) for slot in sb.slots),
                 enabled=sb.enabled,

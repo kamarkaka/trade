@@ -15,7 +15,11 @@ htmlcov/
 # Runtime state, data & secrets — never commit (see plan/design.md §13)
 /state/
 /data/
-secrets/
+# Ignore everything inside any secrets/ dir EXCEPT committed templates (.example). The
+# directory itself stays tracked so the template can live there (a whole-dir ignore would
+# block re-including files inside it).
+**/secrets/*
+!**/secrets/*.example
 .env
 *.env
 !*.env.example

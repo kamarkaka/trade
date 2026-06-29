@@ -1,0 +1,41 @@
+# Compose deployment of the trader daemon (design §16.2).
+#   cd deploy && docker compose up -d
+# Named volumes make /state (SQLite + tokens + ledger) and /data (Parquet cache) survive
+# `docker compose down && up -d` recreates. Real secrets live in ./secrets/.env (gitignored;
+# copy from secrets/.env.example). The config is mounted read-only.
+services:
+  trader:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: trader:latest
+    restart: unless-stopped
+    environment:
+      TZ: America/New_York
+      TRADER_CONFIG: /config/trader.yaml
+    env_file:
+      - ./secrets/.env
+    volumes:
+      - ../config/default.yaml:/config/trader.yaml:ro  # config is read-only; never written
+      - trader_state:/state  # SQLite state, token store, fired-slot ledger — durable
+      - trader_data:/data  # Parquet bar cache — durable
+    healthcheck:
+      test: ["CMD", "trader", "status", "--healthcheck", "--config", "/config/trader.yaml"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
+volumes:
+  trader_state:  # survives container recreation
+  trader_data:  # survives container recreation

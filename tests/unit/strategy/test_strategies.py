@@ -101,24 +101,29 @@ def _bars(symbol: str, closes: list[str]) -> list[Bar]:
 
 
 def _zscore_decisions(last: str, closes: list[str], *, lookback: int = 3):
+    # M6.4: the current quote.last is included in the z-window, so |z| at lookback=3 is bounded
+    # ~1.15 -> z_entry must be reachable. Deeper coverage lives in test_zscore_revert.py.
     data = FakeMarketDataProvider(bars={"AAPL": _bars("AAPL", closes)})
-    strat = REGISTRY.create("zscore_revert", {"lookback": lookback, "z_entry": 2.0, "lot": 10})
+    strat = REGISTRY.create("zscore_revert", {"lookback": lookback, "z_entry": 1.0, "lot": 10})
     return strat.decide(_snapshot(_quote("AAPL", last, "100")), [], ACCOUNT, data, FakeClock(NOW))
 
 
 def test_zscore_buy_oversold() -> None:
-    decisions = _zscore_decisions("90", ["100", "101", "99"])  # mean~100, std~0.8, z<<-2
+    # window [101,99,90]: z~-1.14 <= -1.0 -> BUY
+    decisions = _zscore_decisions("90", ["100", "101", "99"])
     assert decisions[0].action is Action.BUY
 
 
 def test_zscore_sell_overbought() -> None:
-    decisions = _zscore_decisions("110", ["100", "101", "99"])
+    decisions = _zscore_decisions("110", ["100", "101", "99"])  # z~+1.14 >= 1.0 -> SELL
     assert decisions[0].action is Action.SELL
 
 
 def test_zscore_zero_std_holds() -> None:
-    assert _zscore_decisions("90", ["100", "100", "100"]) == []  # std==0 -> no signal, no error
+    # all window values equal (incl. last) -> std 0 -> z None -> HOLD (no div-by-zero)
+    assert _zscore_decisions("100", ["100", "100", "100"]) == []
 
 
 def test_zscore_insufficient_bars_holds() -> None:
-    assert _zscore_decisions("90", ["100", "101"], lookback=3) == []  # < lookback bars
+    # 1 close + last = 2 values < lookback 3 -> z None -> HOLD
+    assert _zscore_decisions("90", ["100"], lookback=3) == []

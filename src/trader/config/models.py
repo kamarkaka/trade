@@ -103,6 +103,11 @@ class RiskConfig(_Base):
     allowlist: tuple[str, ...] = ()  # when non-empty, only these symbols may trade
     denylist: tuple[str, ...] = ()  # these symbols are always blocked (takes precedence)
     enforce_pdt: bool = True
+    # Pattern-day-trader rule (§10). [VERIFY] against current FINRA 4210 (a 2026 amendment may
+    # change the regime) — do NOT treat these as fixed law.
+    pdt_max_day_trades: int = Field(default=3, ge=0)  # block the (N+1)th within the window
+    pdt_equity_threshold_usd: Decimal = Field(default=Decimal("25000"), gt=0)
+    pdt_window_days: int = Field(default=5, ge=1)  # rolling business-day window
     auto_flatten_on_kill: bool = False
     conflict_policy: ConflictPolicy = ConflictPolicy.NET
 

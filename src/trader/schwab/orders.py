@@ -126,9 +126,37 @@ def build_order_json(
 class SchwabOrderStatus:
     order_id: str
     status: OrderStatus
+    symbol: str  # from the order's leg ("" if absent)
     quantity: int
     filled_quantity: int
+    average_price: Decimal  # weighted avg execution price (0 if nothing filled yet)
     raw_status: str
+
+
+def _symbol_of(data: Any) -> str:
+    legs = data.get("orderLegCollection") if isinstance(data, dict) else None
+    if isinstance(legs, list) and legs:
+        instrument = legs[0].get("instrument") if isinstance(legs[0], dict) else None
+        if isinstance(instrument, dict) and "symbol" in instrument:
+            return str(instrument["symbol"])
+    return ""
+
+
+def _average_fill_price(data: Any) -> Decimal:
+    """Quantity-weighted average over the execution legs (0 if there are none)."""
+    total_qty = Decimal(0)
+    total_cost = Decimal(0)
+    for activity in data.get("orderActivityCollection", []) or []:
+        if not isinstance(activity, dict):
+            continue
+        for leg in activity.get("executionLegs", []) or []:
+            if not isinstance(leg, dict):
+                continue
+            qty = _dec(leg.get("quantity", 0), "executionLeg.quantity")
+            price = _dec(leg.get("price", 0), "executionLeg.price")
+            total_qty += qty
+            total_cost += qty * price
+    return (total_cost / total_qty) if total_qty > 0 else Decimal(0)
 
 
 def parse_order_status(data: Any) -> SchwabOrderStatus:
@@ -136,8 +164,10 @@ def parse_order_status(data: Any) -> SchwabOrderStatus:
     return SchwabOrderStatus(
         order_id=str(_require(data, "orderId")),
         status=map_order_status(raw),
+        symbol=_symbol_of(data),
         quantity=_int(data.get("quantity", 0), "quantity"),
         filled_quantity=_int(data.get("filledQuantity", 0), "filledQuantity"),
+        average_price=_average_fill_price(data),
         raw_status=raw,
     )
 
@@ -191,6 +221,11 @@ class SchwabTradingClient:
 
     def __init__(self, http: SchwabHttp) -> None:
         self._http = http
+
+    @property
+    def is_read_only(self) -> bool:
+        """True when the transport is in READ-ONLY safe mode (dead refresh token)."""
+        return self._http.is_read_only
 
     def _orders_path(self, account_hash: str) -> str:
         return f"{ACCOUNTS_PATH}/{account_hash}/orders"

@@ -3,5 +3,14 @@
   "status": "FILLED",
   "quantity": 10,
   "filledQuantity": 10,
-  "orderType": "MARKET"
+  "orderType": "MARKET",
+  "orderLegCollection": [
+    {"instruction": "BUY", "quantity": 10, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}
+  ],
+  "orderActivityCollection": [
+    {"activityType": "EXECUTION", "executionLegs": [
+      {"quantity": 6, "price": "150.00"},
+      {"quantity": 4, "price": "150.25"}
+    ]}
+  ]
 }

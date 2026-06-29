@@ -64,6 +64,10 @@ class TradingCalendar:
         ts = self._cal.session_close(pd.Timestamp(d)).tz_convert(self._tz).to_pydatetime()
         return cast("datetime", ts)
 
+    def session_date_of(self, at: datetime) -> date:
+        """The exchange-local (ET) calendar date of an instant."""
+        return at.astimezone(self._tz).date()
+
     def is_open(self, at: datetime) -> bool:
         """True if ``at`` falls within the session window (inclusive of open/close)."""
         d = at.astimezone(self._tz).date()

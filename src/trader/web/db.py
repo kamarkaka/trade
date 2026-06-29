@@ -56,13 +56,22 @@ class ReadOnlyStateDB:
         """Run a parameterized SELECT and return all rows. Pass values via ``params`` —
         NEVER interpolate them into ``sql`` (SQL injection / quoting bugs)."""
         with self.connect() as conn:
-            return conn.execute(sql, tuple(params)).fetchall()
+            return conn.execute(sql, _bind(params)).fetchall()
 
     def query_one(self, sql: str, params: QueryParams = ()) -> sqlite3.Row | None:
         """Run a parameterized SELECT and return the first row (or ``None``)."""
         with self.connect() as conn:
-            row: sqlite3.Row | None = conn.execute(sql, tuple(params)).fetchone()
+            row: sqlite3.Row | None = conn.execute(sql, _bind(params)).fetchone()
             return row
+
+
+def _bind(params: QueryParams) -> tuple[object, ...]:
+    # A bare str/bytes is itself a Sequence, so ``tuple("AB")`` would bind each CHARACTER —
+    # a silent-wrong-result footgun (a 1-char value binds to a single placeholder and
+    # returns nothing). Reject it: callers must pass a tuple/list of values.
+    if isinstance(params, str | bytes):
+        raise TypeError("params must be a sequence of values (e.g. (value,)), not a str/bytes")
+    return tuple(params)
 
 
 __all__ = ["QueryParams", "ReadOnlyStateDB"]

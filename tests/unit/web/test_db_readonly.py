@@ -82,8 +82,8 @@ def test_missing_db_raises(tmp_path: Path) -> None:
         db.query("SELECT 1")
 
 
-def test_concurrent_wal_read_succeeds(tmp_path: Path) -> None:
-    # A WAL-mode DB with an open writer must still serve read-only reads (busy_timeout).
+def test_reads_succeed_with_open_writer(tmp_path: Path) -> None:
+    # A WAL-mode DB with another (open) writer connection must still serve read-only reads.
     db = tmp_path / "trader.sqlite"
     _seed(db)
     writer = sqlite3.connect(db)
@@ -96,3 +96,11 @@ def test_concurrent_wal_read_succeeds(tmp_path: Path) -> None:
         assert rows[0]["n"] == 3
     finally:
         writer.close()
+
+
+def test_str_params_rejected(ro_db: ReadOnlyStateDB) -> None:
+    # A bare str would bind per-character (silent wrong result) — must be rejected.
+    with pytest.raises(TypeError, match="sequence of values"):
+        ro_db.query("SELECT 1 FROM orders WHERE symbol = ?", "AAPL")
+    with pytest.raises(TypeError):
+        ro_db.query_one("SELECT 1 FROM orders WHERE symbol = ?", b"AAPL")

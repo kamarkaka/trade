@@ -23,6 +23,11 @@ QUOTES_PATH = f"{MARKETDATA_BASE}/quotes"  # [VERIFY]
 PRICEHISTORY_PATH = f"{MARKETDATA_BASE}/pricehistory"  # [VERIFY]
 ACCOUNT_NUMBERS_PATH = f"{TRADER_BASE}/accounts/accountNumbers"  # [VERIFY]
 
+# Trading endpoints used from M5 (§8.5). All trading calls use the HASHED account id.
+ACCOUNTS_PATH = (
+    f"{TRADER_BASE}/accounts"  # GET {hash}?fields=positions; orders at .../orders [VERIFY]
+)
+
 # Token lifetimes (§8.2). The 7-day refresh-token cap is the dominant operational
 # constraint and is NOT programmatically renewable.
 ACCESS_TOKEN_TTL_SECONDS = 1800  # ~30 minutes [VERIFY]

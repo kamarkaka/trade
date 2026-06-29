@@ -42,6 +42,11 @@ class FiredSlotLedger:
         self._conn = conn
         self._now = now
 
+    def _now_iso(self) -> str:
+        # Normalize to UTC so stored timestamps share one offset and ISO-string
+        # ordering matches chronological order (stale_claims relies on this).
+        return self._now().astimezone(UTC).isoformat()
+
     def claim(
         self,
         slot_date: date,
@@ -65,7 +70,7 @@ class FiredSlotLedger:
                     planned_fire_ts.isoformat(),
                     drift_seconds,
                     seed,
-                    self._now().isoformat(),
+                    self._now_iso(),
                 ),
             )
         except sqlite3.IntegrityError:
@@ -90,7 +95,7 @@ class FiredSlotLedger:
 
     def stale_claims(self, grace_seconds: int) -> list[StaleClaim]:
         """Orphaned 'claimed' rows older than ``grace_seconds`` (for alerting)."""
-        cutoff = (self._now() - timedelta(seconds=grace_seconds)).isoformat()
+        cutoff = (self._now().astimezone(UTC) - timedelta(seconds=grace_seconds)).isoformat()
         rows = self._conn.execute(
             "SELECT slot_date, strategy_id, slot_id, claimed_at FROM fired_slot "
             "WHERE status = 'claimed' AND claimed_at < ?",
@@ -104,5 +109,5 @@ class FiredSlotLedger:
         self._conn.execute(
             "UPDATE fired_slot SET status = ?, finished_at = ?, error = ? "
             "WHERE slot_date = ? AND strategy_id = ? AND slot_id = ?",
-            (status, self._now().isoformat(), error, slot_date.isoformat(), strategy_id, slot_id),
+            (status, self._now_iso(), error, slot_date.isoformat(), strategy_id, slot_id),
         )

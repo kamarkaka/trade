@@ -62,6 +62,32 @@ def test_independent_strategies(tmp_path: Path) -> None:
     assert _claim(ledger, strategy_id="meanrev") is True  # same slot_id, different strategy
 
 
+def test_terminal_states_still_block_refire(tmp_path: Path) -> None:
+    # the safety-critical property: a done OR failed slot never re-fires
+    done = _ledger(tmp_path / "d.sqlite")
+    _claim(done, slot_id="open")
+    done.mark_done(DAY, "momentum", "open")
+    assert _claim(done, slot_id="open") is False
+
+    failed = _ledger(tmp_path / "f.sqlite")
+    _claim(failed, slot_id="open")
+    failed.mark_failed(DAY, "momentum", "open", error="x")
+    assert _claim(failed, slot_id="open") is False
+
+
+def test_was_fired_none_for_unknown_key(tmp_path: Path) -> None:
+    assert _ledger(tmp_path / "s.sqlite").was_fired(DAY, "nope", "nope") is None
+
+
+def test_stale_claims_excludes_terminal_rows(tmp_path: Path) -> None:
+    t0 = datetime(2024, 7, 8, 14, 0, tzinfo=UTC)
+    ledger = _ledger(tmp_path / "s.sqlite", now=t0)
+    _claim(ledger, slot_id="open")
+    ledger.mark_done(DAY, "momentum", "open")  # terminal -> never stale
+    later = _ledger(tmp_path / "s.sqlite", now=t0 + timedelta(hours=1))
+    assert later.stale_claims(grace_seconds=300) == []
+
+
 def test_orphaned_claimed_slot_recovery(tmp_path: Path) -> None:
     path = tmp_path / "s.sqlite"
     t0 = datetime(2024, 7, 8, 14, 0, tzinfo=UTC)

@@ -440,22 +440,35 @@ def backtest(
 
 def _print_backtest_summary(data: dict) -> None:  # type: ignore[type-arg]
     """Compact per-strategy + combined table to stdout (no files)."""
+
+    def _row(name: str, trades: object, hit: object, ret: object, dd: object) -> str:
+        # Fixed widths with explicit gaps so signed 8dp values (e.g. -0.00300000) never
+        # collide with the next column.
+        return f"{name:<16}{trades!s:>8}  {hit!s:>14}  {ret!s:>14}  {dd!s:>12}"
+
     combined = data["combined"]
     typer.echo("")
-    typer.echo(f"{'strategy':<16}{'trades':>8}{'hit_rate':>12}{'total_ret':>12}{'max_dd':>10}")
-    typer.echo("-" * 58)
+    typer.echo(_row("strategy", "trades", "hit_rate", "total_ret", "max_dd"))
+    typer.echo("-" * 70)
     typer.echo(
-        f"{'COMBINED':<16}{combined['num_trades']:>8}"
-        f"{(combined['hit_rate'] or '—'):>12}{combined['total_return']:>12}"
-        f"{combined['max_drawdown_pct']:>10}"
+        _row(
+            "COMBINED",
+            combined["num_trades"],
+            combined["hit_rate"] or "—",
+            combined["total_return"],
+            combined["max_drawdown_pct"],
+        )
     )
     for sid, block in data["per_strategy"].items():
         em = block.get("equity_metrics")
-        total_ret = em["total_return"] if em else "—"
-        max_dd = em["max_drawdown_pct"] if em else "—"
         typer.echo(
-            f"{sid:<16}{block['num_trades']:>8}{(block['hit_rate'] or '—'):>12}"
-            f"{total_ret:>12}{max_dd:>10}"
+            _row(
+                sid,
+                block["num_trades"],
+                block["hit_rate"] or "—",
+                em["total_return"] if em else "—",
+                em["max_drawdown_pct"] if em else "—",
+            )
         )
 
 

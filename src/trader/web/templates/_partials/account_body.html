@@ -1,0 +1,43 @@
+{# Account / P&L (refreshable). M7.8. #}
+<section>
+  <h2>Account</h2>
+  {% if latest_equity %}
+  <table>
+    <tr><th class="l">Equity</th><td>{{ latest_equity.equity }}</td>
+        <th class="l">Cash</th><td>{{ latest_equity.cash }}</td></tr>
+    <tr><th class="l">Realized P&amp;L</th><td>{{ latest_equity.realized_pnl }}</td>
+        <th class="l">Unrealized P&amp;L</th><td>{{ latest_equity.unrealized_pnl }}</td></tr>
+    <tr><th class="l">As of</th><td class="l" colspan="3">{{ latest_equity.ts | nyt }}</td></tr>
+  </table>
+  {% else %}<p class="muted">No equity snapshot yet.</p>{% endif %}
+</section>
+
+<section>
+  <h3>Risk usage</h3>
+  <table>
+    <tr><th class="l">Gross exposure</th>
+        <td class="l"><span class="{{ gross_badge | badge }}">{{ gross_exposure }}</span>
+          {% if gross_limit %} / {{ gross_limit }}{% endif %}</td></tr>
+    <tr><th class="l">Daily loss</th>
+        <td class="l"><span class="{{ loss_badge | badge }}">{{ loss_today }}</span>
+          {% if loss_limit %} / {{ loss_limit }}{% endif %}</td></tr>
+    {% if today %}
+    <tr><th class="l">Trades today</th><td class="l">{{ today.trades_today }}</td></tr>
+    {% endif %}
+  </table>
+</section>
+
+<section>
+  <h3>Broker-truth positions</h3>
+  {% if positions %}
+  <table>
+    <tr><th class="l">Symbol</th><th>Quantity</th><th>Avg price</th><th>Market value</th>
+        <th class="l">Updated</th></tr>
+    {% for p in positions %}
+    <tr><td class="l">{{ p.symbol }}</td><td>{{ p.quantity }}</td><td>{{ p.avg_price }}</td>
+        <td>{{ p.market_value }}</td><td class="l">{{ p.updated_at | nyt }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">No open positions.</p>{% endif %}
+</section>
+<p class="muted">updated {{ updated_at | nyt }}</p>

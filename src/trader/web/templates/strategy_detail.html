@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}{{ strategy_id }} — trader monitor{% endblock %}
+{% block content %}
+<p class="muted"><a href="/strategies">← all strategies</a></p>
+<div class="refresh"
+     hx-get="/strategies/{{ strategy_id }}/fragment"
+     hx-trigger="every {{ refresh_seconds }}s"
+     hx-swap="innerHTML">
+  {% include "_partials/strategy_detail_body.html" %}
+</div>
+{% endblock %}

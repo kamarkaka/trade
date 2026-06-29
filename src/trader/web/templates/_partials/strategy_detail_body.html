@@ -1,0 +1,42 @@
+{# Per-strategy detail (refreshable): config, attributed positions, decision audit chain. M7.8. #}
+<section>
+  <h2>{{ strategy_id }}</h2>
+  {% if binding %}
+  <table>
+    <tr><th class="l">Name</th><td class="l">{{ binding.name }}</td></tr>
+    <tr><th class="l">Enabled</th><td class="l">{{ binding.enabled }}</td></tr>
+    <tr><th class="l">Universe</th><td class="l">{{ (binding.universe or []) | join(', ') }}</td></tr>
+    <tr><th class="l">Params</th><td class="l">{{ binding.params }}</td></tr>
+  </table>
+  {% else %}<p class="muted">No config binding (strategy seen only in state).</p>{% endif %}
+</section>
+
+<section>
+  <h3>Attributed positions</h3>
+  {% if attributed_positions %}
+  <table>
+    <tr><th class="l">Symbol</th><th>Quantity</th><th>Avg price</th></tr>
+    {% for p in attributed_positions %}
+    <tr><td class="l">{{ p.symbol }}</td><td>{{ p.quantity }}</td><td>{{ p.avg_price }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">No attributed positions.</p>{% endif %}
+</section>
+
+<section>
+  <h3>Recent decision audit chain</h3>
+  {% if decisions %}
+  <table>
+    <tr><th class="l">Time</th><th class="l">Cycle</th><th class="l">Kind</th><th class="l">Detail</th></tr>
+    {% for d in decisions %}
+    <tr>
+      <td class="l">{{ d.ts | nyt }}</td>
+      <td class="l">{{ (d.cycle_id or '')[:8] }}</td>
+      <td class="l">{{ d.kind }}</td>
+      <td class="l">{{ d.payload }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">No decisions recorded.</p>{% endif %}
+</section>
+<p class="muted">updated {{ updated_at | nyt }}</p>

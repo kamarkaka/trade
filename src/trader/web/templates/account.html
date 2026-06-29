@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Account — trader monitor{% endblock %}
+{% block content %}
+<h1>Account &amp; P&amp;L</h1>
+<div class="refresh"
+     hx-get="/account/fragment"
+     hx-trigger="every {{ refresh_seconds }}s"
+     hx-swap="innerHTML">
+  {% include "_partials/account_body.html" %}
+</div>
+{% endblock %}

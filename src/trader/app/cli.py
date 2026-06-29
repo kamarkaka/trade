@@ -381,11 +381,26 @@ def kill(
     on: Annotated[
         bool, typer.Option("--on/--off", help="Engage or release the kill switch.")
     ] = False,
+    reason: Annotated[
+        str, typer.Option("--reason", help="Why the switch is being engaged (for the audit/log).")
+    ] = "manual kill via CLI",
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Engage/release the kill switch (implemented in M5)."""
-    state = "on" if on else "off"
-    typer.echo(f"kill: not implemented yet (kill switch arrives in M5); requested {state}")
+    """Engage/release the persisted kill switch (halts all new orders; survives restarts)."""
+    from trader.risk.kill_switch import KillSwitch
+    from trader.state.db import connect
+    from trader.state.migrate import run_migrations
+
+    cfg = _load(config)
+    conn = connect(Path(cfg.observability.db_path))
+    run_migrations(conn)
+    switch = KillSwitch(conn)
+    if on:
+        newly = switch.engage(reason, source="cli")
+        typer.echo(f"kill switch ENGAGED ({reason})" if newly else "kill switch already engaged")
+    else:
+        switch.disengage(source="cli")
+        typer.echo("kill switch released")
 
 
 @app.command()

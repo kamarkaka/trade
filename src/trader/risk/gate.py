@@ -132,6 +132,7 @@ class RiskManager:
         #    Per-strategy loss/trade *budgets* (vs an attributed day-state) need the
         #    orchestrator's per-strategy state and land in M4.4; here they're account-wide.
         checks: list[tuple[Callable[[Order, RuleContext], RuleResult], RiskConfig, str]] = [
+            (rules.kill_switch, acct, "account-wide"),  # hard emergency stop, checked first
             (rules.allowlist_denylist, acct, "account-wide"),
             (rules.duplicate_order_guard, acct, "gate"),
             (rules.price_sanity, acct, "account-wide"),

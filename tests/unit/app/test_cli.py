@@ -56,10 +56,10 @@ def test_healthcheck_invalid_config_exits_nonzero(tmp_path: Path) -> None:
 
 
 def test_stub_commands_run() -> None:
-    for argv in (["reconcile"], ["kill", "--on"]):
-        result = runner.invoke(app, argv)
-        assert result.exit_code == 0, argv
-        assert "not implemented" in result.output
+    # `kill` is implemented as of M5.4 (see test_kill_switch.py); `reconcile` is still a stub.
+    result = runner.invoke(app, ["reconcile"])
+    assert result.exit_code == 0
+    assert "not implemented" in result.output
 
 
 def _write_run_config(path: Path, mode: str, data_cache: Path) -> None:

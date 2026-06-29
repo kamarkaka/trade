@@ -76,6 +76,14 @@ def _reduces_or_holds_exposure(order: Order, ctx: RuleContext) -> bool:
     return abs(current + _signed(order)) <= abs(current)
 
 
+def kill_switch(order: Order, ctx: RuleContext) -> RuleResult:
+    """Hard emergency stop: when the kill switch is engaged, halt ALL new orders (including
+    de-risking exits -- auto-flatten is off, so exit manually if needed). Design §10."""
+    if ctx.day_state.kill_switch_engaged:
+        return _reject("kill switch engaged; all new orders halted")
+    return RuleResult(ok=True)
+
+
 def allowlist_denylist(order: Order, ctx: RuleContext) -> RuleResult:
     symbol = order.symbol.strip().upper()
     if symbol in ctx.config.denylist:
@@ -198,8 +206,10 @@ def max_trades_per_day(order: Order, ctx: RuleContext) -> RuleResult:
     return RuleResult(ok=True)
 
 
-# Ordered for the gate (M4.3): cheap gates first, then price-dependent caps.
+# Ordered for the gate (M4.3): the kill switch first (hardest stop), then cheap gates, then
+# price-dependent caps.
 ALL_RULES = (
+    kill_switch,
     allowlist_denylist,
     duplicate_order_guard,
     daily_loss_limit,

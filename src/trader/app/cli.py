@@ -121,10 +121,102 @@ def status(
 
 
 @app.command()
-def run(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
-    """Run the trading daemon (implemented in M3/M4)."""
-    _load(config)
-    typer.echo("run: not implemented yet (daemon arrives in M3/M4)")
+def run(
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+    once: Annotated[
+        bool, typer.Option("--once", help="Fire each slot once and exit (no blocking loop).")
+    ] = False,
+) -> None:
+    """Run the PAPER trading daemon (SimBroker against live quotes; no real orders)."""
+    import time as _time
+
+    from trader.broker import SimBroker
+    from trader.core.enums import Mode
+    from trader.orchestrator.cycle import Orchestrator
+    from trader.orchestrator.lock import GlobalCycleLock
+    from trader.scheduler.calendar import TradingCalendar
+    from trader.scheduler.daemon import SchedulerDaemon
+    from trader.sizing.sizer import size_decision
+    from trader.state.attribution import AttributionLedger
+    from trader.state.db import connect
+    from trader.state.ledger import FiredSlotLedger
+    from trader.state.migrate import run_migrations
+    from trader.strategy import load_bindings
+
+    cfg = _load(config)
+    # SAFETY GATE (pre-M5): the daemon never places real orders. Refuse live.
+    if cfg.mode is Mode.LIVE:
+        typer.echo(
+            "run error: live mode is refused until M5 (no real orders); set mode=paper", err=True
+        )
+        raise typer.Exit(1)
+    if cfg.mode is not Mode.PAPER:
+        typer.echo(f"run error: `run` requires mode=paper, got {cfg.mode.value}", err=True)
+        raise typer.Exit(1)
+
+    schedule, bindings = load_bindings(cfg)
+    if not any(b.enabled for b in bindings):
+        typer.echo("run error: no enabled strategy in config", err=True)
+        raise typer.Exit(1)
+
+    # Paper quotes come from the read-only live Schwab feed -> needs credentials.
+    try:
+        schwab_cfg = _schwab_config(cfg, require_credentials=True)
+    except SchwabAuthError as exc:
+        typer.echo(f"run error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    import httpx
+
+    from trader.auth.token_store import TokenStore
+    from trader.data.schwab_market_data import SchwabMarketData
+    from trader.schwab.endpoints import SchwabClient
+    from trader.schwab.http import SchwabHttp
+
+    clock = RealClock()
+    calendar = TradingCalendar(code=schedule.market_calendar, tz=schedule.timezone)
+    state = connect(Path(cfg.observability.db_path))
+    run_migrations(state)
+    cash = Decimal(_BACKTEST_STARTING_CASH)
+
+    with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
+        http = SchwabHttp(schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock)
+        data = SchwabMarketData(SchwabClient(http), clock)
+        broker = SimBroker(data, clock, starting_cash=cash)  # PAPER: SimBroker only, never real
+        orchestrator = Orchestrator(
+            broker=broker,
+            data=data,
+            clock=clock,
+            cycle_lock=GlobalCycleLock(),
+            attribution=AttributionLedger(state),
+            sizer=lambda d, sid: size_decision(d, sid, cfg.execution),
+        )
+        daemon = SchedulerDaemon(
+            bindings=bindings,
+            schedule=schedule,
+            calendar=calendar,
+            ledger=FiredSlotLedger(state),
+            orchestrator=orchestrator,
+            clock=clock,
+        )
+        if once:
+            daemon.register()
+            for binding in bindings:
+                for slot in binding.slots if binding.enabled else ():
+                    daemon.fire(binding.strategy_id, slot.slot_id)
+            typer.echo("run: one tick complete (--once)")
+            return
+        daemon.start()
+        typer.echo(
+            f"run: paper daemon started ({len(daemon.scheduler.get_jobs())} jobs); Ctrl-C to stop"
+        )
+        try:
+            while True:
+                _time.sleep(1)
+        except KeyboardInterrupt:  # pragma: no cover - interactive shutdown
+            typer.echo("run: stopping…")
+        finally:
+            daemon.stop()
 
 
 @app.command()

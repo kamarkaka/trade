@@ -21,6 +21,12 @@ from trader.observability.alerting import Alerter, AlertEvent, AlertKind
 from trader.observability.logging import get_logger
 
 
+def _as_utc(dt: datetime) -> datetime:
+    # A naive datetime is assumed to be UTC (not reinterpreted as local) so heartbeat
+    # math is correct regardless of how/where a timestamp was written.
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
 @dataclass(frozen=True)
 class HeartbeatRecord:
     last_alive_at: datetime
@@ -47,7 +53,7 @@ class Heartbeat:
 
     def touch(self, scheduler_state: str = "running", detail: str | None = None) -> None:
         """Record that the daemon is alive right now (upsert the singleton row)."""
-        ts = self._clock.now().astimezone(UTC).isoformat()
+        ts = _as_utc(self._clock.now()).astimezone(UTC).isoformat()
         self._conn.execute(
             "INSERT INTO heartbeat (id, last_alive_at, scheduler_state, detail) "
             "VALUES (1, ?, ?, ?) "
@@ -59,23 +65,31 @@ class Heartbeat:
         )
 
     def read(self) -> HeartbeatRecord | None:
-        """Return the last heartbeat, or None if never beat / table absent (defensive)."""
+        """Return the last heartbeat, or None if never beat / table absent / unreadable.
+
+        Fully defensive: any DB error (missing table, corrupt/torn file) or an
+        unparseable/naive timestamp reads as None ("not alive") rather than raising, so
+        the healthcheck probe can never crash on a bad state DB."""
         try:
             row = self._conn.execute(
                 "SELECT last_alive_at, scheduler_state, detail FROM heartbeat WHERE id = 1"
             ).fetchone()
-        except sqlite3.OperationalError:
-            return None  # no such table => never initialized => not alive
+        except sqlite3.Error:
+            return None  # no such table / corrupt db / locked => not alive
         if row is None:
             return None
-        return HeartbeatRecord(datetime.fromisoformat(row[0]), row[1], row[2])
+        try:
+            ts = _as_utc(datetime.fromisoformat(row[0]))
+        except (ValueError, TypeError):
+            return None  # garbage timestamp => not alive
+        return HeartbeatRecord(ts, row[1], row[2])
 
     def age_seconds(self) -> float | None:
         """Seconds since the last beat, or None if there is none."""
         record = self.read()
         if record is None:
             return None
-        return (self._clock.now() - record.last_alive_at).total_seconds()
+        return (_as_utc(self._clock.now()) - record.last_alive_at).total_seconds()
 
     def is_alive(self, max_age_seconds: float | None = None) -> bool:
         """True iff a beat exists and is within the freshness window."""

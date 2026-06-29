@@ -137,3 +137,38 @@ def test_healthcheck_exit_codes(tmp_path: Path) -> None:
     stale_clock = _Clock(datetime.now(UTC) - timedelta(days=1))
     Heartbeat(conn, clock=stale_clock, max_age_seconds=60).touch()
     assert runner.invoke(app, ["status", "--healthcheck", "--config", str(cfg)]).exit_code != 0
+    conn.close()
+
+
+def test_healthcheck_unmigrated_db_unhealthy_no_crash(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite"
+    connect(db).close()  # file exists but no heartbeat table
+    cfg = tmp_path / "c.yaml"
+    _write_config(cfg, db)
+    result = runner.invoke(app, ["status", "--healthcheck", "--config", str(cfg)])
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)  # no traceback
+
+
+def test_healthcheck_corrupt_db_unhealthy_no_crash(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite"
+    db.write_bytes(b"this is not a sqlite database")  # torn/corrupt file
+    cfg = tmp_path / "c.yaml"
+    _write_config(cfg, db)
+    result = runner.invoke(app, ["status", "--healthcheck", "--config", str(cfg)])
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_naive_stored_timestamp_does_not_crash(tmp_path: Path) -> None:
+    # A naive ISO timestamp (no offset) must not raise on the aware-vs-naive subtraction.
+    conn = connect(tmp_path / "state.sqlite")
+    run_migrations(conn)
+    conn.execute(
+        "INSERT INTO heartbeat (id, last_alive_at, scheduler_state) VALUES (1, ?, 'running')",
+        (NOW.replace(tzinfo=None).isoformat(),),  # naive
+    )
+    hb = Heartbeat(conn, clock=_Clock(NOW + timedelta(seconds=10)), max_age_seconds=60)
+    assert hb.is_alive() is True  # treated as UTC, 10s old
+    record = hb.read()
+    assert record is not None and record.last_alive_at.tzinfo is not None  # normalized to aware

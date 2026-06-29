@@ -87,6 +87,8 @@ def _heartbeat_fresh(cfg: AppConfig) -> bool:
     db_path = Path(cfg.observability.db_path)
     if not db_path.exists():
         return False
+    # The daemon must touch the heartbeat at least every heartbeat_minutes (wired in
+    # M4.7); 2x tolerates a single missed beat.
     max_age = cfg.alerting.heartbeat_minutes * 60 * 2
     try:
         conn = read_only_connect(db_path)
@@ -94,6 +96,8 @@ def _heartbeat_fresh(cfg: AppConfig) -> bool:
         return False
     try:
         return Heartbeat(conn, clock=RealClock(), max_age_seconds=max_age).is_alive()
+    except Exception:
+        return False  # any unexpected read error => unhealthy, never a crashing probe
     finally:
         conn.close()
 

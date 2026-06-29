@@ -96,17 +96,27 @@ def test_run_requires_paper_mode(tmp_path: Path) -> None:
     assert "requires mode=paper" in result.output
 
 
-def test_no_real_order_path_pre_m5() -> None:
-    # CI tripwire (design safety gate): no real-order broker exists before M5, and the
-    # read-only Schwab client exposes no order placement/cancel. M5 updates this test.
-    import trader.broker
+def test_no_real_order_path_until_go_live() -> None:
+    # CI tripwire (design safety gate), updated for M5: SchwabBroker now EXISTS (M5.2) but is
+    # not wired into the daemon -- the paper `run` path constructs SimBroker only and refuses
+    # mode=live. Real orders are only possible via the go-live double-confirm (M5.6) + manual
+    # verification (M5.7). The READ-ONLY Schwab client still exposes no order/cancel path
+    # (writes live on the separate SchwabTradingClient).
+    import inspect
+
+    from trader.app import cli
     from trader.schwab.endpoints import SchwabClient
 
-    assert "SchwabBroker" not in dir(trader.broker)  # only SimBroker until M5
     order_methods = [
         m for m in dir(SchwabClient) if any(k in m for k in ("submit", "order", "cancel"))
     ]
-    assert order_methods == [], f"unexpected order path on SchwabClient: {order_methods}"
+    assert order_methods == [], f"unexpected order path on read-only SchwabClient: {order_methods}"
+    # The `run` command must not CONSTRUCT the live SchwabBroker (paper uses SimBroker);
+    # mode=live is refused in depth by test_run_refuses_live_mode. (Check construction, not
+    # mere mentions in comments.)
+    run_src = inspect.getsource(cli.run)
+    assert "SchwabBroker(" not in run_src, "run must not wire the live broker until go-live (M5.6)"
+    assert "SimBroker(" in run_src  # paper path still uses the simulator
 
 
 def test_run_paper_without_credentials_errors(

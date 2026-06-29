@@ -78,6 +78,8 @@ class Portfolio:
             lot.avg_cost = price  # flipped through zero
         # (pure reduction leaves avg_cost unchanged)
         lot.quantity = new_qty
+        # load-bearing: this is what zeros the basis on an exact full close (the
+        # pure-reduction branch above doesn't fire when abs(signed) == abs(old_qty)).
         lot.avg_cost = lot.avg_cost if new_qty != 0 else Decimal("0")
         self._lots[fill.symbol] = lot
         self._marks[fill.symbol] = price  # last trade marks the symbol
@@ -87,6 +89,8 @@ class Portfolio:
             self._marks[symbol] = quote.last
 
     def _mark(self, symbol: str, lot: _Lot) -> Decimal:
+        # apply_fill always seeds _marks at the fill price, so a held symbol is
+        # normally present; avg_cost is the conservative default before any mark.
         return self._marks.get(symbol, lot.avg_cost)
 
     def realized_pnl(self) -> Decimal:
@@ -109,6 +113,8 @@ class Portfolio:
         return self._cash
 
     def equity(self) -> Decimal:
+        """Cash + mark-to-market value of positions. Call ``mark_to_market`` with the
+        current quotes first for a live mark (otherwise positions mark at last fill)."""
         market_value = sum(
             (Decimal(lot.quantity) * self._mark(symbol, lot) for symbol, lot in self._lots.items()),
             Decimal("0"),

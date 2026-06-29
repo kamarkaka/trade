@@ -102,6 +102,42 @@ def test_partial_close_keeps_basis() -> None:
     assert p.realized_pnl() == Decimal("20")
 
 
+def test_flip_through_zero_realizes_only_closed_portion() -> None:
+    p = Portfolio(Decimal("100000"))
+    p.apply_fill(_fill("AAPL", 10, "10"), Side.BUY)  # long 10 @ 10
+    p.apply_fill(_fill("AAPL", 30, "12"), Side.SELL)  # close 10 (+20), open short 20 @ 12
+    assert p.realized_pnl() == Decimal("20")  # only the closed 10, not the new 20
+    qty, avg = p.positions()["AAPL"]
+    assert qty == -20
+    assert avg == Decimal("12")  # basis reset to the new side's price
+
+
+def test_invariant_after_flip_with_fees() -> None:
+    p = Portfolio(Decimal("100000"))
+    p.apply_fill(_fill("AAPL", 10, "10", fees="1"), Side.BUY)
+    p.apply_fill(_fill("AAPL", 30, "12", fees="3"), Side.SELL)  # flip
+    p.mark_to_market({"AAPL": _quote("AAPL", "15")})
+    assert p.equity() == Decimal("100000") + p.realized_pnl() + p.unrealized_pnl()
+
+
+def test_add_to_short_weighted_average() -> None:
+    p = Portfolio(Decimal("100000"))
+    p.apply_fill(_fill("AAPL", 10, "10"), Side.SELL)  # short 10 @ 10
+    p.apply_fill(_fill("AAPL", 30, "14"), Side.SELL)  # short 40 @ (100+420)/40 = 13
+    qty, avg = p.positions()["AAPL"]
+    assert qty == -40
+    assert avg == Decimal("13")
+
+
+def test_multi_symbol_unrealized_with_one_unmarked() -> None:
+    p = Portfolio(Decimal("100000"))
+    p.apply_fill(_fill("AAPL", 10, "10"), Side.BUY)
+    p.apply_fill(_fill("MSFT", 5, "20"), Side.BUY)
+    p.mark_to_market({"AAPL": _quote("AAPL", "12")})  # MSFT left at fill mark
+    assert p.unrealized_pnl() == Decimal("20")  # AAPL +20; MSFT marks at fill -> 0
+    assert p.equity() == Decimal("100000") + p.realized_pnl() + p.unrealized_pnl()
+
+
 def test_zero_quantity_fill_is_noop() -> None:
     p = Portfolio(Decimal("100000"))
     working = Fill("c", "b", "AAPL", 0, Decimal("0"), Decimal("0"), NOW, OrderStatus.WORKING)

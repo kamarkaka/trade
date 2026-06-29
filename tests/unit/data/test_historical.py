@@ -92,6 +92,20 @@ def test_get_bars_rejects_naive_asof(tmp_path: Path) -> None:
         _provider(tmp_path).get_bars("AAPL", _ts(1), _ts(10), "daily", asof=datetime(2023, 1, 6))
 
 
+def test_get_bars_rejects_naive_start_and_end(tmp_path: Path) -> None:
+    provider = _provider(tmp_path)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        provider.get_bars("AAPL", datetime(2023, 1, 1), _ts(10), "daily", asof=_ts(6))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        provider.get_bars("AAPL", _ts(1), datetime(2023, 1, 10), "daily", asof=_ts(6))
+
+
+def test_negative_latency_rejected(tmp_path: Path) -> None:
+    cache = ParquetCache(tmp_path)
+    with pytest.raises(ValueError, match="non-negative"):
+        HistoricalDataProvider(cache, FakeClock(_ts(6)), latency_seconds=-1)
+
+
 # --- quote synthesis -------------------------------------------------------- #
 
 
@@ -123,3 +137,36 @@ def test_quote_no_data_raises(tmp_path: Path) -> None:
     provider = HistoricalDataProvider(cache, FakeClock(_ts(6)))
     with pytest.raises(NoHistoricalDataError):
         provider.get_quote("AAPL", asof=_ts(6))
+
+
+def test_quote_symbol_isolation(tmp_path: Path) -> None:
+    cache = ParquetCache(tmp_path)
+    cache.write_bars("AAPL", _bars([(_ts(3), "10"), (_ts(4), "11")]))
+    cache.write_bars("MSFT", _bars([(_ts(3), "200"), (_ts(4), "201")]))
+    provider = HistoricalDataProvider(cache, FakeClock(_ts(6)))
+    assert provider.get_quote("MSFT", asof=_ts(6)).last == Decimal("201")
+    assert provider.get_quote("AAPL", asof=_ts(6)).last == Decimal("11")
+
+
+def test_quote_prev_close_across_cache_gap(tmp_path: Path) -> None:
+    # a multi-day gap: prev_close is the last *cached* bar, not a calendar session
+    cache = ParquetCache(tmp_path)
+    cache.write_bars("AAPL", _bars([(_ts(3), "10"), (_ts(20), "30")]))
+    provider = HistoricalDataProvider(cache, FakeClock(_ts(25)))
+    q = provider.get_quote("AAPL", asof=_ts(25))
+    assert q.ts == _ts(20)
+    assert q.prev_close == Decimal("10")
+
+
+def test_quote_bounded_lookback_finds_recent_bar(tmp_path: Path) -> None:
+    # latest bar within the 14d window but its predecessor is older than 14d:
+    # the escalating lookback must still surface prev_close.
+    cache = ParquetCache(tmp_path)
+    cache.write_bars(
+        "AAPL",
+        _bars([(datetime(2023, 1, 1, tzinfo=UTC), "10"), (datetime(2023, 2, 1, tzinfo=UTC), "20")]),
+    )
+    provider = HistoricalDataProvider(cache, FakeClock(datetime(2023, 2, 2, tzinfo=UTC)))
+    q = provider.get_quote("AAPL", asof=datetime(2023, 2, 2, tzinfo=UTC))
+    assert q.last == Decimal("20")
+    assert q.prev_close == Decimal("10")  # found via the 90d window

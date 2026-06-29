@@ -160,8 +160,7 @@ def run(
 
     from trader.broker import SimBroker
     from trader.core.enums import Mode
-    from trader.execution.reconcile import reconcile
-    from trader.observability.alerting import AlertEvent, AlertKind, build_alerter
+    from trader.observability.alerting import build_alerter
     from trader.observability.heartbeat import Heartbeat
     from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
     from trader.orchestrator.lock import GlobalCycleLock
@@ -220,8 +219,10 @@ def run(
         overrides_by_strategy=overrides,
         default_policy=cfg.risk.conflict_policy,
     )
+    # The heartbeat gets its OWN connection so its dedicated executor thread never shares
+    # a sqlite3.Connection with the cycle worker (cross-thread concurrent use is unsafe).
     heartbeat = Heartbeat(
-        state,
+        connect(Path(cfg.observability.db_path)),
         clock=clock,
         max_age_seconds=cfg.alerting.heartbeat_minutes * 60 * 2,
         alerter=alerter,
@@ -242,15 +243,11 @@ def run(
             risk=risk,  # the real fail-closed gate is the single chokepoint
             audit=SqliteAuditSink(state),  # durable audit chain
         )
-        # Reconcile against broker truth before acting (design §10); divergence alerts.
-        report = reconcile(broker, attribution)
-        if report.requires_attention:
-            alerter.alert(
-                AlertEvent(
-                    AlertKind.RECONCILE_MISMATCH,
-                    f"startup reconciliation found {len(report.discrepancies)} discrepancies",
-                )
-            )
+        # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
+        # only for a broker whose positions survive a restart; SimBroker is in-memory (always
+        # flat on restart), so trueing the durable attribution ledger up to it would corrupt
+        # intent and fire a spurious mismatch alert every restart. In-session reconcile lands
+        # with the durable SchwabBroker (M5).
         daemon = SchedulerDaemon(
             bindings=bindings,
             schedule=schedule,

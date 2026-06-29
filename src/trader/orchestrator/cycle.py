@@ -323,9 +323,10 @@ class Orchestrator:
 
     @staticmethod
     def _default_day_state(account: Account, now: datetime) -> DayState:
-        # Neutral day-state for callers that don't track one yet (real per-day counters /
-        # start-of-day equity are wired by the paper pipeline, M4.7). loss/trades = 0 means
-        # the daily-loss / trade-count rails don't trip under this default.
+        # Neutral day-state for callers that don't track one yet. loss/trades = 0 means the
+        # daily-loss / trade-count rails do NOT trip under this default, so paper mode does
+        # not enforce those two account-wide rails; real per-day counters / start-of-day
+        # equity (from the daily_counters table) are wired with live trading in M5.
         return DayState(
             trading_date=now.date(),
             start_of_day_equity=account.equity,

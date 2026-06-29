@@ -73,8 +73,16 @@ class SchedulerDaemon:
         # Single-worker executor: jobs run one-at-a-time on one thread, so the SQLite
         # connection is never used concurrently (the global cycle lock is the additional
         # cross-strategy guard). All callbacks run off the main thread.
+        # The heartbeat runs on its OWN single-thread executor so a long-but-healthy cycle
+        # occupying the default worker can't starve the liveness beat (which would otherwise
+        # trip the healthcheck and restart a daemon mid-cycle). Each executor thread uses a
+        # distinct sqlite connection (the cycle conn vs the heartbeat's own conn).
         self._scheduler = BackgroundScheduler(
-            timezone=self._tz, executors={"default": ThreadPoolExecutor(max_workers=1)}
+            timezone=self._tz,
+            executors={
+                "default": ThreadPoolExecutor(max_workers=1),
+                "heartbeat": ThreadPoolExecutor(max_workers=1),
+            },
         )
         self._callbacks: dict[tuple[str, str], Callable[[], CycleResult | None]] = {}
         self._build_callbacks()  # available to fire() without starting the scheduler
@@ -116,8 +124,8 @@ class SchedulerDaemon:
                 self._log.error("alerter raised", error_type=type(exc).__name__)
 
     def _beat(self) -> None:
-        """Liveness touch (runs on the scheduler's worker, so a hung cycle stalls it ->
-        the healthcheck goes stale -> the container is restarted, which is correct)."""
+        """Liveness touch. Runs ONLY on the dedicated 'heartbeat' executor, so it reflects
+        process/scheduler liveness independent of whether a cycle is occupying the worker."""
         if self._heartbeat is not None:
             self._heartbeat.touch("running", f"{len(self._scheduler.get_jobs())} jobs")
 
@@ -126,11 +134,12 @@ class SchedulerDaemon:
             return
         self.register()
         if self._heartbeat is not None:
-            self._heartbeat.touch("running")  # fresh from the moment we start
+            self._heartbeat.touch("running")  # fresh from the moment we start (main thread)
             self._scheduler.add_job(
                 self._beat,
                 IntervalTrigger(seconds=self._heartbeat_interval),
                 id="__heartbeat__",
+                executor="heartbeat",  # own thread + own connection; never starved by a cycle
                 max_instances=1,
                 coalesce=True,
                 replace_existing=True,
@@ -168,7 +177,9 @@ class SchedulerDaemon:
         )
 
     def _fire(self, binding: StrategyBinding, slot: SlotSpec) -> CycleResult | None:
-        self._beat()  # liveness: a fire keeps the heartbeat fresh even between interval ticks
+        # NOTE: the heartbeat is touched ONLY by the dedicated 'heartbeat' executor (_beat),
+        # never here on the cycle worker -- so liveness is independent of cycle duration and
+        # the heartbeat's connection is never used cross-thread.
         today = self._clock.now().astimezone(self._tz).date()
         drift, seed = compute_drift(slot, self._schedule.base_seed, today, binding.strategy_id)
         nominal = self._calendar.localize(today, slot.at)

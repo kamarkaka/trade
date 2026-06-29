@@ -54,7 +54,7 @@ def test_healthcheck_invalid_config_exits_nonzero(tmp_path: Path) -> None:
 
 
 def test_stub_commands_run() -> None:
-    for argv in (["run"], ["backtest"], ["reconcile"], ["kill", "--on"]):
+    for argv in (["run"], ["reconcile"], ["kill", "--on"]):
         result = runner.invoke(app, argv)
         assert result.exit_code == 0, argv
         assert "not implemented" in result.output

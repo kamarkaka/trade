@@ -9,9 +9,10 @@ out by later milestones: ``backtest`` (M2), ``run`` (M3/M4), ``reconcile`` (M4),
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
+from decimal import Decimal
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
@@ -19,6 +20,42 @@ from trader.clock import RealClock
 from trader.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
 from trader.schwab.config import SchwabClientConfig, schwab_config_from_env
 from trader.schwab.errors import SchwabAuthError, SchwabError
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from trader.core import Account, Decision, MarketSnapshot, Position
+    from trader.core.protocols import Clock, MarketDataProvider
+
+# Default backtest starting capital until a config-driven account balance exists.
+_BACKTEST_STARTING_CASH = "100000"
+
+
+class _BuyAndHoldStrategy:
+    """Placeholder strategy for the M2.11 wiring: buy each universe symbol once and
+    hold. Replaced by the StrategyRegistry + real strategies in M3.6/M6."""
+
+    def __init__(self, quantity: int = 10) -> None:
+        self._quantity = quantity
+
+    def decide(
+        self,
+        snapshot: MarketSnapshot,
+        positions: Sequence[Position],
+        account: Account,
+        data: MarketDataProvider,
+        clock: Clock,
+    ) -> Sequence[Decision]:
+        from trader.core import Decision
+        from trader.core.enums import Action
+
+        held = {p.symbol for p in positions if p.quantity != 0}
+        return [
+            Decision(action=Action.BUY, symbol=symbol, quantity=self._quantity)
+            for symbol in snapshot.quotes
+            if symbol not in held
+        ]
+
 
 app = typer.Typer(
     help="Automated equity trader.",
@@ -91,10 +128,69 @@ def run(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
 
 
 @app.command()
-def backtest(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
-    """Run a historical backtest (implemented in M2)."""
-    _load(config)
-    typer.echo("backtest: not implemented yet (engine arrives in M2)")
+def backtest(
+    start: Annotated[str, typer.Option("--start", help="Inclusive start date (YYYY-MM-DD).")],
+    end: Annotated[str, typer.Option("--end", help="Inclusive end date (YYYY-MM-DD).")],
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+    out: Annotated[str, typer.Option("--out", help="Output directory for reports.")] = "reports",
+) -> None:
+    """Run a single-strategy backtest over cached data; write report + manifest."""
+    import json
+
+    from trader.backtest import BacktestEngine, Portfolio, build_manifest, write_manifest
+    from trader.backtest.report import BacktestReport
+    from trader.broker import SimBroker
+    from trader.clock import VirtualClock
+    from trader.data.cache import ParquetCache
+    from trader.data.historical import HistoricalDataProvider
+
+    cfg = _load(config)
+    start_d = _parse_day(start, "--start").date()
+    end_d = _parse_day(end, "--end").date()
+    if end_d < start_d:
+        typer.echo("backtest error: --end must be on or after --start", err=True)
+        raise typer.Exit(1)
+
+    enabled = [b for b in cfg.strategies if b.enabled]
+    if not enabled:
+        typer.echo("backtest error: no enabled strategy in config", err=True)
+        raise typer.Exit(1)
+    binding = enabled[0]
+    universe = list(binding.universe)
+    slots = [
+        datetime.strptime(s.time, "%H:%M").time() for s in binding.slots
+    ]  # UTC-combined by engine
+    seed = cfg.schedule.base_seed or 0
+    cash = Decimal(_BACKTEST_STARTING_CASH)
+
+    clock = VirtualClock(datetime.combine(start_d, time.min, tzinfo=UTC))
+    cache = ParquetCache(cfg.observability.data_cache)
+    data = HistoricalDataProvider(cache, clock)
+    broker = SimBroker(data, clock, starting_cash=cash)
+    portfolio = Portfolio(cash)
+    engine = BacktestEngine(clock=clock, data=data, broker=broker, portfolio=portfolio)
+    result = engine.run(
+        _BuyAndHoldStrategy(),
+        universe=universe,
+        slots=slots,
+        start=start_d,
+        end=end_d,
+        strategy_id=binding.id,
+        seed=seed,
+    )
+
+    data_hashes = {symbol: cache.content_hash(symbol) for symbol in universe}
+    manifest = build_manifest(cfg, data_hashes, seed)
+    report = BacktestReport.build(result.fills, result.equity_curve, manifest)
+
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = Path(out) / f"{binding.id}-{start_d}-{end_d}-{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    write_manifest(manifest, out_dir / "manifest.json")
+    typer.echo(f"backtest: {len(result.fills)} fills; report written to {out_dir}")
 
 
 @app.command()

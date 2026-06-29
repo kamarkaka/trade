@@ -1,33 +1,40 @@
 """SimBroker — the deterministic simulated broker (design §9.3).
 
 Implements the core ``Broker`` protocol for backtest/paper so the SAME strategy and
-risk code runs against simulated execution. Market orders fill at the **next**
-available quote (the engine advances the clock between decision and fill, so the
-quote read here is post-decision) at ``ask + slippage`` (BUY) / ``bid - slippage``
-(SELL), with a ``FeesModel`` (Schwab $0 commission + regulatory bps) applied so
-backtest P&L tracks live economics. Cash and positions are tracked in memory.
+risk code runs against simulated execution.
 
-Money keeps full ``Decimal`` precision (no penny rounding) — intentional for a
-deterministic backtest; reconciliation against live fills (M4) rounds to cents.
+* **MARKET** orders fill at the next quote: ``ask + slippage`` (BUY) /
+  ``bid - slippage`` (SELL). The engine advances the clock between decision and
+  fill, so the quote read here is post-decision (never fill at the signal instant).
+* **LIMIT** orders fill only when the current bar's ``[low, high]`` range crosses
+  the limit (BUY: ``low <= limit``; SELL: ``high >= limit``), at the limit price.
+* Fills are capped at ``max_participation`` * bar/quote volume (ADV cap); the
+  unfilled remainder is carried as a WORKING order and re-evaluated on later bars
+  (``process_working_orders``). DAY orders expire at session close
+  (``expire_day_orders``).
 
-This module owns market-order fills; limit + partial fills are added in M2.6.
+A ``FeesModel`` (Schwab $0 commission + sell-side regulatory bps) is applied so
+backtest P&L tracks live economics. Money keeps full ``Decimal`` precision (no penny
+rounding) — intentional for a deterministic backtest; live reconciliation (M4) rounds.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from decimal import Decimal
 
-from trader.core import Account, Fill, Order, Position, Quote
-from trader.core.enums import OrderStatus, OrderType, Side
+from trader.core import Account, Bar, Fill, Order, Position, Quote
+from trader.core.enums import OrderStatus, OrderType, Side, TimeInForce
 from trader.core.protocols import Clock, MarketDataProvider
 
-# Lazy config import only for the from_config helpers (avoid a hard config dep here).
+# How far back to look for the "current" daily bar when evaluating a limit order.
+_BAR_LOOKBACK = timedelta(days=7)
 
 
 @dataclass(frozen=True)
 class SlippageModel:
-    """Adverse price movement applied to a fill. ``kind``: 'bps' | 'fixed'."""
+    """Adverse price movement applied to a market fill. ``kind``: 'bps' | 'fixed'."""
 
     kind: str = "bps"
     value: Decimal = Decimal("0")
@@ -45,7 +52,6 @@ class SlippageModel:
 
     @classmethod
     def from_config(cls, cfg: object) -> SlippageModel:
-        # cfg is a SlippageModelConfig (type, value); kept loose to avoid the import.
         return cls(kind=cfg.type, value=Decimal(str(cfg.value)))  # type: ignore[attr-defined]
 
 
@@ -82,8 +88,20 @@ class _Lot:
     last_price: Decimal
 
 
+@dataclass
+class _Working:
+    """An order being worked: cumulative fills so far + the original intent."""
+
+    order: Order
+    broker_order_id: str
+    filled_qty: int = 0
+    cost: Decimal = field(default_factory=lambda: Decimal("0"))  # sum(qty*price)
+    fees: Decimal = field(default_factory=lambda: Decimal("0"))
+    last_fill_ts: datetime | None = None  # bar/quote ts of the last fill (per-bar budget)
+
+
 class SimBroker:
-    """A deterministic, in-memory simulated broker for market orders."""
+    """A deterministic, in-memory simulated broker (market + limit, partials)."""
 
     def __init__(
         self,
@@ -93,63 +111,50 @@ class SimBroker:
         starting_cash: Decimal,
         fees: FeesModel | None = None,
         slippage: SlippageModel | None = None,
+        max_participation: Decimal | None = None,
     ) -> None:
         self._data = data
         self._clock = clock
         self._cash = Decimal(starting_cash)
         self._fees = fees or FeesModel()
         self._slippage = slippage or SlippageModel()
+        self._max_participation = max_participation
         self._lots: dict[str, _Lot] = {}
-        self._orders: dict[str, Fill] = {}  # broker_order_id -> Fill
+        self._fills: dict[str, Fill] = {}  # broker_order_id -> latest cumulative Fill
+        self._working: dict[str, _Working] = {}  # broker_order_id -> open order
         self._by_client: dict[str, str] = {}  # client_order_id -> broker_order_id
         self._seq = 0
 
     # --- Broker protocol -------------------------------------------------- #
 
     def submit_order(self, order: Order) -> str:
-        # Idempotent: a re-submitted client_order_id never double-fills.
         existing = self._by_client.get(order.client_order_id)
-        if existing is not None:
+        if existing is not None:  # idempotent: never double-submit
             return existing
-        if order.order_type is not OrderType.MARKET:
-            raise NotImplementedError("SimBroker supports only MARKET orders in M2.5 (limit: M2.6)")
 
-        quote = self._data.get_quote(order.symbol, self._clock.now())
-        price = self._fill_price(order.side, quote)
-        notional = Decimal(order.quantity) * price
-        fees = self._fees.fee(notional, order.side)
-
-        # Build (and validate: price/fees nonneg) the Fill BEFORE mutating cash or
-        # positions, so a bad fill (e.g. slippage > price) can't leave half-applied state.
         broker_order_id = f"SIM-{self._seq + 1}"
-        fill = Fill(
-            client_order_id=order.client_order_id,
-            broker_order_id=broker_order_id,
-            symbol=order.symbol,
-            quantity=order.quantity,
-            price=price,
-            fees=fees,
-            ts=self._clock.now(),
-            status=OrderStatus.FILLED,
-        )
-        self._apply_cash(order.side, notional, fees)
-        self._apply_position(order.symbol, order.side, order.quantity, price)
+        working = _Working(order=order, broker_order_id=broker_order_id)
+        self._try_fill(working)  # may raise (negative price) before _seq is committed
         self._seq += 1
-        self._orders[broker_order_id] = fill
+        status = self._status_of(working)
+        self._fills[broker_order_id] = self._snapshot(working, status)
         self._by_client[order.client_order_id] = broker_order_id
+        if status is not OrderStatus.FILLED:
+            self._working[broker_order_id] = working  # carry the remainder
         return broker_order_id
 
     def get_order(self, broker_order_id: str) -> Fill:
         try:
-            return self._orders[broker_order_id]
+            return self._fills[broker_order_id]
         except KeyError as exc:
             raise KeyError(f"unknown broker_order_id {broker_order_id!r}") from exc
 
     def cancel_order(self, broker_order_id: str) -> None:
-        # Market orders fill synchronously, so there is nothing working to cancel;
-        # this only validates the id exists.
-        if broker_order_id not in self._orders:
+        if broker_order_id not in self._fills:
             raise KeyError(f"unknown broker_order_id {broker_order_id!r}")
+        working = self._working.pop(broker_order_id, None)
+        if working is not None:  # a fully-filled order is a no-op to cancel
+            self._fills[broker_order_id] = self._snapshot(working, OrderStatus.CANCELED)
 
     def get_positions(self) -> list[Position]:
         return [
@@ -171,10 +176,106 @@ class SimBroker:
             ),
             Decimal("0"),
         )
-        equity = self._cash + market_value
-        return Account(cash=self._cash, buying_power=self._cash, equity=equity)
+        return Account(cash=self._cash, buying_power=self._cash, equity=self._cash + market_value)
 
-    # --- internals -------------------------------------------------------- #
+    # --- engine-driven lifecycle ----------------------------------------- #
+
+    def process_working_orders(self) -> None:
+        """Re-evaluate open orders against the current bar/quote (call each bar)."""
+        for broker_order_id, working in list(self._working.items()):
+            self._try_fill(working)
+            status = self._status_of(working)
+            self._fills[broker_order_id] = self._snapshot(working, status)
+            if status is OrderStatus.FILLED:
+                del self._working[broker_order_id]
+
+    def expire_day_orders(self) -> None:
+        """Expire still-open DAY orders at session close."""
+        for broker_order_id, working in list(self._working.items()):
+            if working.order.tif is TimeInForce.DAY:
+                self._fills[broker_order_id] = self._snapshot(working, OrderStatus.EXPIRED)
+                del self._working[broker_order_id]
+
+    # --- fill engine ------------------------------------------------------ #
+
+    def _try_fill(self, working: _Working) -> None:
+        order = working.order
+        remaining = order.quantity - working.filled_qty
+        if remaining <= 0:
+            return
+
+        if order.order_type is OrderType.MARKET:
+            quote = self._data.get_quote(order.symbol, self._clock.now())
+            data_ts = quote.ts
+            price = self._fill_price(order.side, quote)
+            available_volume = quote.volume
+        else:  # LIMIT
+            bar = self._current_bar(order.symbol)
+            if bar is None or order.limit_price is None:
+                return  # no bar to evaluate against -> stays working
+            if not self._limit_crosses(order.side, order.limit_price, bar):
+                return
+            data_ts = bar.ts
+            price = order.limit_price  # limit guarantees price; no extra slippage
+            available_volume = bar.volume
+
+        # One participation budget per bar: don't re-consume the same bar across calls.
+        if working.last_fill_ts == data_ts:
+            return
+
+        if price < 0:
+            # Guard before mutating any state (atomicity): a fill price can't be negative.
+            raise ValueError(f"computed negative fill price {price} for {order.symbol!r}")
+
+        fill_qty = remaining
+        if self._max_participation is not None:
+            cap = int(self._max_participation * Decimal(available_volume))
+            if cap == 0 and available_volume > 0:
+                cap = 1  # floor so a low-volume order isn't starved forever
+            fill_qty = min(remaining, cap)
+        if fill_qty <= 0:
+            return
+
+        notional = Decimal(fill_qty) * price
+        fee = self._fees.fee(notional, order.side)
+        self._apply_cash(order.side, notional, fee)
+        self._apply_position(order.symbol, order.side, fill_qty, price)
+        working.filled_qty += fill_qty
+        working.cost += notional
+        working.fees += fee
+        working.last_fill_ts = data_ts
+
+    def _status_of(self, working: _Working) -> OrderStatus:
+        if working.filled_qty >= working.order.quantity:
+            return OrderStatus.FILLED
+        if working.filled_qty > 0:
+            return OrderStatus.PARTIAL_FILL
+        return OrderStatus.WORKING
+
+    def _snapshot(self, working: _Working, status: OrderStatus) -> Fill:
+        qty = working.filled_qty
+        price = (working.cost / qty) if qty > 0 else Decimal("0")  # VWAP across partials
+        return Fill(
+            client_order_id=working.order.client_order_id,
+            broker_order_id=working.broker_order_id,
+            symbol=working.order.symbol,
+            quantity=qty,
+            price=price,
+            fees=working.fees,
+            ts=self._clock.now(),
+            status=status,
+        )
+
+    def _current_bar(self, symbol: str) -> Bar | None:
+        now = self._clock.now()
+        bars = self._data.get_bars(symbol, now - _BAR_LOOKBACK, now, "daily", now)
+        return bars[-1] if bars else None
+
+    @staticmethod
+    def _limit_crosses(side: Side, limit: Decimal, bar: Bar) -> bool:
+        if side is Side.BUY:
+            return bar.low <= limit
+        return bar.high >= limit
 
     def _mark_price(self, symbol: str, fallback: Decimal) -> Decimal:
         """Current mark from the data feed (mark-to-market); last fill if unavailable."""

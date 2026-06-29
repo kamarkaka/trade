@@ -1,8 +1,12 @@
-# Compose deployment of the trader daemon (design §16.2).
+# Compose deployment of the trader daemon + read-only monitoring UI (design §16.2 / §16.6).
 #   cd deploy && docker compose up -d
-# Named volumes make /state (SQLite + tokens + ledger) and /data (Parquet cache) survive
-# `docker compose down && up -d` recreates. Real secrets live in ./secrets/.env (gitignored;
-# copy from secrets/.env.example). The config is mounted read-only.
+# Named volumes make /state (SQLite + tokens) and /data (Parquet cache) survive recreate.
+# Real secrets live in ./secrets/.env (gitignored; copy from secrets/.env.example).
+#
+# Network topology (§16.6): the trader is on the PRIVATE `internal` network only (no inbound).
+# The web UI is on `internal` (to read the shared state volume's DB) AND `edge` (to receive
+# proxied requests). Caddy is the ONLY service that publishes a host port (:443). The web
+# service is never published directly.
 services:
   trader:
     build:
@@ -15,6 +19,8 @@ services:
       TRADER_CONFIG: /config/trader.yaml
     env_file:
       - ./secrets/.env
+    networks:
+      - internal
     volumes:
       - ../config/default.yaml:/config/trader.yaml:ro  # config is read-only; never written
       - trader_state:/state  # SQLite state, token store, fired-slot ledger — durable
@@ -41,6 +47,74 @@ services:
           cpus: "1.0"
           memory: 2g
 
+  # Read-only monitoring UI (M7). Shares the state volume but opens the DB mode=ro (M7.1);
+  # no broker code path (M7.10). Reachable ONLY via the proxy — `expose`, never `ports`.
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    image: trader-web:latest
+    restart: unless-stopped
+    environment:
+      TZ: America/New_York
+      WEB_DB_PATH: /state/trader.sqlite      # opened read-only by ReadOnlyStateDB
+      WEB_CONFIG_PATH: /config/trader.yaml
+      # WEB_ADMIN_USER / WEB_ADMIN_PASSWORD_HASH (argon2id) / SESSION_SECRET come from env_file.
+    env_file:
+      - ./secrets/.env
+    networks:
+      - internal  # read the shared state volume's DB
+      - edge      # receive requests from the proxy
+    volumes:
+      - ../config/default.yaml:/config/trader.yaml:ro
+      # State volume mounted RW so SQLite can touch -wal/-shm sidecars, BUT the web's
+      # connection is mode=ro + PRAGMA query_only=ON (M7.1) — it can read, never write.
+      - trader_state:/state
+    expose:
+      - "8000"  # internal only — NOT published to the host
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    mem_limit: 512m
+    cpus: "0.5"
+
+  # TLS reverse proxy — the ONLY service exposed to the host (:443).
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - web
+    environment:
+      WEB_DOMAIN: ${WEB_DOMAIN:-localhost}
+    ports:
+      - "443:443"  # the ONLY published port in the whole stack
+    networks:
+      - edge
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data   # ACME certs / Caddy state — durable
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  internal:
+    internal: true  # no host bridge — trader <-> web stay private
+  edge: {}          # proxy <-> web (the proxy bridges to the host via its published port)
+
 volumes:
   trader_state:  # survives container recreation
   trader_data:  # survives container recreation
+  caddy_data:  # ACME/cert state
+  caddy_config:  # Caddy runtime config

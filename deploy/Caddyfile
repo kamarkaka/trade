@@ -1,0 +1,34 @@
+# Caddy reverse proxy for the read-only monitoring UI (design §16.6, M7.11).
+# Terminates TLS and is the ONLY service that publishes a host port (:443). It forwards to the
+# web container on the internal `edge` network; the web service itself is never published.
+#
+# Set the site address via the WEB_DOMAIN env var (compose passes it). For a real domain Caddy
+# obtains a Let's Encrypt cert automatically; for a bare host/IP it serves Caddy's internal CA
+# (self-signed) — browse with -k / trust the local CA for testing.
+{
+	# Uncomment + set an email for Let's Encrypt prod certs:
+	# email {$ACME_EMAIL}
+	admin off
+}
+
+{$WEB_DOMAIN:localhost} {
+	encode gzip
+
+	# Defense-in-depth: restrict to your VPN / LAN. Uncomment and set CIDRs (or front with
+	# Tailscale). The UI is also password-gated (argon2id + session) regardless.
+	# @blocked not remote_ip 100.64.0.0/10 192.168.0.0/16 10.0.0.0/8
+	# respond @blocked "forbidden" 403
+
+	header {
+		# HSTS (2y, include subdomains, preload-eligible).
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		# The UI uses only same-origin assets (local HTMX/CSS) — lock it down.
+		Content-Security-Policy "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'"
+		-Server
+	}
+
+	reverse_proxy web:8000
+}

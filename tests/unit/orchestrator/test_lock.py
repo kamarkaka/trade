@@ -2,6 +2,8 @@
 
 import threading
 
+import pytest
+
 from trader.orchestrator.lock import CycleLock, GlobalCycleLock, NullLock
 
 
@@ -46,6 +48,19 @@ def test_timeout_returns_false_when_held_by_another_thread() -> None:
     finally:
         release.set()
         t.join(timeout=2)
+
+
+def test_exception_in_with_block_still_releases() -> None:
+    lock = GlobalCycleLock()
+    with pytest.raises(RuntimeError), lock:
+        raise RuntimeError("boom")
+    assert lock.acquire(timeout=0.1) is True  # released despite the exception
+    lock.release()
+
+
+def test_release_without_acquire_raises() -> None:
+    with pytest.raises(RuntimeError):
+        GlobalCycleLock().release()
 
 
 def test_null_lock_is_noop() -> None:

@@ -1,7 +1,7 @@
 """Tests for the RiskManager gate: dual-scope limit merge, conflict policy, typed
 verdicts, and the single-chokepoint behaviour (M4.3)."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from trader.clock.virtual import VirtualClock
@@ -34,6 +34,7 @@ def _gate(
     overrides: dict[str, dict[str, object]] | None = None,
     default_policy: ConflictPolicy | None = None,
     priority_order: tuple[str, ...] = (),
+    seen: tuple[str, ...] = (),
 ) -> RiskManager:
     return RiskManager(
         account_config=account or RiskConfig(),
@@ -41,6 +42,7 @@ def _gate(
         overrides_by_strategy=overrides,
         default_policy=default_policy,
         priority_order=priority_order,
+        seen_client_order_ids=seen,
     )
 
 
@@ -111,22 +113,54 @@ def test_per_strategy_position_cap_rejects_when_account_allows() -> None:
 # --- clamp + idempotency ---------------------------------------------------- #
 
 
-def test_notional_clamp_emits_adjusted_order_and_note() -> None:
+def test_notional_clamp_emits_adjusted_order_with_clean_reasons() -> None:
     gate = _gate(account=RiskConfig(max_order_notional_usd=Decimal("500")))
     verdict = _check(gate, _order(qty=10))
     assert verdict.approved is True
     assert verdict.adjusted_order is not None and verdict.adjusted_order.quantity == 5
     assert verdict.adjusted_order.client_order_id == "c1"  # identity preserved through clamp
-    assert verdict.reasons  # carries the clamp note
+    assert verdict.reasons == ()  # contract: reasons non-empty IFF rejected; clamp is signalled
 
 
-def test_duplicate_guard_after_approval() -> None:
+def test_duplicate_guard_rejects_seeded_cid() -> None:
+    # The guard keys off persisted/submitted ids seeded at construction (M4.4 ledger),
+    # not off orders this gate merely approved -- check() is pure.
+    gate = _gate(seen=("dup1",))
+    assert _check(gate, _order(cid="dup1")).approved is False
+    assert _check(gate, _order(cid="c2")).approved is True
+
+
+def test_check_is_pure_no_self_tracking() -> None:
     gate = _gate()
-    first = _check(gate, _order(cid="dup1"))
-    assert first.approved is True
-    second = _check(gate, _order(cid="dup1"))  # same client_order_id resubmitted
-    assert second.approved is False
-    assert any("duplicate" in r for r in second.reasons)
+    first = _check(gate, _order(cid="same"))
+    second = _check(gate, _order(cid="same"))  # not recorded by the first approval
+    assert first.approved is True and second.approved is True
+
+
+def test_data_integrity_gate_not_loosenable_by_override() -> None:
+    # C1 regression: a per-strategy override must NOT be able to weaken staleness.
+    gate = _gate(overrides={"s1": {"max_staleness_seconds": 999999}})
+    stale = Quote(
+        "AAPL",
+        NOW - timedelta(seconds=600),
+        Decimal("100"),
+        Decimal("99.5"),
+        Decimal("100.5"),
+        1000,
+    )
+    verdict = gate.check(_order(qty=10), (), ACCOUNT, stale, DAY)
+    assert verdict.approved is False
+    assert any("price_sanity" in r and "account-wide" in r for r in verdict.reasons)
+
+
+def test_account_wide_trade_count_not_loosenable() -> None:
+    maxed = DayState(
+        date(2024, 7, 8), Decimal("100000"), Decimal("0"), Decimal("0"), 6, Decimal("0")
+    )  # at the account default of 6 trades
+    gate = _gate(overrides={"s1": {"max_trades_per_day": 1000000}})  # try to loosen
+    verdict = _check(gate, _order(qty=10), day_state=maxed)
+    assert verdict.approved is False
+    assert any("account-wide" in r and "max_trades_per_day" in r for r in verdict.reasons)
 
 
 # --- conflict policy -------------------------------------------------------- #
@@ -178,6 +212,32 @@ def test_conflict_policy_defaults_from_account_config() -> None:
         [("a", _d(Action.BUY, qty=10)), ("b", _d(Action.SELL, qty=4))]
     )
     assert len(resolved) == 2  # independent default honoured
+
+
+def test_conflict_net_groups_by_symbol() -> None:
+    gate = _gate()
+    resolved = gate.resolve_conflicts(
+        [
+            ("a", _d(Action.BUY, "AAPL", 10)),
+            ("b", _d(Action.SELL, "AAPL", 4)),
+            ("a", _d(Action.BUY, "MSFT", 7)),
+        ],
+        ConflictPolicy.NET,
+    )
+    by_symbol = {r.symbol: r for r in resolved}
+    assert by_symbol["AAPL"].quantity == 6 and by_symbol["AAPL"].action is Action.BUY
+    assert by_symbol["MSFT"].quantity == 7 and by_symbol["MSFT"].action is Action.BUY
+
+
+def test_conflict_priority_unknown_strategy_ranks_last() -> None:
+    # 'a' is configured (rank 0); 'z' is unknown (ranks last) -> 'a' wins the symbol.
+    gate = _gate(priority_order=("a",))
+    resolved = gate.resolve_conflicts(
+        [("z", _d(Action.SELL, qty=4)), ("a", _d(Action.BUY, qty=10))],
+        ConflictPolicy.PRIORITY,
+    )
+    assert len(resolved) == 1
+    assert (resolved[0].action, resolved[0].quantity) == (Action.BUY, 10)
 
 
 def test_resolve_drops_holds_and_zero() -> None:

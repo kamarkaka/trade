@@ -1,17 +1,26 @@
 """RiskManager gate (design §10): the single, fail-closed chokepoint that composes the
 M4.2 rules with dual limit scopes and the same-ticker conflict policy.
 
-**Two limit scopes (design §10).** Every order is checked under both:
+**Two limit scopes (design §10).**
 
-- *Per-strategy* — every rule under ``merged_config`` (the account defaults updated with
-  this strategy's ``risk_overrides``). "Checked first."
-- *Account-wide hard guardrail* — the account-wide rules (gross exposure, daily loss,
-  trades/day) plus the non-overridable denylist, under ``account_config``. Overrides can
-  never *loosen* these.
+- *Account-wide hard guardrail* (``account_config``): the account-wide caps (gross
+  exposure, daily loss, trades/day), the data-integrity gate (``price_sanity``:
+  staleness/spread/crossed/bad-tick), and the denylist. A per-strategy override can
+  never *loosen* these -- only ``PER_STRATEGY_OVERRIDABLE`` keys may be tuned, and the
+  hard rules are always evaluated under the account config regardless.
+- *Per-strategy* (``merged_config`` = account defaults updated with the strategy's
+  ``risk_overrides``): the sizing caps a strategy may tighten (``max_order_notional``,
+  ``max_position_size``) plus its own allowlist. These also run under the account config
+  so a looser override can't drop the account-wide floor.
 
-An order is approved only if it passes **both**. The per-strategy notional clamp is
-applied first and the quantity-dependent caps are evaluated on the post-clamp order, so
-a clamp-to-fit order is not spuriously rejected.
+An order is approved only if it passes **every** check. The per-strategy notional clamp
+is applied first and the quantity-dependent caps are evaluated on the post-clamp order,
+so a clamp-to-fit order is not spuriously rejected. A clamp is signalled solely by a
+non-None ``adjusted_order``; ``reasons`` is non-empty IFF the order was rejected.
+
+Per-strategy loss/trade *budgets* measured against an attributed per-strategy day-state
+require the orchestrator's per-strategy state and land in M4.4; at M4.3 those budgets
+are enforced at the account-wide level only.
 
 **Conflict policy (design §10).** ``resolve_conflicts`` reconciles same-ticker decisions
 from different strategies in one cycle before sizing: ``net`` (default) sums signed
@@ -74,7 +83,11 @@ class RiskManager:
         self._overrides = dict(overrides_by_strategy or {})
         self._default_policy = default_policy or account_config.conflict_policy
         self._priority_order = tuple(priority_order)
-        self._seen: set[str] = set(seen_client_order_ids)
+        # The duplicate-order guard keys off PERSISTED/submitted ids the orchestrator
+        # seeds here (the write-ahead pending ledger, M4.4/M5.3) -- NOT off orders this
+        # gate merely approved. `check` is pure: it never mutates this set, so an
+        # approved-but-unsent order can't orphan its client_order_id and block a retry.
+        self._seen: frozenset[str] = frozenset(seen_client_order_ids)
         self._log = get_logger("risk")
 
     # -- limit scopes -------------------------------------------------------- #
@@ -97,13 +110,11 @@ class RiskManager:
         merged = self._merged_config(order.strategy_id)
         acct = self._account_config
         now = self._clock.now()
-        seen = frozenset(self._seen)
 
         def ctx(cfg: RiskConfig) -> RuleContext:
-            return RuleContext(cfg, positions, account, quote, day_state, now, seen)
+            return RuleContext(cfg, positions, account, quote, day_state, now, self._seen)
 
         reasons: list[str] = []
-        notes: list[str] = []
 
         # 1) Per-strategy notional clamp first (may reject outright or clamp the size).
         notional = rules.max_order_notional(order, ctx(merged))
@@ -111,22 +122,24 @@ class RiskManager:
             reasons.append(f"per-strategy max_order_notional: {notional.reason}")
         eff_qty = order.quantity if notional.clamped_quantity is None else notional.clamped_quantity
         eff_order = order if eff_qty == order.quantity else replace(order, quantity=eff_qty)
-        if eff_order is not order:
-            notes.append(f"clamped {order.quantity}->{eff_qty}: {notional.reason}")
 
-        # 2) Remaining rules, dual scope, evaluated on the POST-CLAMP order. Account-wide
-        #    entries are the hard guardrail (overrides cannot loosen them).
+        # 2) Remaining rules on the POST-CLAMP order. Scope assignment (design §10):
+        #    - Data-integrity gates (price_sanity) and account-wide caps (gross/loss/
+        #      trades) run under `acct` only -- the HARD floor an override can't loosen.
+        #    - Sizing caps that a strategy may tighten (allowlist, position size) run
+        #      under `merged` AND `acct`, so a stricter override bites and a looser one
+        #      can't remove the account-wide floor.
+        #    Per-strategy loss/trade *budgets* (vs an attributed day-state) need the
+        #    orchestrator's per-strategy state and land in M4.4; here they're account-wide.
         checks: tuple[tuple[Callable[[Order, RuleContext], RuleResult], RiskConfig, str], ...] = (
             (rules.allowlist_denylist, merged, "per-strategy"),
             (rules.allowlist_denylist, acct, "account-wide"),
-            (rules.duplicate_order_guard, merged, "per-strategy"),
-            (rules.price_sanity, merged, "per-strategy"),
-            (rules.daily_loss_limit, merged, "per-strategy"),
+            (rules.duplicate_order_guard, acct, "gate"),
+            (rules.price_sanity, acct, "account-wide"),
             (rules.daily_loss_limit, acct, "account-wide"),
-            (rules.max_trades_per_day, merged, "per-strategy"),
             (rules.max_trades_per_day, acct, "account-wide"),
             (rules.max_position_size, merged, "per-strategy"),
-            (rules.max_gross_exposure, merged, "per-strategy"),
+            (rules.max_position_size, acct, "account-wide"),
             (rules.max_gross_exposure, acct, "account-wide"),
         )
         for rule, cfg, scope in checks:
@@ -134,14 +147,14 @@ class RiskManager:
             if not res.ok:
                 reasons.append(f"{scope} {rule.__name__}: {res.reason}")
 
-        reasons = list(dict.fromkeys(reasons))  # account==merged can duplicate a reason
+        reasons = list(dict.fromkeys(reasons))  # an account==merged run can duplicate a reason
         approved = not reasons
-        final_reasons = tuple(reasons) if reasons else tuple(notes)
+        # Contract: reasons are non-empty IFF rejected. A clamp is signalled purely by a
+        # non-None adjusted_order (the size change is logged), so consumers branch on
+        # `approved` and never misread an informational note as a rejection.
         adjusted = eff_order if (approved and eff_order is not order) else None
-        verdict = RiskVerdict(approved=approved, adjusted_order=adjusted, reasons=final_reasons)
+        verdict = RiskVerdict(approved=approved, adjusted_order=adjusted, reasons=tuple(reasons))
         self._log_verdict(order, eff_qty, verdict)
-        if approved:
-            self._seen.add(order.client_order_id)
         return verdict
 
     def _log_verdict(self, order: Order, eff_qty: int, verdict: RiskVerdict) -> None:

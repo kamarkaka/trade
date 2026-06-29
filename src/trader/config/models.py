@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import ClassVar, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -106,6 +106,20 @@ class RiskConfig(_Base):
     auto_flatten_on_kill: bool = False
     conflict_policy: ConflictPolicy = ConflictPolicy.NET
 
+    # Only these limits may be tuned per strategy (design §10: "per-strategy limits,
+    # e.g. max_order_notional, max_position_size, per-strategy trade count / loss
+    # budget"). Data-integrity gates (staleness/spread/deviation), the allow/denylist,
+    # and account-wide-only caps (gross exposure, PDT, conflict policy) are NOT
+    # overridable — a strategy must never be able to loosen a safety floor.
+    PER_STRATEGY_OVERRIDABLE: ClassVar[frozenset[str]] = frozenset(
+        {
+            "max_order_notional_usd",
+            "max_position_size_pct",
+            "max_trades_per_day",
+            "daily_loss_limit_pct",
+        }
+    )
+
     @field_validator("allowlist", "denylist", mode="before")
     @classmethod
     def _normalize_symbols(cls, v: object) -> object:
@@ -136,6 +150,12 @@ class StrategyBindingConfig(_Base):
         unknown = set(v) - set(RiskConfig.model_fields)
         if unknown:
             raise ValueError(f"unknown risk_overrides keys: {sorted(unknown)}")
+        not_overridable = set(v) - RiskConfig.PER_STRATEGY_OVERRIDABLE
+        if not_overridable:
+            raise ValueError(
+                f"risk_overrides keys not tunable per strategy (safety floors): "
+                f"{sorted(not_overridable)}"
+            )
         return v
 
     @model_validator(mode="after")

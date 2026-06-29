@@ -29,9 +29,14 @@ def stable_seed(base_seed: int | None, slot_date: date, strategy_id: str, slot_i
     """A 64-bit seed, deterministic for a fixed ``base_seed`` and fresh entropy when None."""
     if base_seed is None:
         return secrets.randbits(64)  # live: unpredictable, different each day
-    joined = "|".join((str(base_seed), slot_date.isoformat(), strategy_id, slot_id))
-    digest = hashlib.blake2b(joined.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, "big")
+    # Length-prefix each field so the encoding is unambiguous (a plain delimiter could
+    # collide, e.g. ('a|b','c') vs ('a','b|c') — strategy_id/slot_id are user-controlled).
+    digest = hashlib.blake2b(digest_size=8)
+    for part in (str(base_seed), slot_date.isoformat(), strategy_id, slot_id):
+        encoded = part.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return int.from_bytes(digest.digest(), "big")
 
 
 def _bounds(direction: DriftDirection, max_seconds: int) -> tuple[int, int]:
@@ -48,7 +53,8 @@ def _sample(rng: np.random.Generator, distribution: Distribution, lo: int, hi: i
         return float(rng.triangular(lo, mid, hi))
     if distribution is Distribution.TRUNCNORM:
         # No scipy dependency: normal centered at mid, ~4 sigma across the range, clipped.
-        value = rng.normal(mid, (hi - lo) / 4 or 1.0)
+        # (callers short-circuit max==0, so hi > lo here and the sigma is positive)
+        value = rng.normal(mid, (hi - lo) / 4)
         return float(min(hi, max(lo, value)))
     return float(rng.uniform(lo, hi))  # UNIFORM (default)
 

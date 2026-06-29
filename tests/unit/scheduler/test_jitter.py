@@ -1,6 +1,7 @@
 """Tests for the seeded jitter module: reproducibility, bounds, direction,
 strategy independence, and entropy wiring (M3.2)."""
 
+import secrets
 from datetime import date, time
 
 import numpy as np
@@ -8,7 +9,6 @@ import pytest
 
 from trader.core.enums import DriftDirection
 from trader.core.types import SlotSpec
-from trader.scheduler import jitter
 from trader.scheduler.jitter import compute_drift, stable_seed
 
 DAY = date(2026, 6, 29)
@@ -66,14 +66,26 @@ def test_date_independence() -> None:
     assert a != b  # different day -> different drift
 
 
-def test_entropy_when_seed_none_usually_differs() -> None:
+def test_slot_independence() -> None:
+    a, _ = compute_drift(_slot(), base_seed=42, slot_date=DAY, strategy_id="m")  # slot_id "open"
+    other = SlotSpec(slot_id="close", at=time(10, 0), drift_max_minutes=30)
+    b, _ = compute_drift(other, base_seed=42, slot_date=DAY, strategy_id="m")
+    assert a != b  # different slot_id -> independent drift
+
+
+def test_seed_encoding_has_no_delimiter_collision() -> None:
+    # length-prefixed framing: shifting text across a field boundary must NOT collide
+    assert stable_seed(42, DAY, "a|b", "c") != stable_seed(42, DAY, "a", "b|c")
+
+
+def test_entropy_when_seed_none() -> None:
     seeds = {stable_seed(None, DAY, "m", "open") for _ in range(10)}
     assert len(seeds) > 1  # fresh entropy each call
 
 
 def test_entropy_wiring_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
     # patch the entropy source: base_seed=None must derive from secrets.randbits
-    monkeypatch.setattr(jitter.secrets, "randbits", lambda _bits: 123456789)
+    monkeypatch.setattr(secrets, "randbits", lambda _bits: 123456789)
     assert stable_seed(None, DAY, "m", "open") == 123456789
     drift, seed = compute_drift(_slot(), base_seed=None, slot_date=DAY, strategy_id="m")
     assert seed == 123456789

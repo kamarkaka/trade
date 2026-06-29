@@ -21,7 +21,7 @@ rounding) — intentional for a deterministic backtest; live reconciliation (M4)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from trader.core import Account, Bar, Fill, Order, Position, Quote
@@ -97,6 +97,7 @@ class _Working:
     filled_qty: int = 0
     cost: Decimal = field(default_factory=lambda: Decimal("0"))  # sum(qty*price)
     fees: Decimal = field(default_factory=lambda: Decimal("0"))
+    last_fill_ts: datetime | None = None  # bar/quote ts of the last fill (per-bar budget)
 
 
 class SimBroker:
@@ -131,10 +132,10 @@ class SimBroker:
         if existing is not None:  # idempotent: never double-submit
             return existing
 
-        self._seq += 1
-        broker_order_id = f"SIM-{self._seq}"
+        broker_order_id = f"SIM-{self._seq + 1}"
         working = _Working(order=order, broker_order_id=broker_order_id)
-        self._try_fill(working)
+        self._try_fill(working)  # may raise (negative price) before _seq is committed
+        self._seq += 1
         status = self._status_of(working)
         self._fills[broker_order_id] = self._snapshot(working, status)
         self._by_client[order.client_order_id] = broker_order_id
@@ -205,6 +206,7 @@ class SimBroker:
 
         if order.order_type is OrderType.MARKET:
             quote = self._data.get_quote(order.symbol, self._clock.now())
+            data_ts = quote.ts
             price = self._fill_price(order.side, quote)
             available_volume = quote.volume
         else:  # LIMIT
@@ -213,8 +215,13 @@ class SimBroker:
                 return  # no bar to evaluate against -> stays working
             if not self._limit_crosses(order.side, order.limit_price, bar):
                 return
+            data_ts = bar.ts
             price = order.limit_price  # limit guarantees price; no extra slippage
             available_volume = bar.volume
+
+        # One participation budget per bar: don't re-consume the same bar across calls.
+        if working.last_fill_ts == data_ts:
+            return
 
         if price < 0:
             # Guard before mutating any state (atomicity): a fill price can't be negative.
@@ -223,6 +230,8 @@ class SimBroker:
         fill_qty = remaining
         if self._max_participation is not None:
             cap = int(self._max_participation * Decimal(available_volume))
+            if cap == 0 and available_volume > 0:
+                cap = 1  # floor so a low-volume order isn't starved forever
             fill_qty = min(remaining, cap)
         if fill_qty <= 0:
             return
@@ -234,6 +243,7 @@ class SimBroker:
         working.filled_qty += fill_qty
         working.cost += notional
         working.fees += fee
+        working.last_fill_ts = data_ts
 
     def _status_of(self, working: _Working) -> OrderStatus:
         if working.filled_qty >= working.order.quantity:

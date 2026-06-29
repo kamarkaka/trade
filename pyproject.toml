@@ -20,6 +20,7 @@ dependencies = [
   "tenacity>=8",  # retry/backoff for the Schwab HTTP transport (M1.6)
   "pandas>=2.2",  # backtest historical data cache + frames (M2.2)
   "pyarrow>=16",  # Parquet storage engine for the bar cache (M2.2)
+  "numpy>=2",  # seeded backtest RNG (M2.9)
 ]
 
 [project.optional-dependencies]

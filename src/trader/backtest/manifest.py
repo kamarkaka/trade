@@ -22,17 +22,34 @@ from trader.config import AppConfig
 # Libraries whose versions materially affect numeric results.
 _TRACKED_LIBS = ("pydantic", "pandas", "pyarrow", "numpy")
 
+# Deployment/notification subtrees that don't affect backtest results — excluded so
+# the config_hash is portable across environments (local vs CI golden run, M2.10).
+_HASH_EXCLUDE = {"observability": True, "alerting": True}
+
+# Project root (…/src/trader/backtest/manifest.py -> repo root), so the recorded
+# git commit is the project's, not whatever repo the process CWD happens to be in.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 def config_hash(config: AppConfig) -> str:
-    """SHA-256 of the canonicalized (sorted-key, compact JSON) resolved config."""
-    canonical = json.dumps(config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    """SHA-256 of the canonicalized (sorted-key, compact JSON) resolved config.
+
+    Result-affecting fields only (observability/alerting excluded). Note the hash is
+    sensitive to a field's numeric *formatting* in the source (e.g. ``5000`` vs
+    ``5000.0``); a fixed config fixture (the golden run) keeps it stable.
+    """
+    canonical = json.dumps(
+        config.model_dump(mode="json", exclude=_HASH_EXCLUDE),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _git_commit() -> str:
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=False,

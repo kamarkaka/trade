@@ -45,7 +45,7 @@ def test_manifest_has_all_fields() -> None:
     }
     assert m["seed"] == 42
     assert m["data_hashes"] == {"AAPL": "deadbeef"}
-    assert m["lib_versions"]["numpy"] != ""
+    assert m["lib_versions"]["numpy"] != "unknown"  # numpy is an installed dependency
 
 
 def test_write_manifest_roundtrips(tmp_path: Path) -> None:
@@ -57,14 +57,18 @@ def test_write_manifest_roundtrips(tmp_path: Path) -> None:
     assert json.loads(out.read_text()) == m
 
 
-def test_rng_is_seeded_and_reproducible() -> None:
+def test_rng_is_seeded_not_global() -> None:
+    # reproducible from the seed, and independent of the global numpy RNG
     assert make_rng(42).random() == make_rng(42).random()  # same seed -> same draw
     assert make_rng(42).random() != make_rng(43).random()  # different seed -> different
-
-
-def test_rng_independent_of_global() -> None:
-    rng = make_rng(42)
-    expected = rng.random()
+    expected = make_rng(42).random()
     np.random.seed(999)  # perturb the global RNG
     _ = np.random.random()
     assert make_rng(42).random() == expected  # unaffected by the global RNG
+
+
+def test_manifest_is_deterministic_across_builds() -> None:
+    cfg = _config()
+    a = build_manifest(cfg, {"AAPL": "h"}, seed=1)
+    b = build_manifest(cfg, {"AAPL": "h"}, seed=1)
+    assert a == b  # same inputs -> identical manifest (incl. git/lib/python)

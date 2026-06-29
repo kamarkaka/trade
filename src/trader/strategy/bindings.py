@@ -53,7 +53,7 @@ def load_bindings(
                 universe=tuple(sb.universe),
                 slots=tuple(_to_slotspec(slot, config.schedule) for slot in sb.slots),
                 enabled=sb.enabled,
-                risk_overrides=sb.risk_overrides,
+                risk_overrides=dict(sb.risk_overrides) if sb.risk_overrides is not None else None,
             )
         )
     return config.schedule, bindings

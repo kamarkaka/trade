@@ -59,6 +59,51 @@ def test_slot_inherits_global_catch_up(tmp_path: Path) -> None:
     assert meanrev.slots[1].catch_up is True  # 'noon' inherits schedule.catch_up=true
 
 
+def test_params_and_risk_overrides_isolated_and_passed(tmp_path: Path) -> None:
+    body = _TWO_STRATEGIES.replace(
+        "params: {band: 0.02, lot: 10}",
+        "params: {band: 0.02, lot: 10}\n    risk_overrides: {max_trades_per_day: 2}",
+    )
+    config = load_config(_write(tmp_path, body))
+    _schedule, bindings = load_bindings(config)
+    momentum = next(b for b in bindings if b.strategy_id == "momentum")
+    assert momentum.params == {"band": 0.02, "lot": 10}
+    assert momentum.risk_overrides == {"max_trades_per_day": 2}
+    # copies, not aliases of the config objects
+    assert momentum.params is not config.strategies[0].params
+    assert momentum.risk_overrides is not config.strategies[0].risk_overrides
+
+
+def test_disabled_binding_with_empty_universe_is_mapped(tmp_path: Path) -> None:
+    body = """
+mode: backtest
+strategies:
+  - id: parked
+    name: threshold
+    enabled: false
+    universe: []
+    slots: []
+  - id: momentum
+    name: threshold
+    universe: [AAPL]
+    slots:
+      - {id: morning, time: "09:45"}
+"""
+    _schedule, bindings = load_bindings(load_config(_write(tmp_path, body)))
+    disabled = next(b for b in bindings if b.strategy_id == "parked")
+    assert disabled.enabled is False
+    assert disabled.universe == ()  # allowed for a disabled binding
+
+
+def test_explicit_true_catch_up_overrides_false_schedule(tmp_path: Path) -> None:
+    body = _TWO_STRATEGIES.replace("catch_up: true", "catch_up: false").replace(
+        'time: "09:45"', 'time: "09:45", catch_up: true'
+    )
+    _schedule, bindings = load_bindings(load_config(_write(tmp_path, body)))
+    momentum = next(b for b in bindings if b.strategy_id == "momentum")
+    assert momentum.slots[0].catch_up is True  # explicit True kept despite schedule False
+
+
 def test_unknown_strategy_name_rejected(tmp_path: Path) -> None:
     body = _TWO_STRATEGIES.replace("name: threshold", "name: no_such_strategy")
     with pytest.raises(ValueError, match="unknown strategy name"):

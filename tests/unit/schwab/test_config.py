@@ -5,8 +5,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from trader.schwab.config import SchwabClientConfig
+from trader.schwab.config import SchwabClientConfig, schwab_config_from_env
 from trader.schwab.constants import API_BASE, OAUTH_TOKEN_URL
+from trader.schwab.errors import SchwabAuthError
 
 
 def _cfg(**kw: object) -> SchwabClientConfig:
@@ -47,3 +48,47 @@ def test_defaults() -> None:
     assert cfg.refresh_token_max_age_days == 7
     assert cfg.max_retries == 4
     assert cfg.request_timeout_seconds == 30.0
+
+
+# --- schwab_config_from_env ------------------------------------------------- #
+
+
+def test_from_env_reads_credentials_and_overrides() -> None:
+    env = {
+        "SCHWAB_APP_KEY": "K",
+        "SCHWAB_APP_SECRET": "S",
+        "SCHWAB_REDIRECT_URI": "https://127.0.0.1:9999",
+        "SCHWAB_TOKEN_STORE_PATH": "/custom/token.sqlite",
+    }
+    cfg = schwab_config_from_env(
+        default_token_store="/state/schwab_token.sqlite",
+        rate_limit_per_min=80,
+        environ=env,
+        require_credentials=True,
+    )
+    assert cfg.app_key == "K"
+    assert cfg.app_secret.get_secret_value() == "S"
+    assert cfg.redirect_uri == "https://127.0.0.1:9999"
+    assert cfg.token_store_path == Path("/custom/token.sqlite")
+    assert cfg.rate_limit_per_min == 80
+
+
+def test_from_env_defaults_token_store_when_unset() -> None:
+    cfg = schwab_config_from_env(default_token_store="/state/schwab_token.sqlite", environ={})
+    assert cfg.token_store_path == Path("/state/schwab_token.sqlite")
+    assert cfg.app_key == ""  # absent creds tolerated when not required
+
+
+def test_from_env_requires_credentials_when_asked() -> None:
+    with pytest.raises(SchwabAuthError):
+        schwab_config_from_env(
+            default_token_store="/state/t.sqlite", environ={}, require_credentials=True
+        )
+
+
+def test_from_env_secret_not_in_repr() -> None:
+    cfg = schwab_config_from_env(
+        default_token_store="/state/t.sqlite",
+        environ={"SCHWAB_APP_KEY": "K", "SCHWAB_APP_SECRET": "leakme"},
+    )
+    assert "leakme" not in repr(cfg)

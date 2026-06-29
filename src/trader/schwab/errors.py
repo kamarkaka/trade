@@ -47,5 +47,9 @@ class SchwabBadResponseError(SchwabError):
     """Malformed / unparseable response from Schwab."""
 
 
+class SchwabStaleQuoteError(SchwabError):
+    """A quote is older than the allowed staleness window (price-sanity, §4.2/§10)."""
+
+
 class SchwabReadOnlyModeError(SchwabError):
     """The client is in READ-ONLY safe mode and refused a request."""

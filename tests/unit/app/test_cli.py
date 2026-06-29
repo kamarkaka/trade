@@ -3,6 +3,7 @@ exit code, config-error handling, and stub commands."""
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from trader.app.cli import app
@@ -53,10 +54,36 @@ def test_healthcheck_invalid_config_exits_nonzero(tmp_path: Path) -> None:
 
 
 def test_stub_commands_run() -> None:
-    for argv in (["run"], ["backtest"], ["reconcile"], ["reauth"], ["kill", "--on"]):
+    for argv in (["run"], ["backtest"], ["reconcile"], ["kill", "--on"]):
         result = runner.invoke(app, argv)
         assert result.exit_code == 0, argv
         assert "not implemented" in result.output
+
+
+def test_status_reports_token_age(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from trader.auth.token_store import TokenStore
+    from trader.auth.tokens import TokenSet
+
+    tok_path = tmp_path / "tok.sqlite"
+    monkeypatch.setenv("SCHWAB_TOKEN_STORE_PATH", str(tok_path))
+    now = datetime.now(UTC)
+    TokenStore(tok_path).save(
+        TokenSet("ACC", "REF", now + timedelta(hours=1), now - timedelta(days=1))
+    )
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "auth: authenticated" in result.output
+    assert "expires in" in result.output
+
+
+def test_reauth_without_credentials_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)
+    monkeypatch.delenv("SCHWAB_APP_SECRET", raising=False)
+    result = runner.invoke(app, ["reauth"])
+    assert result.exit_code != 0
+    assert "reauth error" in result.output
 
 
 def test_console_script_entrypoint_is_callable() -> None:

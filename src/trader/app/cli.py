@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import Annotated
 
 import typer
 
@@ -21,40 +21,8 @@ from trader.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
 from trader.schwab.config import SchwabClientConfig, schwab_config_from_env
 from trader.schwab.errors import SchwabAuthError, SchwabError
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from trader.core import Account, Decision, MarketSnapshot, Position
-    from trader.core.protocols import Clock, MarketDataProvider
-
 # Default backtest starting capital until a config-driven account balance exists.
 _BACKTEST_STARTING_CASH = "100000"
-
-
-class _BuyAndHoldStrategy:
-    """Placeholder strategy for the M2.11 wiring: buy each universe symbol once and
-    hold. Replaced by the StrategyRegistry + real strategies in M3.6/M6."""
-
-    def __init__(self, quantity: int = 10) -> None:
-        self._quantity = quantity
-
-    def decide(
-        self,
-        snapshot: MarketSnapshot,
-        positions: Sequence[Position],
-        account: Account,
-        data: MarketDataProvider,
-        clock: Clock,
-    ) -> Sequence[Decision]:
-        from trader.core import Decision
-        from trader.core.enums import Action
-
-        held = {p.symbol for p in positions if p.quantity != 0}
-        return [
-            Decision(action=Action.BUY, symbol=symbol, quantity=self._quantity)
-            for symbol in snapshot.quotes
-            if symbol not in held
-        ]
 
 
 app = typer.Typer(
@@ -356,17 +324,36 @@ def backtest(
     start: Annotated[str, typer.Option("--start", help="Inclusive start date (YYYY-MM-DD).")],
     end: Annotated[str, typer.Option("--end", help="Inclusive end date (YYYY-MM-DD).")],
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
-    out: Annotated[str, typer.Option("--out", help="Output directory for reports.")] = "reports",
+    out: Annotated[
+        str, typer.Option("--out-dir", "--out", help="Output directory for reports.")
+    ] = "reports",
+    report_json: Annotated[
+        bool, typer.Option("--report-json/--no-report-json", help="Write report.json.")
+    ] = True,
+    report_html: Annotated[
+        bool, typer.Option("--report-html/--no-report-html", help="Write report.html.")
+    ] = True,
 ) -> None:
-    """Run a single-strategy backtest over cached data; write report + manifest."""
-    import json
+    """Run a multi-strategy backtest over CACHED data and write a per-strategy + combined
+    report (JSON/HTML + manifest). This path is fully OFFLINE and deterministic — it never
+    touches the broker or the network (no real-money path; design safety gate)."""
+    import itertools
+    import tempfile
 
-    from trader.backtest import BacktestEngine, Portfolio, build_manifest, write_manifest
-    from trader.backtest.report import BacktestReport
+    import trader.strategy  # noqa: F401 - registers built-in strategies into REGISTRY
+    from trader.backtest import build_manifest, run_multi_strategy, write_manifest
+    from trader.backtest.report import BacktestRunResult, FireRecord, build_report
     from trader.broker import SimBroker
     from trader.clock import VirtualClock
+    from trader.core import Decision, Order
     from trader.data.cache import ParquetCache
     from trader.data.historical import HistoricalDataProvider
+    from trader.scheduler.calendar import TradingCalendar
+    from trader.sizing.sizer import size_decision
+    from trader.state.attribution import AttributionLedger
+    from trader.state.db import connect
+    from trader.state.migrate import run_migrations
+    from trader.strategy import load_bindings
 
     cfg = _load(config)
     start_d = _parse_day(start, "--start", context="backtest").date()
@@ -375,52 +362,114 @@ def backtest(
         typer.echo("backtest error: --end must be on or after --start", err=True)
         raise typer.Exit(1)
 
-    enabled = [b for b in cfg.strategies if b.enabled]
+    try:
+        schedule, bindings = load_bindings(cfg)
+    except ValueError as exc:
+        typer.echo(f"backtest error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    enabled = [b for b in bindings if b.enabled]
     if not enabled:
         typer.echo("backtest error: no enabled strategy in config", err=True)
         raise typer.Exit(1)
-    binding = enabled[0]
-    universe = list(binding.universe)
-    # M2 simplification: slot "HH:MM" is treated as UTC (engine combines with UTC).
-    # DST-aware localization to the config timezone arrives in M3.3/M3.4 (design §7.1).
-    slots = [datetime.strptime(s.time, "%H:%M").time() for s in binding.slots]
-    seed = cfg.schedule.base_seed or 0
+    universe = sorted({sym for b in enabled for sym in b.universe})
+    seed = schedule.base_seed or 0
     cash = Decimal(_BACKTEST_STARTING_CASH)
 
     clock = VirtualClock(datetime.combine(start_d, time.min, tzinfo=UTC))
     cache = ParquetCache(cfg.observability.data_cache)
     data = HistoricalDataProvider(cache, clock)
     broker = SimBroker(data, clock, starting_cash=cash)
-    portfolio = Portfolio(cash)
-    engine = BacktestEngine(clock=clock, data=data, broker=broker, portfolio=portfolio)
-    result = engine.run(
-        _BuyAndHoldStrategy(),
-        universe=universe,
-        slots=slots,
-        start=start_d,
-        end=end_d,
-        strategy_id=binding.id,
-        seed=seed,
-    )
+
+    # Deterministic client_order_ids (in trigger order) so the report is reproducible.
+    ids = itertools.count()
+
+    def _sizer(decision: Decision, strategy_id: str) -> Order | None:
+        return size_decision(
+            decision, strategy_id, cfg.execution, id_factory=lambda: f"bt-{next(ids)}"
+        )
+
+    # Throwaway state DB for per-strategy attribution (backtest writes nothing durable).
+    with tempfile.TemporaryDirectory() as state_dir:
+        conn = connect(Path(state_dir) / "state.sqlite")
+        run_migrations(conn)
+        result = run_multi_strategy(
+            bindings=enabled,
+            schedule=schedule,
+            calendar=TradingCalendar(),
+            data=data,
+            broker=broker,
+            attribution=AttributionLedger(conn),
+            sizer=_sizer,
+            clock=clock,
+            start=start_d,
+            end=end_d,
+        )
+        conn.close()
 
     data_hashes = {symbol: cache.content_hash(symbol) for symbol in universe}
     manifest = build_manifest(cfg, data_hashes, seed)
-    report = BacktestReport.build(result.fills, result.equity_curve, manifest)
+    run_result = BacktestRunResult(
+        combined_equity_curve=result.equity_curve,
+        per_strategy_trades=result.per_strategy_trades,
+        fire_log=[
+            FireRecord(t.strategy_id, t.slot_id, t.fire_ts, t.drift_seconds, t.seed)
+            for t in result.fire_log
+        ],
+    )
+    doc = build_report(run_result, manifest, strategy_ids=[b.strategy_id for b in enabled])
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")  # microseconds avoid collisions
-    out_dir = Path(out) / f"{binding.id}-{start_d}-{end_d}-{stamp}"
+    out_dir = Path(out) / f"{start_d}-{end_d}-{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "report.json").write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    if report_json:
+        doc.to_json(out_dir / "report.json")
+    if report_html:
+        doc.to_html(out_dir / "report.html")
     write_manifest(manifest, out_dir / "manifest.json")
-    if not result.fills:
+
+    n_fills = sum(len(t) for t in result.per_strategy_trades.values())
+    if n_fills == 0:
         typer.echo(
             "backtest warning: no fills produced — check that data is cached for "
             f"{universe} over {start_d}..{end_d}",
             err=True,
         )
-    typer.echo(f"backtest: {len(result.fills)} fills; report written to {out_dir}")
+    _print_backtest_summary(doc.data)
+    typer.echo(f"backtest: {n_fills} fills; report written to {out_dir}")
+
+
+def _print_backtest_summary(data: dict) -> None:  # type: ignore[type-arg]
+    """Compact per-strategy + combined table to stdout (no files)."""
+
+    def _row(name: str, trades: object, hit: object, ret: object, dd: object) -> str:
+        # Fixed widths with explicit gaps so signed 8dp values (e.g. -0.00300000) never
+        # collide with the next column.
+        return f"{name:<16}{trades!s:>8}  {hit!s:>14}  {ret!s:>14}  {dd!s:>12}"
+
+    combined = data["combined"]
+    typer.echo("")
+    typer.echo(_row("strategy", "trades", "hit_rate", "total_ret", "max_dd"))
+    typer.echo("-" * 70)
+    typer.echo(
+        _row(
+            "COMBINED",
+            combined["num_trades"],
+            combined["hit_rate"] or "—",
+            combined["total_return"],
+            combined["max_drawdown_pct"],
+        )
+    )
+    for sid, block in data["per_strategy"].items():
+        em = block.get("equity_metrics")
+        typer.echo(
+            _row(
+                sid,
+                block["num_trades"],
+                block["hit_rate"] or "—",
+                em["total_return"] if em else "—",
+                em["max_drawdown_pct"] if em else "—",
+            )
+        )
 
 
 @app.command()

@@ -23,7 +23,7 @@ from trader.config.models import ScheduleConfig
 from trader.core import Fill, MarketSnapshot, Order, Quote
 from trader.core.enums import Action, OrderType, Side
 from trader.core.protocols import Broker, Clock, MarketDataProvider, Strategy
-from trader.core.types import StrategyBinding
+from trader.core.types import StrategyBinding, TriggerSlot
 from trader.orchestrator.cycle import CycleResult, Orchestrator, Sizer
 from trader.orchestrator.lock import NullLock
 from trader.scheduler.calendar import TradingCalendar
@@ -162,11 +162,13 @@ def _triggers(start: date, end: date, slots: Sequence[time]) -> list[datetime]:
 @dataclass
 class MultiStrategyResult:
     """Outputs of a multi-strategy backtest: per-trigger cycles, the combined equity
-    curve (broker mark-to-market per trigger), and per-strategy (fill, side) trades."""
+    curve (broker mark-to-market per trigger), per-strategy (fill, side) trades, and the
+    fire log (each resolved trigger with its realized drift + seed, for the M6.6 report)."""
 
     cycle_results: list[CycleResult] = field(default_factory=list)
     equity_curve: list[tuple[datetime, Decimal]] = field(default_factory=list)
     per_strategy_trades: dict[str, list[tuple[Fill, Side]]] = field(default_factory=dict)
+    fire_log: list[TriggerSlot] = field(default_factory=list)
 
 
 def run_multi_strategy(
@@ -216,6 +218,7 @@ def run_multi_strategy(
             cycle = orchestrator.run_cycle(
                 strategy, binding.universe, trigger.strategy_id, trigger.fire_ts
             )
+            result.fire_log.append(trigger)
             result.cycle_results.append(cycle)
             for order, fill in zip(cycle.orders, cycle.fills, strict=True):
                 result.per_strategy_trades[trigger.strategy_id].append((fill, order.side))

@@ -127,6 +127,50 @@ def test_place_order_no_location_raises(tmp_path: Path) -> None:
 
 
 @respx.mock
+def test_place_order_location_with_query_string(tmp_path: Path) -> None:
+    respx.post(ORDERS_URL).mock(
+        return_value=httpx.Response(201, headers={"Location": f"{ORDERS_URL}/1003490104?x=1"})
+    )
+    with httpx.Client() as c:
+        order_id = _client(tmp_path, c).place_order(
+            ACCT,
+            build_order_json(symbol="AAPL", side=Side.BUY, quantity=1, order_type=OrderType.MARKET),
+        )
+    assert order_id == "1003490104"  # query string stripped, not part of the id
+
+
+@respx.mock
+def test_place_order_not_auto_retried_on_5xx(tmp_path: Path) -> None:
+    # SAFETY: a POST that 5xx's must NOT be re-sent (a 5xx can arrive after the order was
+    # accepted -> a blind retry would double the real position). Surface the error instead.
+    from trader.schwab.errors import SchwabServerError
+
+    route = respx.post(ORDERS_URL).mock(return_value=httpx.Response(503))
+    with httpx.Client() as c, pytest.raises(SchwabServerError):
+        _client(tmp_path, c).place_order(
+            ACCT,
+            build_order_json(symbol="AAPL", side=Side.BUY, quantity=1, order_type=OrderType.MARKET),
+        )
+    assert route.call_count == 1  # exactly one POST attempt, never retried
+
+
+@respx.mock
+def test_cancel_is_retried_on_5xx(tmp_path: Path) -> None:
+    # DELETE (cancel) is idempotent, so it IS safe to retry on a transient 5xx.
+    route = respx.delete(f"{ORDERS_URL}/1003490104").mock(
+        side_effect=[httpx.Response(503), httpx.Response(200)]
+    )
+    with httpx.Client() as c:
+        _client(tmp_path, c).cancel_order(ACCT, "1003490104")
+    assert route.call_count == 2  # retried once, then succeeded
+
+
+def test_parse_order_status_rejects_fractional_quantity() -> None:
+    with pytest.raises(SchwabBadResponseError, match="integer"):
+        parse_order_status({"orderId": "1", "status": "FILLED", "filledQuantity": 3.7})
+
+
+@respx.mock
 def test_replace_order_returns_new_id(tmp_path: Path) -> None:
     route = respx.put(f"{ORDERS_URL}/1003490104").mock(
         return_value=httpx.Response(201, headers={"Location": f"{ORDERS_URL}/1003490200"})

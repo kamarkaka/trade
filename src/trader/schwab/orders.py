@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -39,10 +40,15 @@ def _require(mapping: Any, key: str) -> Any:
 
 
 def _int(value: Any, field: str) -> int:
+    # Fail loud on a non-integral quantity rather than silently truncating: get_json parses
+    # JSON numbers as Decimal, so a stray 3.7 must NOT become 3 shares.
     try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
+        dec = Decimal(str(value))
+    except Exception as exc:
         raise SchwabBadResponseError(f"{field} is not an int: {value!r}") from exc
+    if dec != dec.to_integral_value():
+        raise SchwabBadResponseError(f"{field} is not an integer: {value!r}")
+    return int(dec)
 
 
 def _dec(value: Any, field: str) -> Decimal:
@@ -190,7 +196,12 @@ class SchwabTradingClient:
         return f"{ACCOUNTS_PATH}/{account_hash}/orders"
 
     def place_order(self, account_hash: str, order_json: dict[str, Any]) -> str:
-        """POST a new order; return the order id from the 201 ``Location`` header."""
+        """POST a new order; return the order id from the 201 ``Location`` header.
+
+        NOT IDEMPOTENT: calling this twice places TWO real orders. On a timeout/unknown
+        response, the transport deliberately does NOT auto-retry the POST — the caller must
+        reconcile-before-resend and reuse the client_order_id (the M5.3 idempotent wrapper).
+        Never call this directly from ad-hoc/daemon code."""
         resp = self._http.request("POST", self._orders_path(account_hash), json=order_json)
         return self._order_id_from_location(resp)
 
@@ -220,11 +231,16 @@ class SchwabTradingClient:
 
     @staticmethod
     def _order_id_from_location(resp: httpx.Response) -> str:
-        location = resp.headers.get("Location") or resp.headers.get("location")
+        location = resp.headers.get("Location")  # httpx headers are case-insensitive
         if not location:
             raise SchwabBadResponseError("order placement returned no Location header")
-        order_id = str(location).rstrip("/").rsplit("/", 1)[-1]
-        if not order_id:
+        # Extract the id after ".../orders/", stripping any query string (urlsplit drops it)
+        # and trailing slash. Reject a degenerate Location rather than return a wrong id.
+        path = urlsplit(str(location)).path
+        marker = "/orders/"
+        idx = path.rfind(marker)
+        order_id = path[idx + len(marker) :].strip("/") if idx != -1 else ""
+        if not order_id or "/" in order_id:
             raise SchwabBadResponseError(f"could not parse order id from Location {location!r}")
         return order_id
 

@@ -33,9 +33,11 @@ def test_status_uses_default_config_when_omitted() -> None:
     assert "mode: paper" in result.output
 
 
-def test_healthcheck_exits_zero_when_config_loads() -> None:
+def test_healthcheck_nonzero_without_heartbeat() -> None:
+    # No running daemon => no fresh heartbeat at the configured db_path => unhealthy.
+    # (Fresh/stale exit codes are covered in test_heartbeat.py with a real state DB.)
     result = runner.invoke(app, ["status", "--healthcheck"])
-    assert result.exit_code == 0
+    assert result.exit_code != 0
 
 
 def test_status_invalid_config_exits_nonzero(tmp_path: Path) -> None:

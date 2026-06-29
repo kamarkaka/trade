@@ -2,9 +2,11 @@
 
 **Why this exists.** Schwab **refresh tokens expire ~7 days** and are **not** programmatically
 renewable — a human must complete the browser OAuth flow roughly weekly. The daemon cannot do
-this headless. It therefore alerts ahead of expiry (`reauth_reminder`) and, if the token lapses,
-degrades to **read-only safe mode** (it keeps reading quotes/serving status but places no
-orders) instead of crashing. This runbook is the §16.4 procedure to refresh the token.
+this headless. It therefore alerts ahead of expiry (`reauth_reminder`). If a refresh actually
+returns a dead token, the Schwab client enters **read-only safe mode** and **refuses every
+request** (so no order is ever placed — and there is no order path before M5 regardless);
+cycles fail closed and an alert fires. The daemon **process does not crash**, but it cannot
+trade until you re-authenticate. This runbook is the §16.4 procedure to refresh the token.
 
 > Verify the exact refresh-token TTL against current Schwab developer docs; the code treats it as
 > a configurable max age and reports the countdown in `trader status`.
@@ -49,9 +51,11 @@ then copy the resulting token file onto the server's volume.
    # from the laptop, scp the file to the server first if needed, then on the server:
    docker compose cp ./schwab_token.sqlite trader:/state/schwab_token.sqlite
    ```
-   Alternatively write into the volume via a throwaway container:
+   Alternatively write into the volume via a throwaway container. **Note the real volume
+   name:** Compose prefixes it with the project name (the compose directory, `deploy`), so it
+   is `deploy_trader_state`, not `trader_state` — confirm with `docker volume ls`:
    ```sh
-   docker run --rm -v trader_state:/state -v "$PWD":/in alpine \
+   docker run --rm -v deploy_trader_state:/state -v "$PWD":/in alpine \
      cp /in/schwab_token.sqlite /state/schwab_token.sqlite
    ```
 
@@ -69,21 +73,21 @@ then copy the resulting token file onto the server's volume.
 ## Option B — SSH port-forward the callback to the server
 
 Run the OAuth flow *on the server* but drive the browser from your laptop by forwarding the
-loopback callback port over SSH.
+loopback callback port over SSH. **Caveats:** the callback default is `https://127.0.0.1:8182`
+(override via `SCHWAB_REDIRECT_URI`). A `docker compose exec` callback binds inside the
+*container's* network namespace, which an SSH `-L` forward (terminating on the host) cannot
+reach, and the slim container has **no browser** — so prefer running `reauth` directly on the
+server host (in a venv/one-off `docker run` with the port published), or just use Option A.
 
-1. Find the callback port the client uses (the OAuth loopback redirect URI / port; see the
-   Schwab app config and `trader reauth` output).
-2. Forward it from the laptop:
+1. Forward the callback port from the laptop (default `8182`):
    ```sh
-   ssh -L 8443:localhost:8443 user@server     # replace 8443 with the actual callback port
+   ssh -L 8182:localhost:8182 user@server     # 8182 = default; match SCHWAB_REDIRECT_URI
    ```
-3. On the server, run the flow against the running container (or a one-off run):
-   ```sh
-   docker compose exec trader trader reauth
-   ```
-4. Complete the browser prompt on the laptop (the forwarded port reaches the server's callback).
-   The token is written directly to `/state/schwab_token.sqlite` on the volume.
-5. `docker compose restart trader` and verify with `trader status`.
+2. On the server host, run `trader reauth` so its loopback callback binds the forwarded port,
+   and copy the printed authorize URL into the laptop browser (no browser exists server-side).
+3. On success the token is written to the configured token store; copy it onto
+   `deploy_trader_state` if you authed outside the volume, then `docker compose restart trader`
+   and verify with `trader status`.
 
 ---
 
@@ -97,6 +101,9 @@ The `reauth_reminder` alert should stop firing once the fresh token is in place.
 
 ## If you miss the window
 
-The daemon enters read-only safe mode (no orders) and keeps alerting. Re-auth with Option A/B
-above and restart; the fired-slot ledger + durable state mean it resumes without double-firing.
+Once a refresh returns a dead token the client enters read-only safe mode and refuses all
+Schwab calls; cycles fail closed (no orders) and alerts fire. The process stays up but cannot
+trade. (If the token store is missing entirely, you instead get `not authenticated` errors and
+a `crash` alert each cycle — same net effect: no trading.) Re-auth with Option A/B above and
+restart; the fired-slot ledger + durable state mean it resumes without double-firing.
 **Never** work around expiry by disabling alerts or forcing live mode.

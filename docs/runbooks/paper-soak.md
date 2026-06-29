@@ -69,8 +69,9 @@ docker compose exec trader trader status
 #    auth: authenticated; refresh token expires in ~N day(s)
 ```
 Watch the refresh-token countdown. A `reauth_reminder` alert should fire **before** it expires;
-re-auth weekly (see weekly-reauth.md). If the token lapses, the daemon must degrade to
-read-only (no crash), not place orders.
+re-auth weekly (see weekly-reauth.md). If a refresh returns a dead token, the Schwab client
+enters read-only safe mode and refuses all calls — cycles fail closed (no orders) and an alert
+fires; the process stays up but cannot trade until re-authenticated.
 
 ### Triggers firing on schedule + drift
 Each enabled slot fires once per session at its local time plus the seeded random drift
@@ -138,15 +139,19 @@ on a cycle exception.
    `rejected` audit rows citing `price_sanity` if the live feed hiccups. No trade must occur on
    uncertain data.
 
-4. **Token expiry (re-auth path).** Let the refresh token approach expiry (or remove
-   `/state/schwab_token.sqlite`). Expected: a re-auth reminder alert ahead of time; if missed,
-   the daemon degrades to read-only (no crash) rather than placing orders. Recover via
+4. **Token expiry (re-auth path).** Expected: a `reauth_reminder` alert fires ahead of expiry.
+   When a refresh returns a dead token, the client enters read-only safe mode — all Schwab
+   calls are refused, cycles fail closed (no orders), and an alert fires; the process stays up
+   but cannot trade. (Removing `/state/schwab_token.sqlite` instead yields `not authenticated`
+   errors + a `crash` alert each cycle — same net effect, not formal safe mode.) Recover via
    [weekly-reauth.md](weekly-reauth.md).
 
-5. **Liveness (healthcheck).** Pause the worker (e.g. `docker pause`/`unpause` briefly) or
-   observe a long cycle; the dedicated heartbeat executor keeps liveness independent of cycle
-   work, so a healthy-but-busy daemon stays healthy, while a truly dead process goes unhealthy
-   and is restarted by `restart: unless-stopped`.
+5. **Liveness (healthcheck).** The dedicated heartbeat executor keeps liveness independent of
+   cycle work, so a healthy-but-busy daemon stays `healthy`. Note the restart semantics:
+   `restart: unless-stopped` restarts the container only when the process **exits** — a hung
+   but still-running container is surfaced as `unhealthy` by the healthcheck (and via alerts)
+   but is **not** auto-restarted by `unless-stopped` alone (that needs Swarm or an external
+   watchdog). A process that crashes/exits is restarted.
 
 ---
 

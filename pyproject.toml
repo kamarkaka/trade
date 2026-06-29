@@ -51,7 +51,9 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
 
 [tool.mypy]
-python_version = "3.11"
+# 3.12 to parse numpy's PEP 695 stubs; ruff (target-version py311) still enforces
+# 3.11 source compatibility, matching requires-python.
+python_version = "3.12"
 strict = true
 files = ["src"]
 warn_unused_configs = true

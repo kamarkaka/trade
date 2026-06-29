@@ -132,9 +132,32 @@ def test_get_bars_filters_outside_range() -> None:
     assert [b.close for b in bars] == [Decimal("2")]
 
 
+def test_get_bars_returns_ascending_even_if_source_unordered() -> None:
+    start = NOW - timedelta(days=5)
+    end = NOW
+    earlier = NOW - timedelta(days=2)
+    later = NOW - timedelta(days=1)
+    # source returns candles out of order
+    history = SchwabPriceHistory("AAPL", (_candle(later, "2"), _candle(earlier, "1")))
+    bars = _adapter(_FakeClient(history=history)).get_bars("AAPL", start, end, "daily", NOW)
+    assert [b.ts for b in bars] == [earlier, later]
+
+
 def test_get_bars_rejects_non_daily_frequency() -> None:
     with pytest.raises(NotImplementedError):
         _adapter(_FakeClient()).get_bars("AAPL", NOW, NOW, "minute", NOW)
+
+
+def test_get_quote_rejects_naive_asof() -> None:
+    naive = datetime(2026, 6, 28, 16, 0)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _adapter(_FakeClient()).get_quote("AAPL", naive)
+
+
+def test_get_bars_rejects_naive_bounds() -> None:
+    naive = datetime(2026, 6, 28, 16, 0)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _adapter(_FakeClient()).get_bars("AAPL", naive, NOW, "daily", NOW)
 
 
 def test_adapter_satisfies_market_data_protocol() -> None:

@@ -28,6 +28,13 @@ strategies:                       # at least one is required
       - { id: morning, time: "09:45", drift_max_minutes: 30, drift_direction: forward, distribution: uniform, on_overshoot: clamp }
       - { id: midday,  time: "12:30", drift_max_minutes: 30, drift_direction: forward, distribution: uniform, on_overshoot: clamp }
       - { id: close,   time: "15:30", drift_max_minutes: 30, drift_direction: forward, distribution: uniform, on_overshoot: clamp }
+  - id: meanrev
+    name: zscore_revert           # mean-reversion on the trailing z-score (M6.4)
+    enabled: true
+    params: { lookback: 20, z_entry: 2.0, z_exit: 0.5, lot: 10 }
+    universe: [SPY, QQQ]          # distinct universe -> clean per-strategy attribution
+    slots:
+      - { id: midday, time: "12:00", drift_max_minutes: 30, drift_direction: forward, distribution: uniform, on_overshoot: clamp }
 
 risk:                             # account-wide limits (per-strategy risk_overrides may tighten these)
   max_position_size_pct: 10
@@ -37,7 +44,7 @@ risk:                             # account-wide limits (per-strategy risk_overr
   max_trades_per_day: 6
   max_staleness_seconds: 60
   max_spread_pct: 1.0
-  allowlist: [AAPL, MSFT]         # default-deny: only these symbols may trade
+  allowlist: [AAPL, MSFT, SPY, QQQ]  # default-deny: only these symbols may trade
   enforce_pdt: true
   auto_flatten_on_kill: false
   conflict_policy: net            # net | independent | priority

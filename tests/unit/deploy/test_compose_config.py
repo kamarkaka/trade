@@ -57,6 +57,19 @@ def test_logging_rotation_configured(service: dict[str, Any]) -> None:
     assert opts["max-size"] and int(opts["max-file"]) >= 1
 
 
-def test_resource_limits_set(service: dict[str, Any]) -> None:
-    limits = service["deploy"]["resources"]["limits"]
-    assert limits["cpus"] and limits["memory"]
+def test_resource_limits_enforced_under_compose_up(service: dict[str, Any]) -> None:
+    # Top-level mem_limit/cpus are what `docker compose up` actually enforces (the
+    # deploy.resources block is swarm-only and a no-op under `up`).
+    assert service["mem_limit"] and service["cpus"]
+
+
+def test_mounted_config_writes_land_on_named_volumes() -> None:
+    # The durability invariant: the MOUNTED config must point db_path under /state and
+    # data_cache under /data, else the named volumes are mounted but unused (state lost on
+    # recreate). The compose binds config/default.yaml -> /config/trader.yaml.
+    cfg = yaml.safe_load(
+        (COMPOSE_PATH.parents[1] / "config" / "default.yaml").read_text(encoding="utf-8")
+    )
+    obs = cfg["observability"]
+    assert obs["db_path"].startswith("/state"), obs["db_path"]
+    assert obs["data_cache"].startswith("/data"), obs["data_cache"]

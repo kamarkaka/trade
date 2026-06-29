@@ -30,11 +30,16 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+    # Top-level mem_limit/cpus are what `docker compose up` (non-swarm) actually ENFORCES;
+    # deploy.resources.limits below is swarm-only (kept for parity but a no-op under `up`).
+    # 2g headroom: pandas + pyarrow + numpy import-time RSS approaches ~1g (verify in soak).
+    mem_limit: 2g
+    cpus: "1.0"
     deploy:
       resources:
         limits:
           cpus: "1.0"
-          memory: 1g
+          memory: 2g
 
 volumes:
   trader_state:  # survives container recreation

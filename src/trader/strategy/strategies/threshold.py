@@ -2,8 +2,9 @@
 
 Pure: reads only the injected snapshot/positions/account/data/clock; Decimal math.
 For each quote with a known ``prev_close``: BUY ``lot`` when ``last < prev_close*(1-band)``,
-SELL when ``last > prev_close*(1+band)``, else hold (no decision). Quotes without a
-prev_close are skipped.
+SELL when ``last > prev_close*(1+band)``, else hold. Quotes without a prev_close are
+skipped. HOLD is expressed by emitting no decision (the engine treats an omitted and
+an explicit HOLD identically).
 """
 
 from __future__ import annotations

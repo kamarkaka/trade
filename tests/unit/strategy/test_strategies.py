@@ -74,6 +74,19 @@ def test_threshold_skips_missing_prev_close() -> None:
     assert _threshold_decisions(_quote("AAPL", "97", None)) == []
 
 
+def test_threshold_exact_band_edge_holds() -> None:
+    # last == prev_close*(1-band) exactly is NOT below it (strict <) -> hold
+    assert _threshold_decisions(_quote("AAPL", "98", "100")) == []
+
+
+def test_threshold_multi_symbol() -> None:
+    strat = REGISTRY.create("threshold", {"band": 0.02, "lot": 10})
+    snap = _snapshot(_quote("AAPL", "97", "100"), _quote("MSFT", "103", "100"))
+    decisions = strat.decide(snap, [], ACCOUNT, FakeMarketDataProvider(), FakeClock(NOW))
+    by_symbol = {d.symbol: d.action for d in decisions}
+    assert by_symbol == {"AAPL": Action.BUY, "MSFT": Action.SELL}
+
+
 # --- zscore_revert ---------------------------------------------------------- #
 
 

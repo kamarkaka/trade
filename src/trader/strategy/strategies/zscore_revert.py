@@ -43,6 +43,7 @@ class ZScoreRevertStrategy:
             if len(closes) < self.lookback:
                 continue  # insufficient history -> hold
             mean = sum(closes, Decimal(0)) / Decimal(len(closes))
+            # population variance (/n); only scales z, so the signal sign is unaffected
             variance = sum(((c - mean) ** 2 for c in closes), Decimal(0)) / Decimal(len(closes))
             std = variance.sqrt()
             if std == 0:

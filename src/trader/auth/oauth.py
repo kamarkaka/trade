@@ -40,13 +40,19 @@ from .tokens import TokenSet
 _DEAD_REFRESH_ERRORS = {"invalid_grant", "invalid_token"}
 
 
-def build_authorize_url(config: SchwabClientConfig) -> str:
-    """Build the interactive authorization URL the operator opens in a browser."""
+def build_authorize_url(config: SchwabClientConfig, *, state: str | None = None) -> str:
+    """Build the interactive authorization URL the operator opens in a browser.
+
+    ``state`` (a CSRF nonce) is included when provided and should be checked
+    against the callback by the caller (the authenticator, M1.7).
+    """
     params = {
         "client_id": config.app_key,
         "redirect_uri": config.redirect_uri,
         "response_type": "code",
     }
+    if state is not None:
+        params["state"] = state
     return f"{OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
 
 

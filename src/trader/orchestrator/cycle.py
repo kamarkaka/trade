@@ -3,10 +3,13 @@ Appendix C).
 
 The SAME cycle runs in backtest and live; only the injected Broker/MarketDataProvider/
 Clock differ. The whole critical section runs under one global cycle lock so overlapping
-fires never read-modify-write account state on stale balances. A cycle's decisions are
-first reconciled by the risk gate's conflict policy (net same-ticker deltas), then EVERY
-resulting order traverses the risk gate (``check``) — the single, non-bypassable
-chokepoint (§4.1 boundary rule 2) — before the broker. A rejected order is logged, audited,
+fires never read-modify-write account state on stale balances. This cycle handles ONE
+strategy, so its decisions are first reconciled by the risk gate's conflict policy
+(netting that single strategy's own opposing same-ticker deltas), then EVERY resulting
+order traverses the risk gate (``check``) — the single, non-bypassable chokepoint (§4.1
+boundary rule 2) — before the broker. (Cross-strategy netting + pro-rata ``contributors``
+attribution of a shared fill is a later milestone; here every fill belongs to this
+strategy.) A rejected order is logged, audited,
 and skipped; an approved order may be clamped (``adjusted_order``). Each order's intent is
 persisted (write-ahead) BEFORE submit so a crash mid-submit is recoverable. Fills are
 attributed per strategy. A strategy exception is caught, recorded, and isolated — it never

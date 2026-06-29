@@ -2,9 +2,9 @@
 
 Turns a strategy's share-delta ``Decision`` into a concrete ``Order`` with a
 pre-generated ``client_order_id`` (the idempotency seed, generated BEFORE submit) and
-``strategy_id`` attribution. Intentionally thin in M3: it does NOT clamp or limit —
-that is the risk gate's job (M5). The uuid factory is injectable for deterministic
-tests.
+``strategy_id`` attribution. Intentionally thin: it does NOT clamp or limit — that is
+the risk gate's job (the gate in M4.3, wired into the orchestrator in M4.4). The uuid
+factory is injectable for deterministic tests.
 """
 
 from __future__ import annotations

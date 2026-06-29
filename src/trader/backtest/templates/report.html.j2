@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Backtest Report</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+           margin: 2rem auto; max-width: 1000px; color: #1a1a1a; line-height: 1.45; }
+    h1, h2, h3 { font-weight: 600; }
+    table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1.5rem; font-size: 0.9rem; }
+    th, td { border: 1px solid #ddd; padding: 0.35rem 0.6rem; text-align: right; }
+    th { background: #f5f5f5; text-align: left; }
+    td.l, th.l { text-align: left; }
+    .manifest { background: #f9f9f9; border: 1px solid #e5e5e5; border-radius: 6px;
+                padding: 0.75rem 1rem; font-size: 0.85rem; }
+    .manifest code { word-break: break-all; }
+    details { border: 1px solid #e5e5e5; border-radius: 6px; margin: 0.75rem 0; padding: 0.5rem 1rem; }
+    summary { cursor: pointer; font-weight: 600; font-size: 1.05rem; }
+    .muted { color: #888; }
+    caption { caption-side: top; text-align: left; font-weight: 600; margin-bottom: 0.25rem; }
+  </style>
+</head>
+<body>
+  <h1>Backtest Report</h1>
+
+  {% macro metrics_table(m) -%}
+  <table>
+    <caption>Performance metrics</caption>
+    <tr><th class="l">Start equity</th><td>{{ m.start_equity }}</td>
+        <th class="l">Final equity</th><td>{{ m.final_equity }}</td></tr>
+    <tr><th class="l">Total return</th><td>{{ m.total_return }}</td>
+        <th class="l">CAGR</th><td>{{ m.cagr }}</td></tr>
+    <tr><th class="l">Max drawdown</th><td>{{ m.max_drawdown_pct }}</td>
+        <th class="l">Hit rate</th><td>{{ m.hit_rate if m.hit_rate is not none else "—" }}</td></tr>
+    <tr><th class="l">Turnover</th><td>{{ m.turnover }}</td>
+        <th class="l"># Trades</th><td>{{ m.num_trades }}</td></tr>
+    <tr><th class="l">Avg exposure</th>
+        <td>{{ m.avg_exposure if m.avg_exposure is not none else "—" }}</td>
+        <th class="l">DD window</th>
+        <td class="l">{{ m.max_dd_window[0] or "—" }} → {{ m.max_dd_window[1] or "—" }}</td></tr>
+  </table>
+  {%- endmacro %}
+
+  {% macro blotter_table(rows) -%}
+  {% if rows %}
+  <table>
+    <caption>Trade blotter ({{ rows | length }})</caption>
+    <tr><th class="l">Time</th><th class="l">Symbol</th><th>Qty</th><th>Price</th>
+        <th>Fees</th><th class="l">Status</th><th class="l">Order</th></tr>
+    {% for r in rows %}
+    <tr><td class="l">{{ r.ts }}</td><td class="l">{{ r.symbol }}</td><td>{{ r.quantity }}</td>
+        <td>{{ r.price }}</td><td>{{ r.fees }}</td><td class="l">{{ r.status }}</td>
+        <td class="l">{{ r.client_order_id }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">No trades.</p>{% endif %}
+  {%- endmacro %}
+
+  {% macro fire_table(rows) -%}
+  {% if rows %}
+  <table>
+    <caption>Fire log ({{ rows | length }})</caption>
+    <tr><th class="l">Slot</th><th class="l">Fire time</th><th>Drift (s)</th><th>Seed</th></tr>
+    {% for f in rows %}
+    <tr><td class="l">{{ f.slot_id }}</td><td class="l">{{ f.fire_ts }}</td>
+        <td>{{ f.drift_seconds }}</td><td>{{ f.seed if f.seed is not none else "—" }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  {%- endmacro %}
+
+  <section class="manifest">
+    <h2>Run manifest</h2>
+    <div><strong>config_hash:</strong> <code>{{ manifest.config_hash }}</code></div>
+    <div><strong>git_commit:</strong> <code>{{ manifest.git_commit }}</code></div>
+    <div><strong>seed:</strong> {{ manifest.seed if manifest.seed is not none else "—" }}</div>
+    {% if manifest.data_hashes %}
+    <div><strong>data_hashes:</strong>
+      {% for k, v in manifest.data_hashes.items() %}<div><code>{{ k }}: {{ v }}</code></div>{% endfor %}
+    </div>
+    {% endif %}
+    {% if manifest.lib_versions %}
+    <div><strong>lib_versions:</strong>
+      {% for k, v in manifest.lib_versions.items() %}{{ k }}={{ v }} {% endfor %}</div>
+    {% endif %}
+    {% if manifest.python_version %}<div><strong>python:</strong> {{ manifest.python_version }}</div>{% endif %}
+  </section>
+
+  <h2>Combined portfolio</h2>
+  <p class="muted">Measured against the shared account equity curve (cash is shared across strategies).</p>
+  {{ metrics_table(combined) }}
+  <div><strong>Total fees:</strong> {{ combined.total_fees }}</div>
+  {{ blotter_table(combined.blotter) }}
+  {{ fire_table(combined.fire_log) }}
+
+  <h2>Per-strategy</h2>
+  {% for sid, block in per_strategy.items() %}
+  <details>
+    <summary>{{ sid }} — {{ block.num_trades }} trade(s), realized P&amp;L {{ block.realized_pnl }}</summary>
+    {% if block.equity_metrics is not none %}
+      {{ metrics_table(block.equity_metrics) }}
+    {% else %}
+      <p class="muted">Per-strategy equity curve not reconstructed; trade metrics below.</p>
+      <table>
+        <tr><th class="l">Hit rate</th><td>{{ block.hit_rate if block.hit_rate is not none else "—" }}</td>
+            <th class="l">Turnover</th><td>{{ block.turnover }}</td></tr>
+        <tr><th class="l">Realized P&amp;L</th><td>{{ block.realized_pnl }}</td>
+            <th class="l">Total fees</th><td>{{ block.total_fees }}</td></tr>
+      </table>
+    {% endif %}
+    {{ blotter_table(block.blotter) }}
+    {{ fire_table(block.fire_log) }}
+  </details>
+  {% endfor %}
+</body>
+</html>

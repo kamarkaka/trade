@@ -1,4 +1,4 @@
-"""Backtest report (design §9.6). JSON-first; HTML templating is added in M6.6.
+"""Backtest report (design §9.6).
 
 ``BacktestReport.build`` turns a run's fills + equity curve + manifest into a single
 JSON-serializable report: a summary (P&L, max drawdown, hit rate, turnover), the
@@ -6,20 +6,29 @@ equity curve, and the trade blotter. Money is emitted as strings to preserve Dec
 precision. ``strip_volatile`` removes environment-sensitive manifest fields so a
 golden run can be compared bit-for-bit across machines (M2.10).
 
-This file is CREATED here; M3.10 (per-strategy attribution) and M6.6 (HTML + richer
+M6.6 adds the reproducible per-strategy + combined report (``build_report`` ->
+``BacktestReportDoc``) driven by the M6.5 metrics layer, rendering deterministic JSON
+(feeds the M6.8 golden) and a Jinja2 HTML view. ``jinja2`` is imported lazily inside
+the HTML renderer so the live container (which never renders reports) needn't ship it.
+
+This file is CREATED in M2.10; M3.10 (per-strategy attribution) and M6.6 (HTML + richer
 metrics) UPDATE it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
 from typing import Any
 
 from trader.core import Fill
 from trader.core.enums import Side
 
+from . import metrics as M
+from .metrics import Metrics
 from .portfolio import Portfolio
 
 # Manifest fields that vary by environment and must be dropped before a golden compare.
@@ -140,3 +149,197 @@ def strip_volatile(report: dict[str, Any]) -> dict[str, Any]:
     manifest = out.get("manifest", {})
     out["manifest"] = {k: v for k, v in manifest.items() if k not in VOLATILE_MANIFEST_FIELDS}
     return out
+
+
+# --------------------------------------------------------------------------- #
+# M6.6 — per-strategy + combined report (HTML/JSON + manifest)                 #
+# --------------------------------------------------------------------------- #
+
+_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+
+
+@dataclass(frozen=True)
+class FireRecord:
+    """One scheduler firing: the resolved trigger with its realized drift + seed."""
+
+    strategy_id: str
+    slot_id: str
+    fire_ts: datetime
+    drift_seconds: int
+    seed: int | None = None
+
+
+@dataclass(frozen=True)
+class BacktestRunResult:
+    """The inputs a report is built from (assembled by the M6.7 backtest CLI).
+
+    ``combined_equity_curve`` is the ACCOUNT-level equity series — combined performance
+    is measured against this, NOT the sum of per-strategy curves, because cash is shared
+    across strategies (design §9.6). ``per_strategy_equity`` is an OPTIONAL per-strategy
+    equity contribution; when omitted, a strategy's equity-curve metrics (return / CAGR /
+    drawdown) are reported as ``null`` while its trade metrics (hit rate, turnover,
+    realized P&L) are always computed. ``fire_log`` records realized drift + seed per
+    firing for the per-slot section.
+    """
+
+    combined_equity_curve: Sequence[EquityPoint]
+    per_strategy_trades: dict[str, list[tuple[Fill, Side]]]
+    fire_log: Sequence[FireRecord] = field(default_factory=tuple)
+    per_strategy_equity: dict[str, Sequence[EquityPoint]] | None = None
+
+
+def _ratio_str(value: Decimal) -> str:
+    # Fixed-point 8dp string. ``format(..., "f")`` (not ``str``) so an exact zero renders
+    # "0.00000000" rather than "0E-8" — deterministic + readable in the golden JSON.
+    return format(_q(value), "f")
+
+
+def _opt_ratio(value: Decimal | None) -> str | None:
+    return _ratio_str(value) if value is not None else None
+
+
+def _window(window: tuple[datetime | None, datetime | None]) -> list[str | None]:
+    peak, trough = window
+    return [peak.isoformat() if peak else None, trough.isoformat() if trough else None]
+
+
+def _metrics_dict(m: Metrics) -> dict[str, Any]:
+    """Serialize a ``Metrics`` deterministically: ratios quantized to 8dp, money exact,
+    timestamps ISO-8601 UTC."""
+    return {
+        "start_equity": str(m.start_equity),
+        "final_equity": str(m.final_equity),
+        "total_return": _ratio_str(m.total_return),
+        "cagr": _ratio_str(m.cagr),
+        "max_drawdown_pct": _ratio_str(m.max_drawdown_pct),
+        "max_dd_window": _window(m.max_dd_window),
+        "hit_rate": _opt_ratio(m.hit_rate),
+        "num_trades": m.num_trades,
+        "turnover": _ratio_str(m.turnover),
+        "avg_exposure": _opt_ratio(m.avg_exposure),
+    }
+
+
+def _fire_row(fire: FireRecord) -> dict[str, Any]:
+    return {
+        "strategy_id": fire.strategy_id,
+        "slot_id": fire.slot_id,
+        "fire_ts": fire.fire_ts.isoformat(),
+        "drift_seconds": fire.drift_seconds,
+        "seed": fire.seed,
+    }
+
+
+def _equity_points(curve: Sequence[EquityPoint]) -> list[dict[str, str]]:
+    return [{"ts": ts.isoformat(), "equity": str(eq)} for ts, eq in curve]
+
+
+def _per_strategy_block(
+    sid: str,
+    trades: list[tuple[Fill, Side]],
+    records: Sequence[M.TradeRecord],
+    combined_avg_equity: Decimal,
+    per_strategy_equity: Sequence[EquityPoint] | None,
+    fire_log: Sequence[FireRecord],
+) -> dict[str, Any]:
+    # Realized P&L from a zero-cash book fed only this strategy's fills (the honest
+    # per-strategy P&L, independent of the shared account curve).
+    book = Portfolio(Decimal("0"))
+    for fill, side in trades:
+        book.apply_fill(fill, side)
+    block: dict[str, Any] = {
+        "num_trades": len(trades),
+        "hit_rate": _opt_ratio(M.hit_rate(records, strategy_id=sid)),
+        # Turnover uses the shared account's average equity as the denominator.
+        "turnover": _ratio_str(M.turnover(records, combined_avg_equity, strategy_id=sid)),
+        "realized_pnl": str(book.realized_pnl()),
+        "total_fees": str(book.total_fees()),
+        "blotter": [_fill_row(fill) for fill, _ in trades],
+        "fire_log": [_fire_row(f) for f in fire_log if f.strategy_id == sid],
+    }
+    if per_strategy_equity is not None:
+        m = M.summarize(per_strategy_equity, records, strategy_id=sid)
+        block["equity_metrics"] = _metrics_dict(m)
+        block["equity_curve"] = _equity_points(per_strategy_equity)
+    else:
+        block["equity_metrics"] = None
+        block["equity_curve"] = []
+    return block
+
+
+def build_report(
+    run_result: BacktestRunResult,
+    manifest: dict[str, Any],
+    *,
+    strategy_ids: Sequence[str] | None = None,
+) -> BacktestReportDoc:
+    """Assemble the per-strategy + combined report document (design §9.6).
+
+    Combined metrics come from ``metrics.summarize`` over the ACCOUNT equity curve and
+    every trade; each strategy gets its own section (one per enabled ``strategy_id``,
+    including zero-trade strategies) computed by the SAME M6.5 layer.
+    """
+    curve = M.build_equity_curve(run_result.combined_equity_curve)
+    records = M.trade_records_from_multi(run_result.per_strategy_trades)
+    combined_avg_equity = M.avg_equity(curve)
+    all_fills = [(f, s) for trades in run_result.per_strategy_trades.values() for f, s in trades]
+
+    combined = _metrics_dict(M.summarize(curve, records))
+    combined["total_fees"] = str(sum((f.fees for f, _ in all_fills), Decimal("0")))
+    combined["blotter"] = [_fill_row(f) for f, _ in sorted(all_fills, key=lambda t: t[0].ts)]
+    combined["equity_curve"] = _equity_points(curve)
+    combined["fire_log"] = [_fire_row(f) for f in run_result.fire_log]
+
+    # One section per enabled strategy (zero-trade strategies still get a section).
+    sids = (
+        list(strategy_ids) if strategy_ids is not None else sorted(run_result.per_strategy_trades)
+    )
+    per_strategy_equity = run_result.per_strategy_equity or {}
+    per_strategy = {
+        sid: _per_strategy_block(
+            sid,
+            run_result.per_strategy_trades.get(sid, []),
+            records,
+            combined_avg_equity,
+            per_strategy_equity.get(sid),
+            run_result.fire_log,
+        )
+        for sid in sids
+    }
+    data: dict[str, Any] = {
+        "manifest": manifest,
+        "combined": combined,
+        "per_strategy": per_strategy,
+    }
+    return BacktestReportDoc(data)
+
+
+@dataclass(frozen=True)
+class BacktestReportDoc:
+    """A built report: deterministic JSON + Jinja2 HTML renderings."""
+
+    data: dict[str, Any]
+
+    def json_str(self) -> str:
+        """Deterministic JSON: sorted keys, compact-but-readable, trailing newline. Two
+        runs of the same config produce byte-identical output (feeds the M6.8 golden)."""
+        import json
+
+        return json.dumps(self.data, indent=2, sort_keys=True) + "\n"
+
+    def to_json(self, path: str | Path) -> None:
+        Path(path).write_text(self.json_str(), encoding="utf-8")
+
+    def html_str(self) -> str:
+        # Lazy import: the live container never renders HTML and so needn't ship jinja2.
+        from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+        env = Environment(
+            loader=FileSystemLoader(str(_TEMPLATES_DIR)),
+            autoescape=select_autoescape(["html", "j2"]),
+        )
+        template = env.get_template("report.html.j2")
+        return template.render(**self.data)
+
+    def to_html(self, path: str | Path) -> None:
+        Path(path).write_text(self.html_str(), encoding="utf-8")

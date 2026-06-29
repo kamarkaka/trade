@@ -164,6 +164,7 @@ class CycleResult:
     rejected: list[Order] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     missing_symbols: list[str] = field(default_factory=list)
+    halted: bool = False  # kill switch engaged -> the whole cycle was skipped
 
 
 class Orchestrator:
@@ -180,6 +181,7 @@ class Orchestrator:
         sizer: Sizer,
         risk: RiskManager | None = None,
         audit: AuditSink | None = None,
+        kill_switch: Callable[[], bool] | None = None,
     ) -> None:
         self._broker = broker
         self._data = data
@@ -189,6 +191,9 @@ class Orchestrator:
         self._sizer = sizer
         self._risk: RiskManager = risk or ApproveAllRiskManager()
         self._audit = audit or ListAuditSink()
+        # Read each cycle (fresh DB read) so an engage that lands mid-session is honored on
+        # the next slot. None => never engaged (backtest / tests without a kill switch).
+        self._kill_switch = kill_switch
         self._log = get_logger("orchestrator")
 
     def run_cycle(
@@ -203,6 +208,17 @@ class Orchestrator:
         result = CycleResult(strategy_id=strategy_id, cycle_id=cycle_id)
         with self._lock, cycle_context(cycle_id):
             try:
+                # Kill switch: checked at the START of every cycle (design §10). If engaged,
+                # skip the whole cycle -- never decide or submit. The gate also rejects per
+                # order pre-submit (defense in depth via day_state.kill_switch_engaged).
+                engaged = bool(self._kill_switch()) if self._kill_switch is not None else False
+                if engaged:
+                    self._log.warning("kill switch engaged; cycle skipped", strategy_id=strategy_id)
+                    self._audit.record(
+                        AuditEvent(cycle_id, strategy_id, "kill_switch_halt", "engaged")
+                    )
+                    result.halted = True
+                    return result
                 quotes, result.missing_symbols = self._snapshot(universe, now)
                 snapshot = MarketSnapshot(asof=now, quotes=quotes)
                 positions = self._broker.get_positions()
@@ -211,7 +227,11 @@ class Orchestrator:
                     strategy.decide(snapshot, positions, account, self._data, self._clock)
                 )
                 result.decisions = decisions
-                ds = day_state if day_state is not None else self._default_day_state(account, now)
+                ds = (
+                    day_state
+                    if day_state is not None
+                    else self._default_day_state(account, now, kill_switch_engaged=engaged)
+                )
                 # Reconcile same-ticker conflicts across the cycle's decisions BEFORE sizing
                 # (net default), then route each resulting order through the chokepoint.
                 resolved = self._risk.resolve_conflicts([(strategy_id, d) for d in decisions])
@@ -323,7 +343,9 @@ class Orchestrator:
         result.rejected.append(order)
 
     @staticmethod
-    def _default_day_state(account: Account, now: datetime) -> DayState:
+    def _default_day_state(
+        account: Account, now: datetime, *, kill_switch_engaged: bool = False
+    ) -> DayState:
         # Neutral day-state for callers that don't track one yet. loss/trades = 0 means the
         # daily-loss / trade-count rails do NOT trip under this default, so paper mode does
         # not enforce those two account-wide rails; real per-day counters / start-of-day
@@ -335,6 +357,7 @@ class Orchestrator:
             unrealized_pnl=Decimal(0),
             trades_today=0,
             loss_today=Decimal(0),
+            kill_switch_engaged=kill_switch_engaged,
         )
 
     def _snapshot(

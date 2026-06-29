@@ -165,6 +165,7 @@ def run(
     from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
     from trader.orchestrator.lock import GlobalCycleLock
     from trader.risk.gate import RiskManager
+    from trader.risk.kill_switch import KillSwitch
     from trader.scheduler.calendar import TradingCalendar
     from trader.scheduler.daemon import SchedulerDaemon
     from trader.sizing.sizer import size_decision
@@ -233,6 +234,10 @@ def run(
         data = SchwabMarketData(SchwabClient(http), clock)
         broker = SimBroker(data, clock, starting_cash=cash)  # PAPER: SimBroker only, never real
         attribution = AttributionLedger(state)
+        # Read the persisted kill switch fresh each cycle: an engage (CLI or auto-trip) halts
+        # the daemon at the next cycle start AND pre-submit (gate). Its own connection so the
+        # worker thread never shares one cross-thread.
+        kill_switch = KillSwitch(connect(Path(cfg.observability.db_path)), alerter=alerter)
         orchestrator = Orchestrator(
             broker=broker,
             data=data,
@@ -242,6 +247,7 @@ def run(
             sizer=lambda d, sid: size_decision(d, sid, cfg.execution),
             risk=risk,  # the real fail-closed gate is the single chokepoint
             audit=SqliteAuditSink(state),  # durable audit chain
+            kill_switch=kill_switch.is_engaged,
         )
         # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
         # only for a broker whose positions survive a restart; SimBroker is in-memory (always

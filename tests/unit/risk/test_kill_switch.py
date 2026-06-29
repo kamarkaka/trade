@@ -112,6 +112,48 @@ def test_gate_checked_pre_submit_when_engaged() -> None:
     assert gate.check(sell, (), ACCOUNT, QUOTE, _day(killed=True)).approved is False
 
 
+# --- end-to-end: engaged switch halts a real orchestrator cycle ------------- #
+
+
+def test_engaged_switch_halts_orchestrator_cycle(tmp_path: Path) -> None:
+    # The acceptance criterion: engage the PERSISTED switch, run a cycle through the real
+    # orchestrator (reading the switch each cycle), assert NO order is placed.
+    import itertools
+    from collections.abc import Sequence
+
+    from fakes import FakeBroker, FakeClock, FakeMarketDataProvider
+    from trader.config.models import ExecutionConfig
+    from trader.core import Decision, Position
+    from trader.core.enums import Action
+    from trader.orchestrator.cycle import Orchestrator
+    from trader.orchestrator.lock import NullLock
+    from trader.sizing.sizer import size_decision
+    from trader.state.attribution import AttributionLedger
+
+    switch, conn = _switch(tmp_path)
+    switch.engage("halt", source="cli")  # persisted ON
+
+    class _AlwaysBuy:
+        def decide(self, *a: object, **k: object) -> Sequence[Decision]:
+            return [Decision(Action.BUY, "AAPL", 10)]
+
+    ids = (f"o{i}" for i in itertools.count())
+    broker = FakeBroker()
+    orch = Orchestrator(
+        broker=broker,
+        data=FakeMarketDataProvider(quotes={"AAPL": [QUOTE]}),
+        clock=FakeClock(NOW),
+        cycle_lock=NullLock(),
+        attribution=AttributionLedger(conn),  # type: ignore[arg-type]
+        sizer=lambda d, sid: size_decision(d, sid, ExecutionConfig(), id_factory=lambda: next(ids)),
+        kill_switch=switch.is_engaged,  # the daemon wires this in `trader run`
+    )
+    result = orch.run_cycle(_AlwaysBuy(), ["AAPL"], "m", NOW)
+    assert result.halted is True
+    assert broker.submitted == [] and result.orders == []  # nothing placed while engaged
+    _ = Position  # keep import used
+
+
 # --- CLI -------------------------------------------------------------------- #
 
 

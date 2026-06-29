@@ -1,12 +1,17 @@
 """Persisted kill switch (design §10).
 
 A durable, single-row flag (the ``kill_switch`` table from M0.7) that halts all new orders.
-It is **persisted** so a trip survives restarts, **checked at the start of every cycle and
-immediately before every submit** (the gate's ``kill_switch`` rule enforces the pre-submit
-check), flippable by the operator (``trader kill --on/--off``), and **auto-trips** on
-dangerous conditions (daily-loss breach, repeated broker errors, reconciliation mismatch,
-stale data). On a trip it halts new orders and alerts; **auto-flatten is OFF by default**
-(forcing exits in a disorderly market is itself risky), so existing positions are left as-is.
+It is **persisted** so a trip survives restarts, **checked at the start of every cycle**
+(the orchestrator skips the cycle when engaged) **and immediately before every submit** (the
+gate's ``kill_switch`` rule), and flippable by the operator (``trader kill --on/--off``).
+
+On a trip it halts new orders and alerts; **auto-flatten is OFF by default** (forcing exits
+in a disorderly market is itself risky), so existing positions are left as-is.
+
+Auto-trip: ``maybe_trip_on_daily_loss`` is implemented (engage when the day's loss breaches
+the limit). The other §10 auto-trip conditions (repeated broker errors, reconciliation
+mismatch, stale data) are tripped by their owning components calling ``engage(reason,
+"auto")`` as those features land (reconcile/broker-error/stale-data hooks).
 """
 
 from __future__ import annotations

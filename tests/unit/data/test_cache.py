@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from trader.data.cache import BAR_COLUMNS, ParquetCache
 
@@ -131,7 +132,70 @@ def test_coverage_merges_adjacent(tmp_path: Path) -> None:
     assert cache.missing_ranges("AAPL", _d(2023, 1, 1), _d(2023, 1, 31)) == []
 
 
-def test_content_hash_stable_and_sensitive(tmp_path: Path) -> None:
+def test_write_rejects_naive_timestamps(tmp_path: Path) -> None:
+    cache = ParquetCache(tmp_path)
+    naive = pd.DataFrame(
+        {
+            "ts": [datetime(2023, 1, 3)],
+            "open": [Decimal("10")],
+            "high": [Decimal("10")],
+            "low": [Decimal("10")],
+            "close": [Decimal("10")],
+            "volume": [1],
+        }
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        cache.write_bars("AAPL", naive)
+
+
+def test_write_rejects_float_prices(tmp_path: Path) -> None:
+    cache = ParquetCache(tmp_path)
+    floaty = pd.DataFrame(
+        {
+            "ts": [_d(2023, 1, 3)],
+            "open": [10.1],  # float, not Decimal -> would lose precision
+            "high": [10.1],
+            "low": [10.1],
+            "close": [10.1],
+            "volume": [1],
+        }
+    )
+    with pytest.raises(TypeError, match="Decimal"):
+        cache.write_bars("AAPL", floaty)
+
+
+def test_write_rejects_fractional_volume(tmp_path: Path) -> None:
+    cache = ParquetCache(tmp_path)
+    frac = _bars([(_d(2023, 1, 3), "10", "10", "10", "10", 1)])
+    frac["volume"] = [1.5]  # fractional -> not an integer
+    with pytest.raises(TypeError, match="integer"):
+        cache.write_bars("AAPL", frac)
+
+
+def test_missing_ranges_empty_when_end_not_after_start(tmp_path: Path) -> None:
+    cache = ParquetCache(tmp_path)
+    assert cache.missing_ranges("AAPL", _d(2023, 1, 10), _d(2023, 1, 10)) == []
+    assert cache.missing_ranges("AAPL", _d(2023, 1, 10), _d(2023, 1, 1)) == []
+
+
+def test_content_hash_insensitive_to_split_writes(tmp_path: Path) -> None:
+    both = _bars(
+        [
+            (_d(2023, 1, 3), "10", "11", "9", "10.50", 1000),
+            (_d(2023, 1, 4), "10.50", "12", "10", "11.25", 2000),
+        ]
+    )
+    one_shot = ParquetCache(tmp_path / "one")
+    one_shot.write_bars("AAPL", both)
+
+    # writing the two bars in separate calls (and reversed order) yields the same hash
+    split = ParquetCache(tmp_path / "split")
+    split.write_bars("AAPL", _bars([(_d(2023, 1, 4), "10.50", "12", "10", "11.25", 2000)]))
+    split.write_bars("AAPL", _bars([(_d(2023, 1, 3), "10", "11", "9", "10.50", 1000)]))
+    assert split.content_hash("AAPL") == one_shot.content_hash("AAPL")
+
+
+def test_content_hash_stable(tmp_path: Path) -> None:
     a = ParquetCache(tmp_path / "a")
     a.write_bars("AAPL", JAN)
     h1 = a.content_hash("AAPL")

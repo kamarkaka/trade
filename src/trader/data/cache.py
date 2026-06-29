@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import numbers
+import os
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -40,6 +42,22 @@ def _require_utc(dt: datetime, name: str) -> datetime:
     if dt.tzinfo is None or dt.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware, got naive {dt!r}")
     return dt.astimezone(UTC)
+
+
+def _ensure_decimal(value: object, col: str) -> Decimal:
+    # Fail closed (like core.types): money must arrive as Decimal, never float — a
+    # float would already have lost precision before it reached the cache.
+    if not isinstance(value, Decimal):
+        raise TypeError(
+            f"price column {col!r} must contain Decimal values, got {type(value).__name__}"
+        )
+    return value
+
+
+def _ensure_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise TypeError(f"volume must be an integer, got {type(value).__name__}")
+    return int(value)
 
 
 def _merge_intervals(intervals: list[Interval]) -> list[Interval]:
@@ -104,14 +122,19 @@ class ParquetCache:
     # --- frame (de)serialization ------------------------------------------ #
 
     def _normalize(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Validate + canonicalize an incoming bar frame (fail-closed on bad input)."""
         missing = [c for c in BAR_COLUMNS if c not in df.columns]
         if missing:
             raise ValueError(f"bar frame missing columns: {missing}")
         out = df[list(BAR_COLUMNS)].copy()
-        out["ts"] = pd.to_datetime(out["ts"], utc=True)
+        # ts must be tz-aware (reject naive — never silently localize); store as UTC.
+        ts = pd.to_datetime(out["ts"])
+        if ts.dt.tz is None:
+            raise ValueError("bar 'ts' column must be timezone-aware (UTC)")
+        out["ts"] = ts.dt.tz_convert("UTC")
         for col in _PRICE_COLUMNS:
-            out[col] = out[col].map(lambda v: Decimal(str(v)))
-        out["volume"] = out["volume"].astype("int64")
+            out[col] = out[col].map(lambda v, _c=col: _ensure_decimal(v, _c))
+        out["volume"] = out["volume"].map(_ensure_int).astype("int64")
         return out
 
     def _to_storage(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -137,9 +160,11 @@ class ParquetCache:
     def write_bars(self, symbol: str, df: pd.DataFrame, *, covered: Interval | None = None) -> None:
         """Write/merge bars for ``symbol`` and record the covered range.
 
-        ``covered`` is the *requested* range (e.g. the ingestion window); when
-        omitted it defaults to the data's own extent. Bars are merged with any
-        existing partition, de-duplicated by timestamp (last wins) and sorted.
+        ``df`` must use the canonical schema: tz-aware ``ts``, ``Decimal`` prices
+        (never float — that would already have lost precision), and integer
+        ``volume``. ``covered`` is the *requested* range (e.g. the ingestion
+        window); when omitted it defaults to the data's own extent. Bars are merged
+        with any existing partition, de-duplicated by timestamp (last wins), sorted.
         """
         if df.empty:
             if covered is not None:
@@ -158,7 +183,11 @@ class ParquetCache:
                 .sort_values("ts")
                 .reset_index(drop=True)
             )
-            part.to_parquet(path, engine="pyarrow", index=False)
+            # Atomic replace: write a temp partition then rename, so a crash mid-write
+            # can't leave a truncated/corrupt Parquet file.
+            tmp = path.with_name(f"{path.name}.tmp")
+            part.to_parquet(tmp, engine="pyarrow", index=False)
+            os.replace(tmp, path)
 
         cov_start = covered[0] if covered else frame["ts"].min().to_pydatetime()
         cov_end = covered[1] if covered else frame["ts"].max().to_pydatetime()
@@ -180,7 +209,13 @@ class ParquetCache:
         return df[mask].sort_values("ts").reset_index(drop=True)
 
     def missing_ranges(self, symbol: str, start: datetime, end: datetime) -> list[Interval]:
-        """Sub-intervals of ``[start, end]`` not yet covered (for cache-on-demand)."""
+        """Sub-intervals of ``[start, end]`` not yet covered (for cache-on-demand).
+
+        Coverage is treated as half-open here (a gap whose end touches a coverage
+        start is not re-fetched), whereas ``read_bars`` is closed on both ends. For
+        daily bars the only effect is that the M2.4 ingester may re-read a single
+        boundary bar — harmless given write_bars de-dupes.
+        """
         start = _require_utc(start, "start")
         end = _require_utc(end, "end")
         if end <= start:

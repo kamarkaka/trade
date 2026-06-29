@@ -19,8 +19,11 @@ from typing import Any
 
 from trader.config import AppConfig
 
-# Libraries whose versions materially affect numeric results.
-_TRACKED_LIBS = ("pydantic", "pandas", "pyarrow", "numpy")
+# Libraries whose versions materially affect numeric results. exchange_calendars is
+# tracked because a revised XNYS session/holiday table would shift trigger fire-times
+# (resolve_fire) — recorded for forensics (a stripped field, so it never affects the
+# golden compare, but flags a calendar bump that could otherwise silently move results).
+_TRACKED_LIBS = ("pydantic", "pandas", "pyarrow", "numpy", "exchange_calendars")
 
 # Deployment/notification subtrees that don't affect backtest results — excluded so
 # the config_hash is portable across environments (local vs CI golden run, M2.10).

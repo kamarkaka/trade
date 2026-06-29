@@ -13,7 +13,8 @@ import pytest
 
 import trader.strategy  # noqa: F401 - registers the built-in strategies
 from fakes import FakeClock, FakeMarketDataProvider
-from trader.core import Account, Bar, MarketSnapshot, Position, Quote
+from trader.core import Account, Bar, Decision, MarketSnapshot, Position, Quote
+from trader.core.enums import Action
 from trader.core.protocols import Strategy
 from trader.strategy.contract import (
     assert_decisions_well_formed,
@@ -53,8 +54,33 @@ def _strategy(name: str) -> Strategy:
     return REGISTRY.create(name, {})  # default params
 
 
-def _decide(strategy: Strategy, snapshot: MarketSnapshot, data: FakeMarketDataProvider):
+def _decide(
+    strategy: Strategy, snapshot: MarketSnapshot, data: FakeMarketDataProvider
+) -> Sequence[Decision]:
     return strategy.decide(snapshot, [], ACCOUNT, data, FakeClock(ASOF))
+
+
+def _signal_inputs(name: str) -> tuple[MarketSnapshot, FakeMarketDataProvider]:
+    """Inputs tuned to actually PROVOKE a non-HOLD decision for ``name`` so the determinism /
+    mutation checks exercise the real signal path, not just an early-out."""
+    if name == "zscore_revert":
+        # Ascending closes give std>0; a far-below-mean current last => very negative z => BUY.
+        bars = [
+            Bar(
+                "AAPL",
+                ASOF - timedelta(days=40 - i),
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal(100 + i),
+                1000,
+            )
+            for i in range(40)
+        ]
+        data = FakeMarketDataProvider(quotes={"AAPL": [_quote()]}, bars={"AAPL": bars})
+        return make_snapshot(ASOF, {"AAPL": _quote(last="50")}), data
+    # threshold (and any quote-based default): a dip below prev_close*(1-band).
+    return make_snapshot(ASOF, {"AAPL": _quote(last="96")}), _data()
 
 
 @pytest.fixture(params=REGISTRY.names())
@@ -72,23 +98,32 @@ def test_decide_returns_wellformed_decisions(strategy_name: str) -> None:
     assert_decisions_well_formed(decisions, UNIVERSE)
 
 
+def test_decide_produces_a_signal(strategy_name: str) -> None:
+    # Each strategy's signal path is reachable (so the determinism/mutation checks below
+    # exercise real output, not a vacuous early-out).
+    snap, data = _signal_inputs(strategy_name)
+    decisions = _decide(_strategy(strategy_name), snap, data)
+    assert any(d.action in (Action.BUY, Action.SELL) for d in decisions), "expected a signal"
+    assert_decisions_well_formed(decisions, UNIVERSE)
+
+
 def test_decide_is_deterministic(strategy_name: str) -> None:
     strat = _strategy(strategy_name)
-    snap = make_snapshot(ASOF, {"AAPL": _quote(last="96")})  # a dip, to provoke a decision
-    first = list(_decide(strat, snap, _data()))
-    second = list(_decide(strat, snap, _data()))
+    snap, data = _signal_inputs(strategy_name)  # inputs that actually produce a decision
+    first = list(_decide(strat, snap, data))
+    second = list(_decide(strat, snap, data))
     assert first == second  # identical inputs -> identical outputs
 
 
 def test_decide_does_not_mutate_inputs(strategy_name: str) -> None:
-    snap = make_snapshot(ASOF, {"AAPL": _quote(last="96")})
+    snap, data = _signal_inputs(strategy_name)
     positions: list[Position] = [Position("AAPL", 5, Decimal("100"), Decimal("500"))]
     snap_before, pos_before, acct_before = (
         copy.deepcopy(snap),
         copy.deepcopy(positions),
         copy.deepcopy(ACCOUNT),
     )
-    _strategy(strategy_name).decide(snap, positions, ACCOUNT, _data(), FakeClock(ASOF))
+    _strategy(strategy_name).decide(snap, positions, ACCOUNT, data, FakeClock(ASOF))
     assert snap == snap_before and positions == pos_before and acct_before == ACCOUNT
 
 

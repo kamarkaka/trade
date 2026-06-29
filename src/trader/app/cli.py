@@ -9,6 +9,7 @@ out by later milestones: ``backtest`` (M2), ``run`` (M3/M4), ``reconcile`` (M4),
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -140,3 +141,67 @@ def reconcile(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
     """Reconcile local state with the broker (implemented in M4)."""
     _load(config)
     typer.echo("reconcile: not implemented yet (reconciliation arrives in M4)")
+
+
+data_app = typer.Typer(help="Historical data cache management.", no_args_is_help=True)
+app.add_typer(data_app, name="data")
+
+
+def _parse_day(value: str, name: str) -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError as exc:
+        typer.echo(f"data fetch error: {name} must be YYYY-MM-DD, got {value!r}", err=True)
+        raise typer.Exit(1) from exc
+
+
+@data_app.command("fetch")
+def data_fetch(
+    symbols: Annotated[str, typer.Option("--symbols", help="Comma-separated tickers.")],
+    start: Annotated[str, typer.Option("--start", help="Inclusive start date (YYYY-MM-DD).")],
+    end: Annotated[str, typer.Option("--end", help="Inclusive end date (YYYY-MM-DD).")],
+    freq: Annotated[str, typer.Option("--freq", help="Bar frequency.")] = "daily",
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Fetch daily candles from Schwab into the Parquet cache (read-only, missing-only)."""
+    import httpx
+
+    from trader.auth.token_store import TokenStore
+    from trader.data.cache import ParquetCache
+    from trader.data.ingest import ingest_daily
+    from trader.data.schwab_market_data import SchwabMarketData
+    from trader.schwab.endpoints import SchwabClient
+    from trader.schwab.http import SchwabHttp
+
+    cfg = _load(config)
+    if freq != "daily":
+        typer.echo(f"data fetch error: only --freq daily is supported, got {freq!r}", err=True)
+        raise typer.Exit(1)
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not syms:
+        typer.echo("data fetch error: no symbols given", err=True)
+        raise typer.Exit(1)
+    start_dt = _parse_day(start, "--start")
+    end_dt = _parse_day(end, "--end")
+
+    # Resolve credentials first so a missing-creds run fails before touching the cache.
+    try:
+        schwab_cfg = _schwab_config(cfg, require_credentials=True)
+    except SchwabAuthError as exc:
+        typer.echo(f"data fetch error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    store = TokenStore(schwab_cfg.token_store_path)
+    cache = ParquetCache(cfg.observability.data_cache)
+    clock = RealClock()
+    try:
+        with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
+            http = SchwabHttp(schwab_cfg, client, store, clock=clock)
+            provider = SchwabMarketData(SchwabClient(http), clock)
+            results = ingest_daily(provider, cache, syms, start_dt, end_dt)
+    except SchwabError as exc:
+        typer.echo(f"data fetch failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    for r in results:
+        typer.echo(f"{r.symbol}: {r.bars_written} bars across {r.ranges_fetched} range(s)")

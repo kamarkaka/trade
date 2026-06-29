@@ -19,11 +19,14 @@ import json
 import sqlite3
 from collections.abc import Callable, Mapping
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from trader.web.db import ReadOnlyStateDB
 
-# Substrings that mark a dict key as secret-bearing -> redact its value.
+# Substrings that mark a dict key as secret-bearing -> redact its value. This is KEY-based
+# defense in depth ONLY; the PRIMARY guarantee is the explicit-column SELECTs (no secret column
+# is ever read from the state DB). scrub does NOT value-scan free text (e.g. audit `detail`).
 SECRET_KEYS = (
     "access_token",
     "refresh_token",
@@ -68,10 +71,14 @@ class MonitoringRepo:
         self,
         db: ReadOnlyStateDB,
         config_loader: Callable[[], Mapping[str, Any]] | None = None,
+        *,
+        token_store_path: Path | None = None,
     ) -> None:
         self._db = db
         self._config_loader = config_loader
-        self._token_db = ReadOnlyStateDB(db.path.parent / _TOKEN_DB_NAME)
+        # Token store defaults next to the state DB (the CLI default); inject to honor a
+        # relocated store (SCHWAB_TOKEN_STORE_PATH) via WebSettings at wiring time.
+        self._token_db = ReadOnlyStateDB(token_store_path or db.path.parent / _TOKEN_DB_NAME)
 
     # --- system / schedule ------------------------------------------------- #
 
@@ -237,6 +244,11 @@ class MonitoringRepo:
             access_expires = datetime.fromisoformat(row["access_expires_at"])
             refresh_issued = datetime.fromisoformat(row["refresh_issued_at"])
         except (TypeError, ValueError):
+            return {"authenticated": False}
+        # All token timestamps are tz-aware UTC (TokenStore enforces it); a naive one (corrupt
+        # / hand-edited store) is invalid -- reject it rather than let an aware/naive subtraction
+        # raise (this method must never raise).
+        if access_expires.tzinfo is None or refresh_issued.tzinfo is None or now.tzinfo is None:
             return {"authenticated": False}
         return {
             "authenticated": True,

@@ -178,6 +178,43 @@ def test_token_status_unauthenticated_when_missing(tmp_path: Path) -> None:
     assert repo.token_status(NOW) == {"authenticated": False}
 
 
+def test_token_status_naive_timestamp_does_not_crash(tmp_path: Path) -> None:
+    # A corrupt/naive stored timestamp must yield unauthenticated, NOT a TypeError.
+    db = tmp_path / "trader.sqlite"
+    _seed_state(db)
+    conn = sqlite3.connect(db.parent / "schwab_token.sqlite")
+    conn.execute(
+        "CREATE TABLE tokens (id INTEGER PRIMARY KEY, access_token TEXT, refresh_token TEXT, "
+        "access_expires_at TEXT, refresh_issued_at TEXT, scope TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO tokens VALUES (1, ?, ?, '2026-06-29T12:20:00', '2026-06-27T12:00:00', 's')",
+        (SENTINEL_ACCESS, SENTINEL_REFRESH),  # naive timestamps (no tz)
+    )
+    conn.commit()
+    conn.close()
+    assert MonitoringRepo(ReadOnlyStateDB(db)).token_status(NOW) == {"authenticated": False}
+
+
+def test_token_status_honors_injected_store_path(tmp_path: Path) -> None:
+    db = tmp_path / "trader.sqlite"
+    _seed_state(db)
+    custom = tmp_path / "relocated_token.sqlite"
+    conn = sqlite3.connect(custom)
+    conn.execute(
+        "CREATE TABLE tokens (id INTEGER PRIMARY KEY, access_token TEXT, refresh_token TEXT, "
+        "access_expires_at TEXT, refresh_issued_at TEXT, scope TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO tokens VALUES (1, 'a', 'r', ?, ?, 's')",
+        ((NOW + timedelta(minutes=20)).isoformat(), (NOW - timedelta(days=2)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    repo = MonitoringRepo(ReadOnlyStateDB(db), token_store_path=custom)
+    assert repo.token_status(NOW)["authenticated"] is True
+
+
 def test_recent_orders_shape(repo: MonitoringRepo) -> None:
     orders = repo.recent_orders()
     assert len(orders) == 1

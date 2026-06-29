@@ -35,8 +35,10 @@ def _strategies_data(request: Request) -> dict[str, Any]:
                 "id": sid,
                 "name": sb.get("name"),
                 "enabled": bool(sb.get("enabled", True)),
-                "universe": sb.get("universe", []),
-                "params": sb.get("params", {}),
+                # `or []` (not get-default): a present-but-null `universe:` returns None, and
+                # Jinja's `join` would crash on it.
+                "universe": sb.get("universe") or [],
+                "params": sb.get("params") or {},
                 "trades_today": counts.get(str(sid), 0),
                 "trades_limit": overrides.get("max_trades_per_day", default_limit),
             }

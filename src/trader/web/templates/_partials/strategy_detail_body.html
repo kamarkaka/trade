@@ -5,7 +5,7 @@
   <table>
     <tr><th class="l">Name</th><td class="l">{{ binding.name }}</td></tr>
     <tr><th class="l">Enabled</th><td class="l">{{ binding.enabled }}</td></tr>
-    <tr><th class="l">Universe</th><td class="l">{{ binding.universe | join(', ') }}</td></tr>
+    <tr><th class="l">Universe</th><td class="l">{{ (binding.universe or []) | join(', ') }}</td></tr>
     <tr><th class="l">Params</th><td class="l">{{ binding.params }}</td></tr>
   </table>
   {% else %}<p class="muted">No config binding (strategy seen only in state).</p>{% endif %}

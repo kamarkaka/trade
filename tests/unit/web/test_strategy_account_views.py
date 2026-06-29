@@ -121,6 +121,19 @@ def test_unknown_strategy_404(tmp_path: Path) -> None:
     assert _build(tmp_path).get("/strategies/nope").status_code == 404
 
 
+def test_null_universe_binding_does_not_500(tmp_path: Path) -> None:
+    # A present-but-null universe / minimal binding must render, not crash (join(None)).
+    cfg = {
+        "mode": "paper",
+        "risk": {"max_trades_per_day": 6},
+        "strategies": [{"id": "bare", "name": "x", "universe": None}, {"id": "minimal"}],
+    }
+    client = _build(tmp_path, config=cfg)
+    assert client.get("/strategies").status_code == 200
+    assert client.get("/strategies/bare").status_code == 200
+    assert client.get("/strategies/minimal").status_code == 200
+
+
 def test_account_shows_positions_and_pnl(tmp_path: Path) -> None:
     body = _build(tmp_path).get("/account").text
     assert "100500" in body  # equity

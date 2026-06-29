@@ -7,6 +7,7 @@ sys.modules scan proving the research package can never reach a broker / network
 
 from __future__ import annotations
 
+import math
 import subprocess
 import sys
 from datetime import date
@@ -115,6 +116,25 @@ def test_load_respects_date_window(tmp_path: Path) -> None:
     )
     windowed = param_sweep.load_cached_bars(tmp_path, "AAA", date(2024, 1, 5), date(2024, 1, 10))
     assert (windowed["ts"].dt.day >= 5).all() and (windowed["ts"].dt.day <= 10).all()
+
+
+def test_segment_metrics_flip_no_double_count() -> None:
+    # Long [1,2] then a direct flip to short [3,4], exit to flat at 5. The flip-bar return
+    # (rets[3]=+1.0) belongs to the LONG segment only and must NOT seed the short segment.
+    # Long P&L = rets[2]+rets[3] = +1.10 (win); short P&L = rets[4]+rets[5] = -0.10 (loss).
+    positions = pd.Series([0.0, 1.0, 1.0, -1.0, -1.0, 0.0])
+    strat_returns = pd.Series([0.0, 0.0, 0.10, 1.0, -0.05, -0.05])
+    num_trades, hit_rate = param_sweep._segment_metrics(strat_returns, positions)
+    assert num_trades == 2  # one long segment + one short segment
+    assert hit_rate == 0.5  # 1 win (long) of 2 closed; the old double-count gave 1.0
+
+
+def test_segment_metrics_open_position_excluded() -> None:
+    # A position still open at the last bar is excluded from hit_rate (nothing closed).
+    positions = pd.Series([0.0, 1.0, 1.0, 1.0])
+    strat_returns = pd.Series([0.0, 0.0, 0.05, 0.05])
+    num_trades, hit_rate = param_sweep._segment_metrics(strat_returns, positions)
+    assert num_trades == 1 and math.isnan(hit_rate)
 
 
 def test_research_imports_no_broker() -> None:

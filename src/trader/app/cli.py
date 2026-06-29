@@ -430,6 +430,8 @@ def _parse_grid(grid: list[str]) -> dict[str, list[object]]:
             raise ValueError(f"bad --grid {spec!r}; expected key=v1,v2")
         key, _, values = spec.partition("=")
         key = key.strip()
+        if key in out:
+            raise ValueError(f"duplicate --grid key {key!r} (pass all values in one key=...)")
         try:
             out[key] = [_coerce(v.strip()) for v in values.split(",") if v.strip()]
         except ValueError as exc:

@@ -101,34 +101,40 @@ def zscore_positions(
 
 
 def _segment_metrics(strat_returns: pd.Series, positions: pd.Series) -> tuple[int, float]:
-    """(num_trades, hit_rate) over holding segments. A trade is one entry into a nonzero
-    position; hit_rate = fraction of CLOSED segments with positive realized return. Returns
-    hit_rate as NaN when nothing closed (mirrors metrics.hit_rate -> None)."""
+    """(num_trades, hit_rate) over holding segments.
+
+    A holding segment is a maximal run where the position is a constant nonzero value (a
+    long->short flip ends one segment and starts the next). num_trades counts every segment.
+    Under the shifted-return convention (``strat_returns[i] = positions[i-1] * returns[i]``),
+    a segment held over bars ``[s, e]`` earns its P&L on bars ``s+1 .. e+1``; each bar's
+    return is credited to EXACTLY one segment (no flip-bar double counting). hit_rate is the
+    fraction of CLOSED segments (those that end before the series ends) with positive realized
+    return; a position still open at the last bar is excluded (mirrors metrics.hit_rate ->
+    None when nothing closed)."""
     pos = positions.to_numpy()
     rets = strat_returns.fillna(0.0).to_numpy()
-    num_trades = 0
+    n = len(pos)
+    segments: list[tuple[int, int]] = []  # inclusive (start, end) of each constant-nonzero run
+    i = 0
+    while i < n:
+        if pos[i] != 0.0:
+            j = i
+            while j + 1 < n and pos[j + 1] == pos[i]:
+                j += 1
+            segments.append((i, j))
+            i = j + 1
+        else:
+            i += 1
     closed = 0
     wins = 0
-    seg_ret = 0.0
-    in_pos = False
-    for i in range(len(pos)):
-        prev = pos[i - 1] if i > 0 else 0.0
-        if pos[i] != 0.0 and prev == 0.0:  # entry
-            num_trades += 1
-            in_pos = True
-            seg_ret = 0.0
-        if in_pos:
-            seg_ret += rets[i]
-        if prev != 0.0 and pos[i] != prev:  # exit or flip (segment closed)
-            closed += 1
-            if seg_ret > 0:
-                wins += 1
-            in_pos = pos[i] != 0.0
-            seg_ret = rets[i] if in_pos else 0.0
-            if in_pos and pos[i] != 0.0 and prev != 0.0:  # a flip is also a new entry
-                num_trades += 1
+    for start, end in segments:
+        if end >= n - 1:
+            continue  # still open at the last bar -> never closed -> excluded from hit_rate
+        closed += 1
+        if float(rets[start + 1 : end + 2].sum()) > 0:  # P&L on bars start+1 .. end+1
+            wins += 1
     hit_rate = (wins / closed) if closed else math.nan
-    return num_trades, hit_rate
+    return len(segments), hit_rate
 
 
 def simulate(close: pd.Series, positions: pd.Series) -> dict[str, float]:

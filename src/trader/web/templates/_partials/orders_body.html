@@ -1,0 +1,41 @@
+{# Recent orders + risk rejections (refreshable). M7.9. #}
+<section>
+  <h2>Recent orders</h2>
+  {% if orders %}
+  <table>
+    <tr><th class="l">Order</th><th class="l">Strategy</th><th class="l">Symbol</th>
+        <th class="l">Side</th><th>Qty</th><th class="l">Type</th><th class="l">Status</th>
+        <th class="l">Updated</th></tr>
+    {% for o in orders %}
+    <tr>
+      <td class="l"><a href="/orders/{{ o.client_order_id }}">{{ o.client_order_id[:12] }}</a></td>
+      <td class="l">{{ o.strategy_id }}</td>
+      <td class="l">{{ o.symbol }}</td>
+      <td class="l">{{ o.side }}</td>
+      <td>{{ o.quantity }}</td>
+      <td class="l">{{ o.order_type }}</td>
+      <td class="l">
+        {% if o.status in ('REJECTED', 'CANCELED', 'EXPIRED') %}
+          <span class="{{ 'warn' | badge }}">{{ o.status }}</span>
+        {% else %}<span class="{{ 'ok' | badge }}">{{ o.status }}</span>{% endif %}
+      </td>
+      <td class="l">{{ o.updated_at | nyt }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">No orders.</p>{% endif %}
+</section>
+
+<section>
+  <h3>Risk rejections</h3>
+  {% if rejections %}
+  <table>
+    <tr><th class="l">Time</th><th class="l">Strategy</th><th class="l">Reason</th></tr>
+    {% for r in rejections %}
+    <tr><td class="l">{{ r.ts | nyt }}</td><td class="l">{{ r.strategy_id }}</td>
+        <td class="l"><span class="{{ 'alert' | badge }}">{{ r.payload.get('reason', r.payload) }}</span></td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">No rejections.</p>{% endif %}
+</section>
+<p class="muted">updated {{ updated_at | nyt }}</p>

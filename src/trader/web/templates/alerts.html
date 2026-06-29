@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Alerts — trader monitor{% endblock %}
+{% block content %}
+<h1>Alerts</h1>
+<p class="muted">Alert-worthy events from the audit log (kill-switch trips, cycle errors,
+risk rejections). Telegram/email delivery is configured in the trader; this is the tail.</p>
+<div class="refresh"
+     hx-get="/alerts/fragment"
+     hx-trigger="every {{ refresh_seconds }}s"
+     hx-swap="innerHTML">
+  {% include "_partials/alerts_body.html" %}
+</div>
+{% endblock %}

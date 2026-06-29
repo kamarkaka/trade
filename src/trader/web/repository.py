@@ -217,6 +217,26 @@ class MonitoringRepo:
         )
         return {str(r["strategy_id"]): int(r["n"]) for r in rows}
 
+    def order(self, client_order_id: str) -> dict[str, Any] | None:
+        return _row(
+            self._db.query_one(
+                "SELECT client_order_id, strategy_id, symbol, side, quantity, order_type, "
+                "limit_price, tif, status, broker_order_id, created_at, updated_at "
+                "FROM orders WHERE client_order_id = ?",
+                (client_order_id,),
+            )
+        )
+
+    def recent_rejections(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Risk-rejected orders (with reasons) from the audit log — these never reach the
+        orders table (write-ahead happens only for approved orders)."""
+        rows = self._db.query(
+            "SELECT id, ts, cycle_id, strategy_id, kind, payload FROM audit_log "
+            "WHERE kind = 'rejected' ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return [self._decision_row(r) for r in rows]
+
     def order_fills(self, client_order_id: str) -> list[dict[str, Any]]:
         return _rows(
             self._db.query(

@@ -1,0 +1,42 @@
+# Pinned runtime dependency lock for the Docker image (design §16.1: reproducible deps).
+# Regenerate after changing pyproject [project.dependencies]:
+#   pip install --dry-run --ignore-installed --report r.json <the pyproject deps...>
+#   then pin each r.json install entry as name==version (sorted).
+# The image installs these with --only-binary=:all: so a missing wheel fails the build
+# loudly (no silent source compile), then `pip install --no-deps .` adds the package.
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.14.1
+apscheduler==3.11.3
+certifi==2026.6.17
+cffi==2.0.0
+cryptography==49.0.0
+exchange_calendars==4.13.2
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+korean_lunar_calendar==0.4.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+numpy==2.5.0
+pandas==3.0.4
+pyarrow==24.0.0
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+pygments==2.20.0
+pyluach==2.3.0
+python-dateutil==2.9.0.post0
+pyyaml==6.0.3
+rich==15.0.0
+shellingham==1.5.4
+six==1.17.0
+structlog==26.1.0
+tenacity==9.1.4
+toolz==1.1.0
+typer==0.26.8
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+tzdata==2026.2
+tzlocal==5.4.4

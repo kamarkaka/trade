@@ -39,6 +39,39 @@ def test_count_day_trades() -> None:
     assert rule.count_day_trades(one_sided, window_start=WINDOW_START) == 0
 
 
+def test_session_bucketed_by_exchange_tz_not_utc() -> None:
+    # A same-session ET round trip late in the afternoon crosses into the next UTC day; it
+    # must still count as ONE day-trade (bucket by exchange-tz date, not UTC).
+    rule = PDTRule(RiskConfig())
+    buy = datetime(2026, 6, 29, 18, 0, tzinfo=UTC)  # 14:00 ET
+    sell = datetime(2026, 6, 30, 0, 30, tzinfo=UTC)  # 20:30 ET SAME session (still 2026-06-29 ET)
+    events = [TradeEvent("AAPL", Side.BUY, buy), TradeEvent("AAPL", Side.SELL, sell)]
+    assert (
+        rule.count_day_trades(events, window_start=WINDOW_START) == 1
+    )  # not split across UTC days
+
+
+def test_multiple_round_trips_same_session_count_each() -> None:
+    # 3 buy+sell pairs in one symbol/session = 3 day-trades (not 1) -> never under-counts.
+    rule = PDTRule(RiskConfig())
+    events = [TradeEvent("AAPL", Side.BUY if i % 2 == 0 else Side.SELL, NOW) for i in range(6)]
+    assert rule.count_day_trades(events, window_start=WINDOW_START) == 3
+
+
+def test_short_side_day_trade_blocked() -> None:
+    # Short-then-cover: a SELL opens the position today, a BUY now completes the round trip.
+    rule = PDTRule(RiskConfig())
+    events = [*_events(3), TradeEvent("AAPL", Side.SELL, NOW)]
+    result = rule.check(
+        _order(Side.BUY, "AAPL"),
+        events=events,
+        equity=_under(),
+        asof=NOW,
+        window_start=WINDOW_START,
+    )
+    assert result.ok is False
+
+
 def test_rolling_window_expiry() -> None:
     rule = PDTRule(RiskConfig())
     old = _events(3, day=NOW - timedelta(days=30))  # well before the window

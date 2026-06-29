@@ -30,7 +30,13 @@ class SchwabRefreshTokenDeadError(SchwabAuthError):
 
 
 class SchwabRateLimitError(SchwabError):
-    """HTTP 429 — retryable with backoff."""
+    """HTTP 429 — retryable with backoff. Carries an optional Retry-After (seconds)."""
+
+    def __init__(
+        self, message: str = "", *, status_code: int | None = None, retry_after: float | None = None
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.retry_after = retry_after
 
 
 class SchwabServerError(SchwabError):

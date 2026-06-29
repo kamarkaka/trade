@@ -329,8 +329,9 @@ class StrategyBinding:
     def __post_init__(self) -> None:
         object.__setattr__(self, "universe", tuple(self.universe))
         object.__setattr__(self, "slots", tuple(self.slots))
-        if not self.universe:
-            raise ValueError("universe must not be empty")
+        if self.enabled and not self.universe:
+            # an enabled binding must trade something; a disabled one may be empty
+            raise ValueError("an enabled binding must have a non-empty universe")
         for s in self.slots:
             if not isinstance(s, SlotSpec):
                 raise TypeError(f"slots must contain SlotSpec, got {type(s).__name__}")

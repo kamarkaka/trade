@@ -97,10 +97,24 @@ class RiskConfig(_Base):
     max_trades_per_day: int = Field(default=6, ge=0)
     max_staleness_seconds: int = Field(default=60, gt=0)
     max_spread_pct: float = Field(default=1.0, ge=0)
-    allowlist: tuple[str, ...] = ()  # default-deny when empty
+    # Reject "bad ticks": |last - prev_close| / prev_close beyond this %. 0 disables
+    # the check; it is also skipped when prev_close is unavailable (design §10).
+    max_deviation_from_prev_close_pct: float = Field(default=20.0, ge=0)
+    allowlist: tuple[str, ...] = ()  # when non-empty, only these symbols may trade
+    denylist: tuple[str, ...] = ()  # these symbols are always blocked (takes precedence)
     enforce_pdt: bool = True
     auto_flatten_on_kill: bool = False
     conflict_policy: ConflictPolicy = ConflictPolicy.NET
+
+    @field_validator("allowlist", "denylist", mode="before")
+    @classmethod
+    def _normalize_symbols(cls, v: object) -> object:
+        # Symbols are matched case-sensitively against (upper-case) order symbols;
+        # normalize the lists so a lower-case/whitespace entry can't silently fail
+        # to deny (a deny list that doesn't deny is a fail-open hazard).
+        if isinstance(v, (list, tuple)):
+            return tuple(s.strip().upper() for s in v if isinstance(s, str) and s.strip())
+        return v
 
 
 class StrategyBindingConfig(_Base):

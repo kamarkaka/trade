@@ -96,6 +96,8 @@ def price_sanity(order: Order, ctx: RuleContext) -> RuleResult:
         return _reject("no quote (fail closed)")
     if quote.last <= 0:
         return _reject(f"non-positive price {quote.last}")
+    if quote.bid > quote.ask:
+        return _reject(f"crossed market (bid {quote.bid} > ask {quote.ask})")
     mid = (quote.bid + quote.ask) / 2
     if mid <= 0:
         return _reject("non-positive mid")

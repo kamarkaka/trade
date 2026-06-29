@@ -153,6 +153,8 @@ def test_price_sanity_rejects_zero_negative_wide_spread_and_stale() -> None:
     assert rules.price_sanity(_order(), _ctx(quote=_quote(last="-1"))).ok is False
     wide = _quote(bid="90", ask="110")  # 20% spread > 1%
     assert rules.price_sanity(_order(), _ctx(quote=wide)).ok is False
+    crossed = _quote(bid="101", ask="99")  # bid > ask: crossed/locked book
+    assert rules.price_sanity(_order(), _ctx(quote=crossed)).ok is False
     stale = _quote(ts=NOW - timedelta(seconds=120))  # > 60s
     assert rules.price_sanity(_order(), _ctx(quote=stale)).ok is False
     assert rules.price_sanity(_order(), _ctx()).ok is True  # good quote

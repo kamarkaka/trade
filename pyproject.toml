@@ -20,6 +20,7 @@ dependencies = [
   "tenacity>=8",  # retry/backoff for the Schwab HTTP transport (M1.6)
   "pandas>=2.2",  # backtest historical data cache + frames (M2.2)
   "pyarrow>=16",  # Parquet storage engine for the bar cache (M2.2)
+  "numpy>=2",  # seeded backtest RNG (M2.9)
 ]
 
 [project.optional-dependencies]
@@ -51,7 +52,9 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
 
 [tool.mypy]
-python_version = "3.11"
+# 3.12 to parse numpy's PEP 695 stubs; ruff (target-version py311) still enforces
+# 3.11 source compatibility, matching requires-python.
+python_version = "3.12"
 strict = true
 files = ["src"]
 warn_unused_configs = true

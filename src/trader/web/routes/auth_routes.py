@@ -38,6 +38,9 @@ _DUMMY_HASH = (
 
 
 def _client_ip(request: Request) -> str:
+    # Deliberately the direct peer (proxy IP behind Caddy), NOT X-Forwarded-For: trusting a
+    # client-settable XFF header would let an attacker reset the lockout key by spoofing it.
+    # Effectively per-username throttling behind the proxy — fine for a single admin.
     return request.client.host if request.client else "unknown"
 
 

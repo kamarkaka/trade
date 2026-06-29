@@ -9,7 +9,7 @@ out by later milestones: ``backtest`` (M2), ``run`` (M3/M4), ``reconcile`` (M4),
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -182,7 +182,13 @@ def data_fetch(
         typer.echo("data fetch error: no symbols given", err=True)
         raise typer.Exit(1)
     start_dt = _parse_day(start, "--start")
-    end_dt = _parse_day(end, "--end")
+    end_day = _parse_day(end, "--end")
+    if end_day < start_dt:
+        typer.echo("data fetch error: --end must be on or after --start", err=True)
+        raise typer.Exit(1)
+    # --start/--end are inclusive day boundaries; extend end to end-of-day so the end
+    # day's (midnight-stamped) daily bar is fetched and a single-day window is non-empty.
+    end_dt = end_day + timedelta(days=1) - timedelta(seconds=1)
 
     # Resolve credentials first so a missing-creds run fails before touching the cache.
     try:
@@ -198,7 +204,7 @@ def data_fetch(
         with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
             http = SchwabHttp(schwab_cfg, client, store, clock=clock)
             provider = SchwabMarketData(SchwabClient(http), clock)
-            results = ingest_daily(provider, cache, syms, start_dt, end_dt)
+            results = ingest_daily(provider, cache, syms, start_dt, end_dt, clock=clock)
     except SchwabError as exc:
         typer.echo(f"data fetch failed: {exc}", err=True)
         raise typer.Exit(1) from exc

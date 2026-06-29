@@ -104,6 +104,14 @@ def test_data_fetch_rejects_bad_date(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "YYYY-MM-DD" in result.output
 
 
+def test_data_fetch_rejects_reversed_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = runner.invoke(
+        app, ["data", "fetch", "--symbols", "AAPL", "--start", "2023-12-31", "--end", "2023-01-01"]
+    )
+    assert result.exit_code != 0
+    assert "on or after" in result.output
+
+
 def test_data_fetch_rejects_non_daily(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(
         app,

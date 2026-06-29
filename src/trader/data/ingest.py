@@ -16,7 +16,7 @@ from datetime import datetime
 import pandas as pd
 
 from trader.core import Bar
-from trader.core.protocols import MarketDataProvider
+from trader.core.protocols import Clock, MarketDataProvider
 
 from .cache import BAR_COLUMNS, ParquetCache
 
@@ -50,20 +50,32 @@ def ingest_daily(
     symbols: Sequence[str],
     start: datetime,
     end: datetime,
+    *,
+    clock: Clock,
 ) -> list[IngestResult]:
     """Fetch and cache daily bars for ``symbols`` over ``[start, end]``, missing-only.
 
-    For each gap the cache reports, fetch via the provider and write it back. Even a
-    gap that yields no bars (holiday/halt) records its coverage, so it is not
-    re-fetched on the next run.
+    For each gap the cache reports, fetch via the provider and write it back. A
+    settled gap that yields no bars (holiday/halt) still records its coverage so it
+    is not re-fetched. Coverage is recorded only up to the data frontier
+    (``clock.now()``): a gap reaching into the future stays a refetchable gap, so
+    bars published later (after the requested ``end`` passes) are not masked forever.
     """
+    now = clock.now()
     results: list[IngestResult] = []
     for symbol in symbols:
         ranges_fetched = 0
         bars_written = 0
         for gap_start, gap_end in cache.missing_ranges(symbol, start, end):
             bars = provider.get_bars(symbol, gap_start, gap_end, "daily", asof=gap_end)
-            cache.write_bars(symbol, _bars_to_frame(bars), covered=(gap_start, gap_end))
+            frame = _bars_to_frame(bars)
+            settled_end = min(gap_end, now)
+            if settled_end > gap_start:
+                cache.write_bars(symbol, frame, covered=(gap_start, settled_end))
+            elif bars:
+                # Gap is entirely in the future but bars came back anyway: store them
+                # without claiming coverage of the unsettled future.
+                cache.write_bars(symbol, frame)
             ranges_fetched += 1
             bars_written += len(bars)
         results.append(IngestResult(symbol, ranges_fetched, bars_written))

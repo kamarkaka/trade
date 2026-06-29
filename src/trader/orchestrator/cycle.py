@@ -221,8 +221,9 @@ class Orchestrator:
                 # Strategy isolation (Appendix C#6): a failing cycle must never crash the
                 # daemon or block other strategies. exc_info carries the traceback to logs
                 # so an orchestrator bug (vs a strategy bug) is still diagnosable. Partial
-                # effects (earlier fills already attributed) are intentional — each order is
-                # write-ahead-logged + idempotent, so recovery is via reconcile, not rollback.
+                # effects (earlier fills already attributed) are intentional — recovery is via
+                # reconcile, not rollback. (At-most-once placement via submit_idempotent (M5.3)
+                # is wired into this submit path at go-live, M5.6/M5.7; paper submits directly.)
                 self._log.error(
                     "cycle failed", strategy_id=strategy_id, error=str(exc), exc_info=True
                 )

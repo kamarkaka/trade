@@ -9,10 +9,19 @@ from pathlib import Path
 
 from fakes import FakeBroker, FakeClock, FakeMarketDataProvider
 from trader.config.models import ExecutionConfig
-from trader.core import Account, Decision, MarketSnapshot, Order, Position, Quote
+from trader.core import (
+    Account,
+    DayState,
+    Decision,
+    MarketSnapshot,
+    Order,
+    Position,
+    Quote,
+    RiskVerdict,
+)
 from trader.core.enums import Action
 from trader.core.protocols import Clock, MarketDataProvider
-from trader.orchestrator.cycle import ListAuditSink, Orchestrator
+from trader.orchestrator.cycle import ApproveAllRiskManager, ListAuditSink, Orchestrator
 from trader.orchestrator.lock import GlobalCycleLock, NullLock
 from trader.sizing.sizer import size_decision
 from trader.state.attribution import AttributionLedger
@@ -109,14 +118,21 @@ def test_strategy_exception_isolated(tmp_path: Path) -> None:
     assert broker.submitted == []
 
 
-class _SpyRisk:
+class _SpyRisk(ApproveAllRiskManager):
     def __init__(self, approve: bool) -> None:
         self.approve = approve
         self.calls: list[Order] = []
 
-    def check(self, order: Order) -> bool:
+    def check(
+        self,
+        order: Order,
+        positions: Sequence[Position],
+        account: Account,
+        quote: Quote,
+        day_state: DayState,
+    ) -> RiskVerdict:
         self.calls.append(order)
-        return self.approve
+        return RiskVerdict(approved=self.approve)
 
 
 def test_every_order_passes_risk_check(tmp_path: Path) -> None:

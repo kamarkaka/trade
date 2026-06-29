@@ -67,6 +67,14 @@ class SlotScheduler:
                         SkippedSlot(binding.strategy_id, slot.slot_id, "calendar gate skipped")
                     )
                     continue
+                if self._calendar.session_date_of(resolved) != on_date:
+                    # A drift large enough to cross midnight would land the trigger on a
+                    # different session (only reachable via an uncapped SlotSpec — config
+                    # caps drift). Drop it rather than fire on the wrong day.
+                    self._skipped.append(
+                        SkippedSlot(binding.strategy_id, slot.slot_id, "drift crossed session")
+                    )
+                    continue
                 triggers.append(
                     TriggerSlot(
                         strategy_id=binding.strategy_id,

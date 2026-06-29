@@ -3,9 +3,12 @@ and reproducibility (M3.4)."""
 
 from datetime import date, time
 
+import pytest
+
 from trader.core.enums import OnOvershoot
 from trader.core.protocols import Scheduler
 from trader.core.types import SlotSpec, StrategyBinding
+from trader.scheduler import triggers as triggers_mod
 from trader.scheduler.calendar import TradingCalendar
 from trader.scheduler.triggers import SlotScheduler
 
@@ -83,6 +86,23 @@ def test_trigger_carries_drift_and_seed() -> None:
     trigger = _scheduler(binding).triggers_for(SESSION)[0]
     assert 0 <= trigger.drift_seconds <= 30 * 60
     assert trigger.seed is not None  # realized seed persisted for replay
+
+
+def test_multi_slot_per_binding_merged_sorted() -> None:
+    binding = _binding(
+        "a", (_slot("close", time(15, 0)), _slot("open", time(10, 0)), _slot("noon", time(12, 0)))
+    )
+    triggers = _scheduler(binding).triggers_for(SESSION)
+    assert [t.slot_id for t in triggers] == ["open", "noon", "close"]  # sorted by fire_ts
+
+
+def test_cross_session_drift_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # force a backward drift that lands on the PRIOR session (Fri 07-05 ~12:00 ET),
+    # a valid session, so the guard (not the calendar gate) must drop it.
+    monkeypatch.setattr(triggers_mod, "compute_drift", lambda *_a, **_k: (-252000, 7))
+    sched = _scheduler(_binding("a", (_slot("open", time(10, 0), minutes=9999),)))
+    assert sched.triggers_for(SESSION) == []  # not fired on the wrong day
+    assert sched.skipped[0].reason == "drift crossed session"
 
 
 def test_skipped_recorded_on_overshoot() -> None:

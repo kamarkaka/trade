@@ -128,21 +128,6 @@ def test_idempotent_resubmit_does_not_double_fill() -> None:
     assert broker.get_positions()[0].quantity == 10  # only filled once
 
 
-def test_limit_order_not_supported_yet() -> None:
-    broker = _broker()
-    order = Order(
-        client_order_id="L1",
-        strategy_id="s1",
-        symbol="AAPL",
-        side=Side.BUY,
-        quantity=1,
-        order_type=OrderType.LIMIT,
-        limit_price=Decimal("90"),
-    )
-    with pytest.raises(NotImplementedError):
-        broker.submit_order(order)
-
-
 def test_get_order_unknown_raises() -> None:
     with pytest.raises(KeyError):
         _broker().get_order("SIM-999")

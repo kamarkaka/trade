@@ -1,7 +1,9 @@
 """Pure, deterministic, no-lookahead indicators (design §6/§9.5).
 
-The single source of truth for strategy math, shared by production strategies and the offline
-research harness (M6.9) so they compute identically (parity). All functions:
+The single source of truth for the production strategy math (live + the event-driven
+backtest, which ARE the parity path). The offline research harness (M6.9) deliberately does
+NOT import these — it reimplements a vectorized float APPROXIMATION for speed and is not a
+parity path. All functions:
 
 - are pure (no global state, no wall clock, no I/O) and **Decimal**-based (no binary float;
   ``std`` uses ``Decimal.sqrt`` for cross-platform determinism);
@@ -23,7 +25,7 @@ from trader.core import Bar
 
 # Pin a fixed Decimal context for ALL indicator arithmetic so results are invariant to the
 # (process-global, mutable) ambient context -- the math must be bit-for-bit reproducible
-# (parity with the research harness + the golden runs, design §9.5).
+# (parity across live + the event-driven backtest golden runs, design §9.5).
 _CTX = Context(prec=28, rounding=ROUND_HALF_EVEN)
 
 

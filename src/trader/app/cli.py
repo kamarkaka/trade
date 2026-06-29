@@ -145,8 +145,8 @@ def backtest(
     from trader.data.historical import HistoricalDataProvider
 
     cfg = _load(config)
-    start_d = _parse_day(start, "--start").date()
-    end_d = _parse_day(end, "--end").date()
+    start_d = _parse_day(start, "--start", context="backtest").date()
+    end_d = _parse_day(end, "--end", context="backtest").date()
     if end_d < start_d:
         typer.echo("backtest error: --end must be on or after --start", err=True)
         raise typer.Exit(1)
@@ -157,9 +157,9 @@ def backtest(
         raise typer.Exit(1)
     binding = enabled[0]
     universe = list(binding.universe)
-    slots = [
-        datetime.strptime(s.time, "%H:%M").time() for s in binding.slots
-    ]  # UTC-combined by engine
+    # M2 simplification: slot "HH:MM" is treated as UTC (engine combines with UTC).
+    # DST-aware localization to the config timezone arrives in M3.3/M3.4 (design §7.1).
+    slots = [datetime.strptime(s.time, "%H:%M").time() for s in binding.slots]
     seed = cfg.schedule.base_seed or 0
     cash = Decimal(_BACKTEST_STARTING_CASH)
 
@@ -183,13 +183,19 @@ def backtest(
     manifest = build_manifest(cfg, data_hashes, seed)
     report = BacktestReport.build(result.fills, result.equity_curve, manifest)
 
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")  # microseconds avoid collisions
     out_dir = Path(out) / f"{binding.id}-{start_d}-{end_d}-{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     write_manifest(manifest, out_dir / "manifest.json")
+    if not result.fills:
+        typer.echo(
+            "backtest warning: no fills produced — check that data is cached for "
+            f"{universe} over {start_d}..{end_d}",
+            err=True,
+        )
     typer.echo(f"backtest: {len(result.fills)} fills; report written to {out_dir}")
 
 
@@ -243,11 +249,11 @@ data_app = typer.Typer(help="Historical data cache management.", no_args_is_help
 app.add_typer(data_app, name="data")
 
 
-def _parse_day(value: str, name: str) -> datetime:
+def _parse_day(value: str, name: str, *, context: str = "data fetch") -> datetime:
     try:
         return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
     except ValueError as exc:
-        typer.echo(f"data fetch error: {name} must be YYYY-MM-DD, got {value!r}", err=True)
+        typer.echo(f"{context} error: {name} must be YYYY-MM-DD, got {value!r}", err=True)
         raise typer.Exit(1) from exc
 
 

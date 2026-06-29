@@ -186,6 +186,13 @@ def run_multi_strategy(
     """Walk merged, time-sorted triggers across all enabled strategies, running the
     SAME ``run_cycle`` per trigger against the SimBroker. Identical to live except for
     the injected VirtualClock / HistoricalDataProvider / SimBroker (design §4.3/§9).
+
+    No-lookahead model: unlike the M2 single-strategy ``BacktestEngine.run`` (which
+    defers fills to the next bar), this path relies on the **asof clamp** — the data
+    provider never returns ``ts > fire_ts``, so the strategy can't see the future. The
+    fill happens at the decision instant's quote, which for daily history is that
+    session's bar (the bar predates the mid-session fire time). A strategy exception is
+    isolated inside ``run_cycle`` (recorded in its CycleResult), so the run continues.
     """
     scheduler = SlotScheduler(bindings, calendar, schedule.base_seed)
     orchestrator = Orchestrator(

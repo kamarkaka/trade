@@ -92,13 +92,21 @@ def test_misfire_grace_reflects_catch_up(tmp_path: Path) -> None:
 
 
 def test_calendar_gate_skips(tmp_path: Path) -> None:
-    alerts: list[str] = []
+    from trader.observability.alerting import AlertEvent, AlertKind
+
+    events: list[AlertEvent] = []
+
+    class _Rec:
+        def alert(self, event: AlertEvent) -> None:
+            events.append(event)
+
     spy = _SpyOrchestrator()
     daemon = _daemon(tmp_path, [_binding("m", "open", time(9, 45))], spy, clock=HOLIDAY_NOW)
-    daemon._alert = alerts.append
+    daemon._alerter = _Rec()  # type: ignore[assignment]
     assert daemon.fire("m", "open") is None
     assert spy.calls == []  # holiday -> no cycle
-    assert alerts and "skipped" in alerts[0]
+    assert events and events[0].kind is AlertKind.SKIPPED_SLOT
+    assert "skipped" in events[0].message
 
 
 def test_ledger_blocks_double_fire(tmp_path: Path) -> None:

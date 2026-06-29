@@ -24,20 +24,19 @@ from zoneinfo import ZoneInfo
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from trader.config.models import ScheduleConfig
 from trader.core.protocols import Clock
 from trader.core.types import SlotSpec, StrategyBinding
+from trader.observability.alerting import Alerter, AlertEvent, AlertKind
+from trader.observability.heartbeat import Heartbeat
 from trader.observability.logging import get_logger
 from trader.orchestrator.cycle import CycleResult, Orchestrator
 from trader.scheduler.calendar import TradingCalendar
 from trader.scheduler.jitter import compute_drift
 from trader.state.ledger import FiredSlotLedger
 from trader.strategy.registry import REGISTRY, StrategyRegistry
-
-# A plain string-message sink (distinct from observability.alerting.Alerter, which takes a
-# typed AlertEvent). M4.6/M4.7 adapts the daemon to emit AlertEvents through that gate.
-AlertFn = Callable[[str], None]
 
 
 class SchedulerDaemon:
@@ -53,7 +52,9 @@ class SchedulerDaemon:
         orchestrator: Orchestrator,
         clock: Clock,
         registry: StrategyRegistry = REGISTRY,
-        alerter: AlertFn | None = None,
+        alerter: Alerter | None = None,
+        heartbeat: Heartbeat | None = None,
+        heartbeat_interval_seconds: float = 60.0,
         sleep: Callable[[float], None] = _time.sleep,
     ) -> None:
         self._bindings = bindings
@@ -65,9 +66,9 @@ class SchedulerDaemon:
         self._registry = registry
         self._tz = ZoneInfo(schedule.timezone)
         self._log = get_logger("daemon")
-        self._alert: AlertFn = alerter or (
-            lambda msg: self._log.warning("daemon alert", detail=msg)
-        )
+        self._alerter = alerter
+        self._heartbeat = heartbeat
+        self._heartbeat_interval = heartbeat_interval_seconds
         self._sleep = sleep
         # Single-worker executor: jobs run one-at-a-time on one thread, so the SQLite
         # connection is never used concurrently (the global cycle lock is the additional
@@ -105,10 +106,35 @@ class SchedulerDaemon:
             for slot in binding.slots:
                 self._register_slot(binding, slot)
 
+    def _emit(self, kind: AlertKind, message: str) -> None:
+        """Log + (if configured) send a typed alert. Alerting never raises into the daemon."""
+        self._log.warning("daemon alert", kind=kind.value, detail=message)
+        if self._alerter is not None:
+            try:
+                self._alerter.alert(AlertEvent(kind, message))
+            except Exception as exc:  # pragma: no cover - alerter is itself fail-safe
+                self._log.error("alerter raised", error_type=type(exc).__name__)
+
+    def _beat(self) -> None:
+        """Liveness touch (runs on the scheduler's worker, so a hung cycle stalls it ->
+        the healthcheck goes stale -> the container is restarted, which is correct)."""
+        if self._heartbeat is not None:
+            self._heartbeat.touch("running", f"{len(self._scheduler.get_jobs())} jobs")
+
     def start(self) -> None:
         if self._scheduler.running:
             return
         self.register()
+        if self._heartbeat is not None:
+            self._heartbeat.touch("running")  # fresh from the moment we start
+            self._scheduler.add_job(
+                self._beat,
+                IntervalTrigger(seconds=self._heartbeat_interval),
+                id="__heartbeat__",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
         self._scheduler.start()
 
     def stop(self) -> None:
@@ -142,12 +168,16 @@ class SchedulerDaemon:
         )
 
     def _fire(self, binding: StrategyBinding, slot: SlotSpec) -> CycleResult | None:
+        self._beat()  # liveness: a fire keeps the heartbeat fresh even between interval ticks
         today = self._clock.now().astimezone(self._tz).date()
         drift, seed = compute_drift(slot, self._schedule.base_seed, today, binding.strategy_id)
         nominal = self._calendar.localize(today, slot.at)
         resolved = self._calendar.resolve_fire(nominal + timedelta(seconds=drift), slot)
         if resolved is None:
-            self._alert(f"{binding.strategy_id}/{slot.slot_id} skipped (calendar gate) on {today}")
+            self._emit(
+                AlertKind.SKIPPED_SLOT,
+                f"{binding.strategy_id}/{slot.slot_id} skipped (calendar gate) on {today}",
+            )
             return None
 
         delay = (resolved - self._clock.now()).total_seconds()
@@ -164,14 +194,19 @@ class SchedulerDaemon:
             )
         except Exception as exc:
             self._ledger.mark_failed(today, binding.strategy_id, slot.slot_id, str(exc))
-            self._alert(f"{binding.strategy_id}/{slot.slot_id} cycle crashed: {exc}")
+            self._emit(
+                AlertKind.CRASH, f"{binding.strategy_id}/{slot.slot_id} cycle crashed: {exc}"
+            )
             return None
 
         if result.errors:
             self._ledger.mark_failed(
                 today, binding.strategy_id, slot.slot_id, "; ".join(result.errors)
             )
-            self._alert(f"{binding.strategy_id}/{slot.slot_id} cycle failed: {result.errors}")
+            self._emit(
+                AlertKind.CRASH,
+                f"{binding.strategy_id}/{slot.slot_id} cycle failed: {result.errors}",
+            )
         else:
             self._ledger.mark_done(today, binding.strategy_id, slot.slot_id)
         return result

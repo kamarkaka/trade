@@ -155,12 +155,17 @@ def run(
     ] = False,
 ) -> None:
     """Run the PAPER trading daemon (SimBroker against live quotes; no real orders)."""
+    import os
     import time as _time
 
     from trader.broker import SimBroker
     from trader.core.enums import Mode
-    from trader.orchestrator.cycle import Orchestrator
+    from trader.execution.reconcile import reconcile
+    from trader.observability.alerting import AlertEvent, AlertKind, build_alerter
+    from trader.observability.heartbeat import Heartbeat
+    from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
     from trader.orchestrator.lock import GlobalCycleLock
+    from trader.risk.gate import RiskManager
     from trader.scheduler.calendar import TradingCalendar
     from trader.scheduler.daemon import SchedulerDaemon
     from trader.sizing.sizer import size_decision
@@ -206,18 +211,46 @@ def run(
     run_migrations(state)
     cash = Decimal(_BACKTEST_STARTING_CASH)
 
+    # Redundant alerting + per-strategy risk overrides assembled once for the run.
+    alerter = build_alerter(cfg.alerting.channels, environ=os.environ)
+    overrides = {b.strategy_id: b.risk_overrides for b in bindings if b.risk_overrides}
+    risk = RiskManager(
+        account_config=cfg.risk,
+        clock=clock,
+        overrides_by_strategy=overrides,
+        default_policy=cfg.risk.conflict_policy,
+    )
+    heartbeat = Heartbeat(
+        state,
+        clock=clock,
+        max_age_seconds=cfg.alerting.heartbeat_minutes * 60 * 2,
+        alerter=alerter,
+    )
+
     with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
         http = SchwabHttp(schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock)
         data = SchwabMarketData(SchwabClient(http), clock)
         broker = SimBroker(data, clock, starting_cash=cash)  # PAPER: SimBroker only, never real
+        attribution = AttributionLedger(state)
         orchestrator = Orchestrator(
             broker=broker,
             data=data,
             clock=clock,
             cycle_lock=GlobalCycleLock(),
-            attribution=AttributionLedger(state),
+            attribution=attribution,
             sizer=lambda d, sid: size_decision(d, sid, cfg.execution),
+            risk=risk,  # the real fail-closed gate is the single chokepoint
+            audit=SqliteAuditSink(state),  # durable audit chain
         )
+        # Reconcile against broker truth before acting (design §10); divergence alerts.
+        report = reconcile(broker, attribution)
+        if report.requires_attention:
+            alerter.alert(
+                AlertEvent(
+                    AlertKind.RECONCILE_MISMATCH,
+                    f"startup reconciliation found {len(report.discrepancies)} discrepancies",
+                )
+            )
         daemon = SchedulerDaemon(
             bindings=bindings,
             schedule=schedule,
@@ -225,6 +258,8 @@ def run(
             ledger=FiredSlotLedger(state),
             orchestrator=orchestrator,
             clock=clock,
+            alerter=alerter,
+            heartbeat=heartbeat,
         )
         if once:
             for binding in bindings:

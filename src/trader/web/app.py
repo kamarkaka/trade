@@ -15,14 +15,19 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from trader.web.auth import install_session_refresh, require_session
 from trader.web.db import ReadOnlyStateDB
+from trader.web.routes import auth_routes
+from trader.web.security import LoginThrottle
 from trader.web.settings import WebSettings
 
 _WEB_DIR = Path(__file__).resolve().parent
@@ -32,13 +37,32 @@ _TEMPLATES_DIR = _WEB_DIR / "templates"
 logger = logging.getLogger("trader.web")  # web's OWN logger (stdout) — never the trading DB
 
 
-def create_app(settings: WebSettings) -> FastAPI:
-    """Build the read-only monitoring FastAPI app from injected settings."""
+def create_app(settings: WebSettings, *, now: Callable[[], datetime] | None = None) -> FastAPI:
+    """Build the read-only monitoring FastAPI app from injected settings.
+
+    ``now`` injects the clock (default: real UTC wall clock) so session/lockout timing is
+    deterministic in tests."""
     app = FastAPI(title="trader monitor", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
+    app.state.now = now if now is not None else (lambda: datetime.now(UTC))
     app.state.db = ReadOnlyStateDB(settings.db_path)
     app.state.templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+    app.state.login_throttle = LoginThrottle(
+        settings.login_max_attempts, settings.login_lockout_seconds
+    )
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    install_session_refresh(app)  # writes the idle-refreshed cookie on authenticated responses
+    app.include_router(auth_routes.router)  # PUBLIC: /login, /logout
+
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard(request: Request, user: str = Depends(require_session)) -> HTMLResponse:
+        # Placeholder protected root (real dashboards land in M7.5+). Exists now so the auth
+        # guard is exercised end-to-end.
+        return HTMLResponse(
+            f"<!DOCTYPE html><html><body><h1>trader monitor</h1>"
+            f"<p>signed in as {user}</p></body></html>"
+        )
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:

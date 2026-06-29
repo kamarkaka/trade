@@ -1,0 +1,18 @@
+/* Minimal monitoring-UI styles (no external assets). M7.4+. */
+:root { --fg: #1a1a1a; --muted: #777; --err: #b00020; --line: #e2e2e2; }
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+       color: var(--fg); margin: 0; line-height: 1.45; }
+.muted { color: var(--muted); }
+.error { color: var(--err); font-weight: 600; }
+
+body.login { display: grid; place-items: center; min-height: 100vh; background: #fafafa; }
+.login-card { width: 320px; padding: 1.5rem 1.75rem; border: 1px solid var(--line);
+              border-radius: 10px; background: #fff; }
+.login-card h1 { margin: 0 0 .25rem; font-size: 1.25rem; }
+.login-card label { display: block; margin: .75rem 0 .25rem; font-size: .9rem; }
+.login-card input { width: 100%; padding: .5rem; border: 1px solid var(--line);
+                    border-radius: 6px; font-size: 1rem; }
+.login-card button { width: 100%; margin-top: 1rem; padding: .55rem; border: 0;
+                     border-radius: 6px; background: #1a1a1a; color: #fff;
+                     font-size: 1rem; cursor: pointer; }

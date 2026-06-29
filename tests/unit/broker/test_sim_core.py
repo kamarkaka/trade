@@ -1,7 +1,7 @@
 """Tests for SimBroker core: market fill price (slippage), cash/position updates,
 fees, idempotency, and account valuation (M2.5)."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -86,13 +86,13 @@ def test_cash_and_position_update_on_buy() -> None:
     assert broker.get_account().cash == Decimal("100000") - Decimal("1000")
 
 
-def test_fees_applied() -> None:
+def test_regulatory_fee_on_sell_only() -> None:
     broker = _broker(bid="100", ask="100", cash="100000", fees=FeesModel(regulatory_bps=5.0))
-    fill = broker.get_order(broker.submit_order(_order(Side.BUY, qty=10)))
-    notional = Decimal("1000")
-    expected_fee = notional * Decimal("5.0") / Decimal("10000")
-    assert fill.fees == expected_fee
-    assert broker.get_account().cash == Decimal("100000") - notional - expected_fee
+    buy_fill = broker.get_order(broker.submit_order(_order(Side.BUY, qty=10, cid="b")))
+    assert buy_fill.fees == Decimal("0")  # regulatory fee is sell-side only
+
+    sell_fill = broker.get_order(broker.submit_order(_order(Side.SELL, qty=10, cid="s")))
+    assert sell_fill.fees == Decimal("1000") * Decimal("5.0") / Decimal("10000")
 
 
 def test_sell_reduces_position_and_keeps_basis() -> None:
@@ -155,3 +155,84 @@ def test_account_equity_marks_position() -> None:
     acct = broker.get_account()
     assert acct.equity == Decimal("100000")
     assert acct.buying_power == acct.cash
+
+
+# --- short / flip / realized P&L / marking ---------------------------------- #
+
+
+def test_short_sell_from_flat() -> None:
+    broker = _broker(bid="100", ask="100", cash="100000")
+    broker.submit_order(_order(Side.SELL, qty=10))
+    pos = broker.get_positions()[0]
+    assert pos.quantity == -10
+    assert pos.avg_price == Decimal("100")
+
+
+def test_sell_more_than_held_flips_to_short() -> None:
+    broker = _broker(bid="100", ask="100", cash="100000")
+    broker.submit_order(_order(Side.BUY, qty=5, cid="b"))
+    broker.submit_order(_order(Side.SELL, qty=8, cid="s"))  # flip through zero
+    pos = broker.get_positions()[0]
+    assert pos.quantity == -3
+    assert pos.avg_price == Decimal("100")  # basis resets to the new side's price
+
+
+def test_full_sell_drops_position() -> None:
+    broker = _broker(bid="100", ask="100", cash="100000")
+    broker.submit_order(_order(Side.BUY, qty=10, cid="b"))
+    broker.submit_order(_order(Side.SELL, qty=10, cid="s"))
+    assert broker.get_positions() == []
+
+
+def _two_quote_broker(p1: str, p2: str) -> tuple[SimBroker, FakeClock]:
+    q1 = Quote("AAPL", NOW, Decimal(p1), Decimal(p1), Decimal(p1), 1000)
+    q2 = Quote("AAPL", NOW + timedelta(hours=1), Decimal(p2), Decimal(p2), Decimal(p2), 1000)
+    clock = FakeClock(NOW)
+    data = FakeMarketDataProvider(quotes={"AAPL": [q1, q2]})
+    return SimBroker(data, clock, starting_cash=Decimal("100000")), clock
+
+
+def test_equity_reflects_realized_pnl() -> None:
+    broker, clock = _two_quote_broker("100", "120")
+    broker.submit_order(_order(Side.BUY, qty=10, cid="b"))  # -1000
+    clock.advance(timedelta(hours=1))
+    broker.submit_order(_order(Side.SELL, qty=10, cid="s"))  # +1200 (sell @ 120)
+    assert broker.get_positions() == []
+    acct = broker.get_account()
+    assert acct.cash == Decimal("100200")  # +200 realized
+    assert acct.equity == Decimal("100200")
+
+
+def test_marks_to_current_quote_not_last_fill() -> None:
+    broker, clock = _two_quote_broker("100", "110")
+    broker.submit_order(_order(Side.BUY, qty=10))  # filled @ 100
+    clock.advance(timedelta(hours=1))  # price moved to 110, no new fill
+    pos = broker.get_positions()[0]
+    assert pos.market_value == Decimal("1100")  # marked to current 110, not fill 100
+    assert broker.get_account().equity == Decimal("100100")
+
+
+def test_negative_fill_price_is_atomic() -> None:
+    broker = _broker(
+        bid="100", ask="100", cash="100000", slippage=SlippageModel("fixed", Decimal("200"))
+    )
+    with pytest.raises(ValueError):
+        broker.submit_order(_order(Side.SELL, qty=1))
+    assert broker.get_account().cash == Decimal("100000")  # no state mutated
+    assert broker.get_positions() == []
+
+
+def test_models_from_config() -> None:
+    from trader.config.models import FeesModelConfig, SlippageModelConfig
+
+    s = SlippageModel.from_config(SlippageModelConfig(type="bps", value=10.0))
+    assert s.kind == "bps"
+    assert s.value == Decimal("10.0")
+    f = FeesModel.from_config(FeesModelConfig(commission=Decimal("1"), regulatory_bps=5.0))
+    assert f.commission == Decimal("1")
+    assert f.regulatory_bps == 5.0
+
+
+def test_unknown_slippage_kind_rejected() -> None:
+    with pytest.raises(ValueError, match="unknown slippage kind"):
+        SlippageModel("bogus", Decimal("1"))

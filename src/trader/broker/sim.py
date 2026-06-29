@@ -7,6 +7,9 @@ quote read here is post-decision) at ``ask + slippage`` (BUY) / ``bid - slippage
 (SELL), with a ``FeesModel`` (Schwab $0 commission + regulatory bps) applied so
 backtest P&L tracks live economics. Cash and positions are tracked in memory.
 
+Money keeps full ``Decimal`` precision (no penny rounding) — intentional for a
+deterministic backtest; reconciliation against live fills (M4) rounds to cents.
+
 This module owns market-order fills; limit + partial fills are added in M2.6.
 """
 
@@ -29,6 +32,10 @@ class SlippageModel:
     kind: str = "bps"
     value: Decimal = Decimal("0")
 
+    def __post_init__(self) -> None:
+        if self.kind not in {"bps", "fixed", "vol"}:
+            raise ValueError(f"unknown slippage kind {self.kind!r}")
+
     def amount(self, reference_price: Decimal) -> Decimal:
         if self.kind == "bps":
             return reference_price * self.value / Decimal(10000)
@@ -49,8 +56,13 @@ class FeesModel:
     commission: Decimal = Decimal("0")
     regulatory_bps: float = 0.0
 
-    def fee(self, notional: Decimal) -> Decimal:
-        regulatory = notional * Decimal(str(self.regulatory_bps)) / Decimal(10000)
+    def fee(self, notional: Decimal, side: Side) -> Decimal:
+        # Regulatory (SEC/TAF) fees are sell-side only; commission applies both sides.
+        regulatory = (
+            notional * Decimal(str(self.regulatory_bps)) / Decimal(10000)
+            if side is Side.SELL
+            else Decimal("0")
+        )
         return self.commission + regulatory
 
     @classmethod
@@ -105,12 +117,11 @@ class SimBroker:
         quote = self._data.get_quote(order.symbol, self._clock.now())
         price = self._fill_price(order.side, quote)
         notional = Decimal(order.quantity) * price
-        fees = self._fees.fee(notional)
-        self._apply_cash(order.side, notional, fees)
-        self._apply_position(order.symbol, order.side, order.quantity, price)
+        fees = self._fees.fee(notional, order.side)
 
-        self._seq += 1
-        broker_order_id = f"SIM-{self._seq}"
+        # Build (and validate: price/fees nonneg) the Fill BEFORE mutating cash or
+        # positions, so a bad fill (e.g. slippage > price) can't leave half-applied state.
+        broker_order_id = f"SIM-{self._seq + 1}"
         fill = Fill(
             client_order_id=order.client_order_id,
             broker_order_id=broker_order_id,
@@ -121,6 +132,9 @@ class SimBroker:
             ts=self._clock.now(),
             status=OrderStatus.FILLED,
         )
+        self._apply_cash(order.side, notional, fees)
+        self._apply_position(order.symbol, order.side, order.quantity, price)
+        self._seq += 1
         self._orders[broker_order_id] = fill
         self._by_client[order.client_order_id] = broker_order_id
         return broker_order_id
@@ -143,7 +157,7 @@ class SimBroker:
                 symbol=symbol,
                 quantity=lot.quantity,
                 avg_price=lot.avg_price,
-                market_value=Decimal(lot.quantity) * lot.last_price,
+                market_value=Decimal(lot.quantity) * self._mark_price(symbol, lot.last_price),
             )
             for symbol, lot in self._lots.items()
             if lot.quantity != 0
@@ -151,13 +165,23 @@ class SimBroker:
 
     def get_account(self) -> Account:
         market_value = sum(
-            (Decimal(lot.quantity) * lot.last_price for lot in self._lots.values()),
+            (
+                Decimal(lot.quantity) * self._mark_price(sym, lot.last_price)
+                for sym, lot in self._lots.items()
+            ),
             Decimal("0"),
         )
         equity = self._cash + market_value
         return Account(cash=self._cash, buying_power=self._cash, equity=equity)
 
     # --- internals -------------------------------------------------------- #
+
+    def _mark_price(self, symbol: str, fallback: Decimal) -> Decimal:
+        """Current mark from the data feed (mark-to-market); last fill if unavailable."""
+        try:
+            return self._data.get_quote(symbol, self._clock.now()).last
+        except (LookupError, ValueError):
+            return fallback
 
     def _fill_price(self, side: Side, quote: Quote) -> Decimal:
         if side is Side.BUY:

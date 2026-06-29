@@ -94,6 +94,19 @@ def test_run_requires_paper_mode(tmp_path: Path) -> None:
     assert "requires mode=paper" in result.output
 
 
+def test_no_real_order_path_pre_m5() -> None:
+    # CI tripwire (design safety gate): no real-order broker exists before M5, and the
+    # read-only Schwab client exposes no order placement/cancel. M5 updates this test.
+    import trader.broker
+    from trader.schwab.endpoints import SchwabClient
+
+    assert "SchwabBroker" not in dir(trader.broker)  # only SimBroker until M5
+    order_methods = [
+        m for m in dir(SchwabClient) if any(k in m for k in ("submit", "order", "cancel"))
+    ]
+    assert order_methods == [], f"unexpected order path on SchwabClient: {order_methods}"
+
+
 def test_run_paper_without_credentials_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

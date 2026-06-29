@@ -200,10 +200,9 @@ def run(
             clock=clock,
         )
         if once:
-            daemon.register()
             for binding in bindings:
                 for slot in binding.slots if binding.enabled else ():
-                    daemon.fire(binding.strategy_id, slot.slot_id)
+                    daemon.fire(binding.strategy_id, slot.slot_id)  # callbacks built at init
             typer.echo("run: one tick complete (--once)")
             return
         daemon.start()

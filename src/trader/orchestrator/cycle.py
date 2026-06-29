@@ -24,10 +24,12 @@ SAFETY: M4 uses FakeBroker (tests) or SimBroker (paper) only — no real orders.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Protocol
 
@@ -101,12 +103,17 @@ class ApproveAllRiskManager:
         return resolved
 
 
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass(frozen=True)
 class AuditEvent:
-    cycle_id: str
+    cycle_id: str  # correlation id tying every row of one cycle's chain together
     strategy_id: str
     kind: str  # order_pending | fill | rejected | cycle_error
     detail: str
+    payload: Mapping[str, object] = field(default_factory=dict)
 
 
 class AuditSink(Protocol):
@@ -114,13 +121,37 @@ class AuditSink(Protocol):
 
 
 class ListAuditSink:
-    """In-memory audit sink (default); the SQLite-backed audit chain is wired in M4."""
+    """In-memory audit sink (default for tests)."""
 
     def __init__(self) -> None:
         self.events: list[AuditEvent] = []
 
     def record(self, event: AuditEvent) -> None:
         self.events.append(event)
+
+
+class SqliteAuditSink:
+    """Durable audit chain in the ``audit_log`` table (design §12): one JSON row per
+    event, correlated by ``cycle_id``, so the inputs->decision->risk->order->fill chain is
+    reconstructable. The paper pipeline and live share this schema."""
+
+    def __init__(self, conn: sqlite3.Connection, *, now: Callable[[], datetime] = _utcnow) -> None:
+        self._conn = conn
+        self._now = now
+
+    def record(self, event: AuditEvent) -> None:
+        payload = json.dumps({"detail": event.detail, **dict(event.payload)}, default=str)
+        self._conn.execute(
+            "INSERT INTO audit_log (ts, cycle_id, strategy_id, kind, payload) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                self._now().astimezone(UTC).isoformat(),
+                event.cycle_id,
+                event.strategy_id,
+                event.kind,
+                payload,
+            ),
+        )
 
 
 @dataclass
@@ -229,16 +260,43 @@ class Orchestrator:
             return
         final_order = verdict.adjusted_order or order  # honour a risk clamp
         # Write-ahead: persist the intent (with its client_order_id) BEFORE submit so a
-        # crash mid-submit is recoverable / idempotent.
+        # crash mid-submit is recoverable / idempotent. The payload carries the
+        # decision + risk verdict so the audit chain reconstructs inputs->...->order.
         self._audit.record(
-            AuditEvent(cycle_id, strategy_id, "order_pending", final_order.client_order_id)
+            AuditEvent(
+                cycle_id,
+                strategy_id,
+                "order_pending",
+                final_order.client_order_id,
+                payload={
+                    "symbol": final_order.symbol,
+                    "side": final_order.side.value,
+                    "quantity": final_order.quantity,
+                    "order_type": final_order.order_type.value,
+                    "rationale": rd.action.value,
+                    "clamped_from": order.quantity if final_order is not order else None,
+                },
+            )
         )
         broker_order_id = self._broker.submit_order(final_order)
         # TODO(M5, §4.2): poll get_order until a terminal status (FILLED/PARTIAL/REJECTED)
         # with a bounded timeout; M4's SimBroker/FakeBroker fill synchronously.
         fill = self._broker.get_order(broker_order_id)
         self._attribution.apply(fill, strategy_id, final_order.side)
-        self._audit.record(AuditEvent(cycle_id, strategy_id, "fill", fill.broker_order_id))
+        self._audit.record(
+            AuditEvent(
+                cycle_id,
+                strategy_id,
+                "fill",
+                fill.broker_order_id,
+                payload={
+                    "symbol": fill.symbol,
+                    "quantity": fill.quantity,
+                    "price": fill.price,
+                    "status": fill.status.value,
+                },
+            )
+        )
         result.orders.append(final_order)
         result.fills.append(fill)
 
@@ -252,14 +310,23 @@ class Orchestrator:
             cid=order.client_order_id,
             reason=reason,
         )
-        self._audit.record(AuditEvent(cycle_id, strategy_id, "rejected", order.client_order_id))
+        self._audit.record(
+            AuditEvent(
+                cycle_id,
+                strategy_id,
+                "rejected",
+                order.client_order_id,
+                payload={"symbol": order.symbol, "reason": reason},
+            )
+        )
         result.rejected.append(order)
 
     @staticmethod
     def _default_day_state(account: Account, now: datetime) -> DayState:
-        # Neutral day-state for callers that don't track one yet (real per-day counters /
-        # start-of-day equity are wired by the paper pipeline, M4.7). loss/trades = 0 means
-        # the daily-loss / trade-count rails don't trip under this default.
+        # Neutral day-state for callers that don't track one yet. loss/trades = 0 means the
+        # daily-loss / trade-count rails do NOT trip under this default, so paper mode does
+        # not enforce those two account-wide rails; real per-day counters / start-of-day
+        # equity (from the daily_counters table) are wired with live trading in M5.
         return DayState(
             trading_date=now.date(),
             start_of_day_equity=account.equity,

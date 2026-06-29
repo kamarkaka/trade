@@ -155,12 +155,16 @@ def run(
     ] = False,
 ) -> None:
     """Run the PAPER trading daemon (SimBroker against live quotes; no real orders)."""
+    import os
     import time as _time
 
     from trader.broker import SimBroker
     from trader.core.enums import Mode
-    from trader.orchestrator.cycle import Orchestrator
+    from trader.observability.alerting import build_alerter
+    from trader.observability.heartbeat import Heartbeat
+    from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
     from trader.orchestrator.lock import GlobalCycleLock
+    from trader.risk.gate import RiskManager
     from trader.scheduler.calendar import TradingCalendar
     from trader.scheduler.daemon import SchedulerDaemon
     from trader.sizing.sizer import size_decision
@@ -206,18 +210,44 @@ def run(
     run_migrations(state)
     cash = Decimal(_BACKTEST_STARTING_CASH)
 
+    # Redundant alerting + per-strategy risk overrides assembled once for the run.
+    alerter = build_alerter(cfg.alerting.channels, environ=os.environ)
+    overrides = {b.strategy_id: b.risk_overrides for b in bindings if b.risk_overrides}
+    risk = RiskManager(
+        account_config=cfg.risk,
+        clock=clock,
+        overrides_by_strategy=overrides,
+        default_policy=cfg.risk.conflict_policy,
+    )
+    # The heartbeat gets its OWN connection so its dedicated executor thread never shares
+    # a sqlite3.Connection with the cycle worker (cross-thread concurrent use is unsafe).
+    heartbeat = Heartbeat(
+        connect(Path(cfg.observability.db_path)),
+        clock=clock,
+        max_age_seconds=cfg.alerting.heartbeat_minutes * 60 * 2,
+        alerter=alerter,
+    )
+
     with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
         http = SchwabHttp(schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock)
         data = SchwabMarketData(SchwabClient(http), clock)
         broker = SimBroker(data, clock, starting_cash=cash)  # PAPER: SimBroker only, never real
+        attribution = AttributionLedger(state)
         orchestrator = Orchestrator(
             broker=broker,
             data=data,
             clock=clock,
             cycle_lock=GlobalCycleLock(),
-            attribution=AttributionLedger(state),
+            attribution=attribution,
             sizer=lambda d, sid: size_decision(d, sid, cfg.execution),
+            risk=risk,  # the real fail-closed gate is the single chokepoint
+            audit=SqliteAuditSink(state),  # durable audit chain
         )
+        # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
+        # only for a broker whose positions survive a restart; SimBroker is in-memory (always
+        # flat on restart), so trueing the durable attribution ledger up to it would corrupt
+        # intent and fire a spurious mismatch alert every restart. In-session reconcile lands
+        # with the durable SchwabBroker (M5).
         daemon = SchedulerDaemon(
             bindings=bindings,
             schedule=schedule,
@@ -225,6 +255,8 @@ def run(
             ledger=FiredSlotLedger(state),
             orchestrator=orchestrator,
             clock=clock,
+            alerter=alerter,
+            heartbeat=heartbeat,
         )
         if once:
             for binding in bindings:

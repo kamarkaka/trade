@@ -31,6 +31,15 @@ app = typer.Typer(
     add_completion=False,
 )
 
+# OFFLINE research tools (parameter sweeps). Strictly read-only / no broker — see
+# trader.research (structurally cannot trade; enforced by tests/unit/test_param_sweep.py).
+research_app = typer.Typer(
+    help="OFFLINE research tools — reads cached data only; never trades.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(research_app, name="research")
+
 ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to the YAML config file.")]
 
 
@@ -404,6 +413,94 @@ def _print_backtest_summary(data: dict) -> None:  # type: ignore[type-arg]
                 em["max_drawdown_pct"] if em else "—",
             )
         )
+
+
+def _parse_grid(grid: list[str]) -> dict[str, list[object]]:
+    """Parse ``key=v1,v2`` options into ``{key: [values]}`` (int when integral, else float)."""
+
+    def _coerce(token: str) -> object:
+        try:
+            return int(token)
+        except ValueError:
+            return float(token)
+
+    out: dict[str, list[object]] = {}
+    for spec in grid:
+        if "=" not in spec:
+            raise ValueError(f"bad --grid {spec!r}; expected key=v1,v2")
+        key, _, values = spec.partition("=")
+        key = key.strip()
+        try:
+            out[key] = [_coerce(v.strip()) for v in values.split(",") if v.strip()]
+        except ValueError as exc:
+            raise ValueError(f"bad --grid value in {spec!r}: {exc}") from exc
+        if not out[key]:
+            raise ValueError(f"--grid {spec!r} has no values")
+    return out
+
+
+@research_app.command("sweep")
+def research_sweep(
+    strategy: Annotated[str, typer.Option("--strategy", help="Strategy family to sweep.")],
+    grid: Annotated[
+        list[str],
+        typer.Option("--grid", help="Param grid, repeatable: key=v1,v2 (e.g. lookback=10,20)."),
+    ],
+    data: Annotated[str, typer.Option("--data", help="Path to the read-only Parquet data cache.")],
+    symbols: Annotated[
+        str, typer.Option("--symbols", help="Comma-separated symbols (default: all in cache).")
+    ] = "",
+    start: Annotated[str, typer.Option("--start", help="Inclusive start date (YYYY-MM-DD).")] = "",
+    end: Annotated[str, typer.Option("--end", help="Inclusive end date (YYYY-MM-DD).")] = "",
+    out: Annotated[
+        str, typer.Option("--out", help="Output directory for the results CSV.")
+    ] = "research_results",
+) -> None:
+    """RESEARCH ONLY — no orders, no broker, offline. Vectorized parameter sweep over CACHED
+    bars to SHORTLIST params; re-validate winners with `trader backtest` before any live use."""
+    # Banner first: make it unmistakable this path cannot trade.
+    typer.echo("=== RESEARCH ONLY — no orders, no broker, offline ===")
+    from trader.research import param_sweep  # imports ONLY pandas/numpy/stdlib (no broker)
+
+    try:
+        param_grid = _parse_grid(grid)
+    except ValueError as exc:
+        typer.echo(f"research error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    start_d = _parse_day(start, "--start", context="research").date() if start else None
+    end_d = _parse_day(end, "--end", context="research").date() if end else None
+
+    syms = [s.strip() for s in symbols.split(",") if s.strip()] or param_sweep.available_symbols(
+        data
+    )
+    if not syms:
+        typer.echo(f"research error: no symbols given and none cached under {data}", err=True)
+        raise typer.Exit(1)
+
+    bars, missing = param_sweep.load_bars_for_symbols(data, syms, start_d, end_d)
+    for sym in missing:
+        typer.echo(
+            f"research warning: no cached data for {sym} — skipped (never fetched)", err=True
+        )
+    if not bars:
+        typer.echo("research error: no cached data for any requested symbol", err=True)
+        raise typer.Exit(1)
+
+    try:
+        results = param_sweep.sweep(strategy, param_grid, bars)
+    except ValueError as exc:
+        typer.echo(f"research error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    out_dir = Path(out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    grid_tag = "_".join(sorted(param_grid))
+    out_path = out_dir / f"sweep-{strategy}-{grid_tag}.csv"
+    results.to_csv(out_path, index=False)
+    typer.echo(f"research: {len(results)} param combo(s) over {len(bars)} symbol(s)")
+    typer.echo(results.to_string(index=False) if not results.empty else "(no results)")
+    typer.echo(f"research: results written to {out_path}")
 
 
 @app.command()

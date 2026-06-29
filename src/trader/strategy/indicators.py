@@ -17,9 +17,14 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 
 from trader.core import Bar
+
+# Pin a fixed Decimal context for ALL indicator arithmetic so results are invariant to the
+# (process-global, mutable) ambient context -- the math must be bit-for-bit reproducible
+# (parity with the research harness + the golden runs, design §9.5).
+_CTX = Context(prec=28, rounding=ROUND_HALF_EVEN)
 
 
 def _check_window(window: int) -> None:
@@ -41,7 +46,8 @@ def rolling_mean(values: Sequence[Decimal], window: int) -> Decimal | None:
     _validate(values)
     if len(values) < window:
         return None
-    return sum(values[-window:], Decimal(0)) / Decimal(window)
+    with localcontext(_CTX):
+        return sum(values[-window:], Decimal(0)) / Decimal(window)
 
 
 def sma(values: Sequence[Decimal], window: int) -> Decimal | None:
@@ -60,9 +66,10 @@ def rolling_std(values: Sequence[Decimal], window: int, ddof: int = 1) -> Decima
     if denom <= 0:
         return None  # not enough degrees of freedom (e.g. window=1, ddof=1)
     w = values[-window:]
-    mean = sum(w, Decimal(0)) / Decimal(window)
-    variance = sum(((x - mean) ** 2 for x in w), Decimal(0)) / Decimal(denom)
-    return variance.sqrt()
+    with localcontext(_CTX):
+        mean = sum(w, Decimal(0)) / Decimal(window)
+        variance = sum(((x - mean) ** 2 for x in w), Decimal(0)) / Decimal(denom)
+        return variance.sqrt()
 
 
 def zscore(values: Sequence[Decimal], window: int) -> Decimal | None:
@@ -72,7 +79,8 @@ def zscore(values: Sequence[Decimal], window: int) -> Decimal | None:
     std = rolling_std(values, window)
     if mean is None or std is None or std == 0:
         return None
-    return (values[-1] - mean) / std
+    with localcontext(_CTX):
+        return (values[-1] - mean) / std
 
 
 def ema(values: Sequence[Decimal], window: int) -> Decimal | None:
@@ -82,21 +90,23 @@ def ema(values: Sequence[Decimal], window: int) -> Decimal | None:
     _validate(values)
     if len(values) < window:
         return None
-    alpha = Decimal(2) / Decimal(window + 1)
-    e = sum(values[:window], Decimal(0)) / Decimal(window)  # seed = SMA of the first window
-    for v in values[window:]:
-        e = alpha * v + (Decimal(1) - alpha) * e
-    return e
+    with localcontext(_CTX):
+        alpha = Decimal(2) / Decimal(window + 1)
+        e = sum(values[:window], Decimal(0)) / Decimal(window)  # seed = SMA of first window
+        for v in values[window:]:
+            e = alpha * v + (Decimal(1) - alpha) * e
+        return e
 
 
 def simple_returns(values: Sequence[Decimal]) -> list[Decimal]:
     """Period-over-period simple returns (v[i]-v[i-1])/v[i-1]. Raises if a base value is 0."""
     _validate(values)
     out: list[Decimal] = []
-    for prev, cur in itertools.pairwise(values):
-        if prev == 0:
-            raise ValueError("cannot compute a return from a zero base value")
-        out.append((cur - prev) / prev)
+    with localcontext(_CTX):
+        for prev, cur in itertools.pairwise(values):
+            if prev == 0:
+                raise ValueError("cannot compute a return from a zero base value")
+            out.append((cur - prev) / prev)
     return out
 
 

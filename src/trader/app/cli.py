@@ -9,7 +9,7 @@ out by later milestones: ``backtest`` (M2), ``run`` (M3/M4), ``reconcile`` (M4),
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
@@ -337,23 +337,8 @@ def backtest(
     """Run a multi-strategy backtest over CACHED data and write a per-strategy + combined
     report (JSON/HTML + manifest). This path is fully OFFLINE and deterministic — it never
     touches the broker or the network (no real-money path; design safety gate)."""
-    import itertools
-    import tempfile
-
-    import trader.strategy  # noqa: F401 - registers built-in strategies into REGISTRY
-    from trader.backtest import build_manifest, run_multi_strategy, write_manifest
-    from trader.backtest.report import BacktestRunResult, FireRecord, build_report
-    from trader.broker import SimBroker
-    from trader.clock import VirtualClock
-    from trader.core import Decision, Order
-    from trader.data.cache import ParquetCache
-    from trader.data.historical import HistoricalDataProvider
-    from trader.scheduler.calendar import TradingCalendar
-    from trader.sizing.sizer import size_decision
-    from trader.state.attribution import AttributionLedger
-    from trader.state.db import connect
-    from trader.state.migrate import run_migrations
-    from trader.strategy import load_bindings
+    from trader.backtest import write_manifest
+    from trader.backtest.runner import run_backtest_report
 
     cfg = _load(config)
     start_d = _parse_day(start, "--start", context="backtest").date()
@@ -363,79 +348,28 @@ def backtest(
         raise typer.Exit(1)
 
     try:
-        schedule, bindings = load_bindings(cfg)
+        run = run_backtest_report(cfg, start_d, end_d)
     except ValueError as exc:
         typer.echo(f"backtest error: {exc}", err=True)
         raise typer.Exit(1) from exc
-    enabled = [b for b in bindings if b.enabled]
-    if not enabled:
-        typer.echo("backtest error: no enabled strategy in config", err=True)
-        raise typer.Exit(1)
-    universe = sorted({sym for b in enabled for sym in b.universe})
-    seed = schedule.base_seed or 0
-    cash = Decimal(_BACKTEST_STARTING_CASH)
-
-    clock = VirtualClock(datetime.combine(start_d, time.min, tzinfo=UTC))
-    cache = ParquetCache(cfg.observability.data_cache)
-    data = HistoricalDataProvider(cache, clock)
-    broker = SimBroker(data, clock, starting_cash=cash)
-
-    # Deterministic client_order_ids (in trigger order) so the report is reproducible.
-    ids = itertools.count()
-
-    def _sizer(decision: Decision, strategy_id: str) -> Order | None:
-        return size_decision(
-            decision, strategy_id, cfg.execution, id_factory=lambda: f"bt-{next(ids)}"
-        )
-
-    # Throwaway state DB for per-strategy attribution (backtest writes nothing durable).
-    with tempfile.TemporaryDirectory() as state_dir:
-        conn = connect(Path(state_dir) / "state.sqlite")
-        run_migrations(conn)
-        result = run_multi_strategy(
-            bindings=enabled,
-            schedule=schedule,
-            calendar=TradingCalendar(),
-            data=data,
-            broker=broker,
-            attribution=AttributionLedger(conn),
-            sizer=_sizer,
-            clock=clock,
-            start=start_d,
-            end=end_d,
-        )
-        conn.close()
-
-    data_hashes = {symbol: cache.content_hash(symbol) for symbol in universe}
-    manifest = build_manifest(cfg, data_hashes, seed)
-    run_result = BacktestRunResult(
-        combined_equity_curve=result.equity_curve,
-        per_strategy_trades=result.per_strategy_trades,
-        fire_log=[
-            FireRecord(t.strategy_id, t.slot_id, t.fire_ts, t.drift_seconds, t.seed)
-            for t in result.fire_log
-        ],
-    )
-    doc = build_report(run_result, manifest, strategy_ids=[b.strategy_id for b in enabled])
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")  # microseconds avoid collisions
     out_dir = Path(out) / f"{start_d}-{end_d}-{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
     if report_json:
-        doc.to_json(out_dir / "report.json")
+        run.doc.to_json(out_dir / "report.json")
     if report_html:
-        doc.to_html(out_dir / "report.html")
-    write_manifest(manifest, out_dir / "manifest.json")
+        run.doc.to_html(out_dir / "report.html")
+    write_manifest(run.manifest, out_dir / "manifest.json")
 
-    n_fills = sum(len(t) for t in result.per_strategy_trades.values())
-    if n_fills == 0:
+    if run.num_fills == 0:
         typer.echo(
-            "backtest warning: no fills produced — check that data is cached for "
-            f"{universe} over {start_d}..{end_d}",
+            "backtest warning: no fills produced — check that data is cached over "
+            f"{start_d}..{end_d}",
             err=True,
         )
-    _print_backtest_summary(doc.data)
-    typer.echo(f"backtest: {n_fills} fills; report written to {out_dir}")
+    _print_backtest_summary(run.doc.data)
+    typer.echo(f"backtest: {run.num_fills} fills; report written to {out_dir}")
 
 
 def _print_backtest_summary(data: dict) -> None:  # type: ignore[type-arg]

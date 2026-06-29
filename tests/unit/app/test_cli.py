@@ -54,10 +54,69 @@ def test_healthcheck_invalid_config_exits_nonzero(tmp_path: Path) -> None:
 
 
 def test_stub_commands_run() -> None:
-    for argv in (["run"], ["reconcile"], ["kill", "--on"]):
+    for argv in (["reconcile"], ["kill", "--on"]):
         result = runner.invoke(app, argv)
         assert result.exit_code == 0, argv
         assert "not implemented" in result.output
+
+
+def _write_run_config(path: Path, mode: str, data_cache: Path) -> None:
+    path.write_text(
+        f"""
+mode: {mode}
+strategies:
+  - id: momentum
+    name: threshold
+    universe: [AAPL]
+    slots:
+      - {{id: open, time: "09:45"}}
+observability:
+  data_cache: "{data_cache}"
+  db_path: "{data_cache / "state.sqlite"}"
+""",
+        encoding="utf-8",
+    )
+
+
+def test_run_refuses_live_mode(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.yaml"
+    _write_run_config(cfg, "live", tmp_path)
+    result = runner.invoke(app, ["run", "--config", str(cfg)])
+    assert result.exit_code != 0
+    assert "live mode is refused" in result.output
+
+
+def test_run_requires_paper_mode(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.yaml"
+    _write_run_config(cfg, "backtest", tmp_path)
+    result = runner.invoke(app, ["run", "--config", str(cfg)])
+    assert result.exit_code != 0
+    assert "requires mode=paper" in result.output
+
+
+def test_no_real_order_path_pre_m5() -> None:
+    # CI tripwire (design safety gate): no real-order broker exists before M5, and the
+    # read-only Schwab client exposes no order placement/cancel. M5 updates this test.
+    import trader.broker
+    from trader.schwab.endpoints import SchwabClient
+
+    assert "SchwabBroker" not in dir(trader.broker)  # only SimBroker until M5
+    order_methods = [
+        m for m in dir(SchwabClient) if any(k in m for k in ("submit", "order", "cancel"))
+    ]
+    assert order_methods == [], f"unexpected order path on SchwabClient: {order_methods}"
+
+
+def test_run_paper_without_credentials_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)
+    monkeypatch.delenv("SCHWAB_APP_SECRET", raising=False)
+    cfg = tmp_path / "c.yaml"
+    _write_run_config(cfg, "paper", tmp_path)
+    result = runner.invoke(app, ["run", "--config", str(cfg), "--once"])
+    assert result.exit_code != 0
+    assert "run error" in result.output  # mode ok, fails at credential resolution
 
 
 def test_status_reports_token_age(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

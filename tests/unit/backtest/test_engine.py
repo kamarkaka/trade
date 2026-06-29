@@ -66,9 +66,22 @@ def _bars() -> pd.DataFrame:
     )
 
 
-def _engine(tmp_path: Path) -> BacktestEngine:
+class AlwaysSell:
+    def decide(
+        self,
+        snapshot: MarketSnapshot,
+        positions: Sequence[Position],
+        account: Account,
+        data: MarketDataProvider,
+        clock: Clock,
+    ) -> Sequence[Decision]:
+        return [Decision(action=Action.SELL, symbol=s, quantity=1) for s in snapshot.quotes]
+
+
+def _engine(tmp_path: Path, *, symbols: Sequence[str] = ("AAPL",)) -> BacktestEngine:
     cache = ParquetCache(tmp_path)
-    cache.write_bars("AAPL", _bars())
+    for symbol in symbols:
+        cache.write_bars(symbol, _bars())
     clock = VirtualClock(datetime(2023, 1, 1, tzinfo=UTC))
     data = HistoricalDataProvider(cache, clock)
     broker = SimBroker(data, clock, starting_cash=Decimal("100000"))
@@ -112,3 +125,41 @@ def test_fill_uses_next_trigger_bar_not_decision_bar(tmp_path: Path) -> None:
         AlwaysBuy(1), universe=["AAPL"], slots=[SLOT], start=START, end=END
     )
     assert result.fills[0].price == Decimal("103")  # next bar, no lookahead
+
+
+def test_sell_decisions_produce_sell_fills(tmp_path: Path) -> None:
+    result = _engine(tmp_path).run(
+        AlwaysSell(), universe=["AAPL"], slots=[SLOT], start=START, end=END
+    )
+    assert len(result.fills) == 4
+    assert all(f.quantity == 1 for f in result.fills)
+
+
+def test_multi_symbol_is_deterministic(tmp_path: Path) -> None:
+    syms = ("AAPL", "MSFT")
+    a = _engine(tmp_path / "a", symbols=syms).run(
+        AlwaysBuy(1), universe=list(syms), slots=[SLOT], start=START, end=END
+    )
+    b = _engine(tmp_path / "b", symbols=syms).run(
+        AlwaysBuy(1), universe=list(syms), slots=[SLOT], start=START, end=END
+    )
+    assert a.fills == b.fills
+    assert len(a.fills) == 8  # 2 symbols * 4 deferred fills
+    assert {f.symbol for f in a.fills} == {"AAPL", "MSFT"}
+
+
+def test_trigger_without_data_is_skipped(tmp_path: Path) -> None:
+    # start a day before any bar exists -> that trigger has no quotes and no crash
+    result = _engine(tmp_path).run(
+        AlwaysBuy(1), universe=["AAPL"], slots=[SLOT], start=date(2023, 1, 1), end=END
+    )
+    assert len(result.equity_curve) == 6  # Jan 1..6
+    assert len(result.fills) == 4  # Jan-1 contributes nothing
+
+
+def test_unsorted_slots_do_not_break_forward_only_clock(tmp_path: Path) -> None:
+    # _triggers must sort slots so the VirtualClock never moves backward
+    result = _engine(tmp_path).run(
+        AlwaysBuy(1), universe=["AAPL"], slots=[time(15, 0), time(9, 30)], start=START, end=END
+    )
+    assert len(result.equity_curve) == 10  # 5 days * 2 slots, no exception

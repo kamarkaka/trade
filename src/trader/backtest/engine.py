@@ -70,6 +70,9 @@ class BacktestEngine:
             quotes = self._snapshot_quotes(universe, fire_ts)
 
             # 1) Fill orders decided at the previous trigger against THIS bar.
+            # NOTE: with the default uncapped SimBroker these fill fully in one shot.
+            # A partially-filled remainder (only possible once ADV caps are configured)
+            # is NOT yet carried across triggers — that lifecycle is wired in M3.
             for order, side in pending:
                 fill = self._broker.get_order(self._broker.submit_order(order))
                 if fill.quantity > 0:
@@ -93,7 +96,7 @@ class BacktestEngine:
             )
             for decision in decisions:
                 if decision.action is Action.HOLD or decision.quantity <= 0:
-                    continue
+                    continue  # quantity<=0 is belt-and-suspenders (Decision rejects it)
                 order_seq += 1
                 side = Side.BUY if decision.action is Action.BUY else Side.SELL
                 pending.append(
@@ -110,11 +113,14 @@ class BacktestEngine:
                     )
                 )
 
+        # The final trigger's decisions remain in `pending` and are intentionally
+        # discarded — there is no next bar to fill them against (no-lookahead).
         return BacktestResult(fills=fills, equity_curve=self._portfolio.equity_series())
 
     def _advance(self, fire_ts: datetime) -> None:
-        # The engine drives a VirtualClock forward; tolerate any Clock by only
-        # advancing when the concrete clock exposes advance_to.
+        # Backtest drives a VirtualClock forward to each trigger. Live (M3) injects a
+        # RealClock with no advance_to — wall-clock time flows on its own — so this
+        # intentionally no-ops there rather than forcing the time.
         advance_to = getattr(self._clock, "advance_to", None)
         if callable(advance_to):
             advance_to(fire_ts)

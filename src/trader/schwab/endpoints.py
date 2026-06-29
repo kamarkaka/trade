@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from trader.observability.logging import register_secret
+
 from .constants import ACCOUNT_NUMBERS_PATH, PRICEHISTORY_PATH, QUOTES_PATH
 from .http import SchwabHttp
 from .models import (
@@ -66,5 +68,12 @@ class SchwabClient:
         return parse_price_history(self._http.get_json(PRICEHISTORY_PATH, params=params))
 
     def get_account_numbers(self) -> list[AccountNumberMapping]:
-        """Resolve raw account numbers to the hashed ids used by trading endpoints."""
-        return parse_account_numbers(self._http.get_json(ACCOUNT_NUMBERS_PATH))
+        """Resolve raw account numbers to the hashed ids used by trading endpoints.
+
+        The raw account number is PII; register it as a scrub literal (like tokens)
+        so it can never leak into logs even via free text (§13).
+        """
+        mappings = parse_account_numbers(self._http.get_json(ACCOUNT_NUMBERS_PATH))
+        for mapping in mappings:
+            register_secret(mapping.account_number)
+        return mappings

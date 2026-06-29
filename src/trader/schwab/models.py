@@ -70,10 +70,14 @@ class SchwabPriceHistory:
     candles: tuple[SchwabCandle, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class AccountNumberMapping:
     account_number: str  # raw (PII — never log; resolve to hash_value for use)
     hash_value: str
+
+    def __repr__(self) -> str:
+        # Mask the raw account number so it can't leak via repr/log of the object.
+        return f"AccountNumberMapping(account_number='***', hash_value={self.hash_value!r})"
 
 
 def parse_quote(symbol: str, entry: Any) -> SchwabQuote:

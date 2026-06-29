@@ -80,28 +80,28 @@ observability:
     )
 
 
-def test_run_refuses_live_mode(tmp_path: Path) -> None:
+def test_run_refuses_live_without_confirm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TRADER_CONFIRM_LIVE", raising=False)
     cfg = tmp_path / "c.yaml"
     _write_run_config(cfg, "live", tmp_path)
     result = runner.invoke(app, ["run", "--config", str(cfg)])
     assert result.exit_code != 0
-    assert "live mode is refused" in result.output
+    assert "SECOND confirmation" in result.output  # double-confirm gate (M5.6)
 
 
-def test_run_requires_paper_mode(tmp_path: Path) -> None:
+def test_run_rejects_backtest_mode(tmp_path: Path) -> None:
     cfg = tmp_path / "c.yaml"
     _write_run_config(cfg, "backtest", tmp_path)
     result = runner.invoke(app, ["run", "--config", str(cfg)])
     assert result.exit_code != 0
-    assert "requires mode=paper" in result.output
+    assert "mode=paper or mode=live" in result.output
 
 
-def test_no_real_order_path_until_go_live() -> None:
-    # CI tripwire (design safety gate), updated for M5: SchwabBroker now EXISTS (M5.2) but is
-    # not wired into the daemon -- the paper `run` path constructs SimBroker only and refuses
-    # mode=live. Real orders are only possible via the go-live double-confirm (M5.6) + manual
-    # verification (M5.7). The READ-ONLY Schwab client still exposes no order/cancel path
-    # (writes live on the separate SchwabTradingClient).
+def test_no_real_order_path_until_confirmed_live() -> None:
+    # CI tripwire (design safety gate), updated for M5.6: live REQUIRES a second confirmation
+    # (test_run_refuses_live_without_confirm) so real orders can never start silently; paper
+    # uses SimBroker. The READ-ONLY Schwab client still exposes no order/cancel path (writes
+    # live on the separate SchwabTradingClient).
     import inspect
 
     from trader.app import cli
@@ -111,11 +111,10 @@ def test_no_real_order_path_until_go_live() -> None:
         m for m in dir(SchwabClient) if any(k in m for k in ("submit", "order", "cancel"))
     ]
     assert order_methods == [], f"unexpected order path on read-only SchwabClient: {order_methods}"
-    # The `run` command must not CONSTRUCT the live SchwabBroker (paper uses SimBroker);
-    # mode=live is refused in depth by test_run_refuses_live_mode. (Check construction, not
-    # mere mentions in comments.)
+    # SchwabBroker is only constructed inside the live branch, which is unreachable without the
+    # double-confirm gate; paper still uses SimBroker.
     run_src = inspect.getsource(cli.run)
-    assert "SchwabBroker(" not in run_src, "run must not wire the live broker until go-live (M5.6)"
+    assert "live_confirmed(" in run_src  # the double-confirm gate is present
     assert "SimBroker(" in run_src  # paper path still uses the simulator
 
 

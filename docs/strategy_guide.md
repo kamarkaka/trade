@@ -49,16 +49,17 @@ fails if you break them:
 
 1. `__init__(self, lookback=20, lot=10, **params)` — store typed params from the binding.
 2. `decide(...)` — for each `symbol, quote` in `snapshot.quotes`:
-   - pull trailing bars: `data.get_bars(symbol, start=clock.now()-N, end=clock.now(), freq="1d", asof=clock.now())`;
+   - pull trailing bars: `data.get_bars(symbol, start=clock.now()-N, end=clock.now(), freq="daily", asof=clock.now())` (only `"daily"` is supported today);
    - compute an indicator: `sma(closes_from_bars(bars), self.lookback)`;
    - emit `Decision(Action.BUY/SELL, symbol, self.lot, rationale=...)`, or HOLD (emit nothing)
      when there's insufficient history or no signal.
 
 ## 4. Params
 
-Put strategy parameters in the binding's `params:` (config §11). If you add a pydantic param
-model (see `zscore_revert`'s `ZScoreRevertParams`), they are validated at config-load time;
-otherwise they pass through as a dict. Keep them simple and typed in `__init__`.
+Put strategy parameters in the binding's `params:` (config §11). Today they pass through as an
+unvalidated `dict[str, object]` to your `__init__`, so coerce/validate them there (the template
+does `int(lookback)`, `int(lot)`). Name every param explicitly in `__init__` so a config typo
+fails loudly rather than being silently ignored.
 
 ## 5. Register the class
 
@@ -107,5 +108,7 @@ Run an offline backtest over cached data and read the per-strategy report (see M
 trader backtest --start 2023-01-01 --end 2023-12-31 --config your.yaml
 ```
 
-The SAME `decide` runs in backtest and live (only the injected broker/data/clock differ), so
-a strategy that backtests cleanly behaves identically in paper/live.
+By design the SAME `decide` runs in backtest and live (only the injected broker/data/clock
+differ), so a strategy that backtests cleanly behaves identically in paper/live. (The
+`trader run` daemon wiring that dispatches registry-bound strategies lands in M3/M4; the
+end-to-end backtest report is M6.6/M6.7.)

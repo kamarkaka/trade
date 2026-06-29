@@ -26,6 +26,8 @@ class ExampleTemplateStrategy:
 
     def __init__(self, lookback: int = 20, lot: int = 10, **_params: object) -> None:
         # Keep params typed + simple; they come from the binding's `params:` (config §11).
+        # NOTE: **_params intentionally swallows extra keys (forward-compat). For your own
+        # strategy, prefer naming every param explicitly so a config typo fails loudly.
         self.lookback = int(lookback)
         self.lot = int(lot)
 
@@ -44,7 +46,7 @@ class ExampleTemplateStrategy:
         start = now - timedelta(days=self.lookback * 4 + 10)
         decisions: list[Decision] = []
         for symbol, quote in snapshot.quotes.items():
-            bars = data.get_bars(symbol, start=start, end=now, freq="1d", asof=now)
+            bars = data.get_bars(symbol, start=start, end=now, freq="daily", asof=now)
             average = sma(closes_from_bars(bars), self.lookback)
             if average is None:
                 continue  # insufficient history -> HOLD (emit nothing)

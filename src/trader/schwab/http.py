@@ -14,7 +14,9 @@ Token values never reach logs (scrubbed centrally + the bearer is only in header
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -165,6 +167,8 @@ class SchwabHttp:
     def get_json(self, url: str, *, params: Mapping[str, Any] | None = None) -> Any:
         resp = self.request("GET", url, params=params)
         try:
-            return resp.json()
+            # Decode numbers as Decimal so prices keep full precision (money never
+            # passes through binary float).
+            return json.loads(resp.content, parse_float=Decimal)
         except ValueError as exc:
             raise SchwabBadResponseError("non-JSON response from Schwab") from exc

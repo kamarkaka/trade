@@ -1,0 +1,26 @@
+{
+  "AAPL": {
+    "assetMainType": "EQUITY",
+    "symbol": "AAPL",
+    "quote": {
+      "lastPrice": 150.25,
+      "bidPrice": 150.20,
+      "askPrice": 150.30,
+      "totalVolume": 12345678,
+      "quoteTime": 1782556800000,
+      "closePrice": 149.50
+    }
+  },
+  "MSFT": {
+    "assetMainType": "EQUITY",
+    "symbol": "MSFT",
+    "quote": {
+      "lastPrice": 405.10,
+      "bidPrice": 405.00,
+      "askPrice": 405.20,
+      "totalVolume": 7654321,
+      "quoteTime": 1782556800000,
+      "closePrice": 404.00
+    }
+  }
+}

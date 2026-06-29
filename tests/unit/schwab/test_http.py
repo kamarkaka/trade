@@ -244,3 +244,16 @@ def test_get_json_non_json_raises(tmp_path: Path) -> None:
         http, *_ = _build(tmp_path, client)
         with pytest.raises(SchwabBadResponseError):
             http.get_json(DATA_URL)
+
+
+@respx.mock
+def test_get_json_parses_floats_as_decimal(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    respx.get(DATA_URL).mock(return_value=httpx.Response(200, json={"price": 150.25, "n": 5}))
+    with httpx.Client() as client:
+        http, *_ = _build(tmp_path, client)
+        data = http.get_json(DATA_URL)
+    assert data["price"] == Decimal("150.25")
+    assert isinstance(data["price"], Decimal)  # money never via binary float
+    assert data["n"] == 5  # ints stay int

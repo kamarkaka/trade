@@ -1,0 +1,31 @@
+# Keep the build context small and secret-free (design §13/§16.1). Docker honours the
+# context-root .dockerignore for `docker build -f deploy/Dockerfile .`.
+
+# Secrets + runtime state must NEVER enter the image.
+secrets/
+state/
+data/
+*.sqlite
+*.sqlite-*
+schwab_token*
+
+# Dev/VCS/caches.
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+*.egg-info/
+dist/
+build/
+
+# Tests, plans, and docs aren't needed at runtime.
+tests/
+plan/
+docs/

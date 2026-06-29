@@ -4,7 +4,6 @@ windows — all with an injected clock and a known admin hash (no wall clock).""
 from __future__ import annotations
 
 import re
-import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -47,9 +46,12 @@ def _settings(db: Path, **over: object) -> WebSettings:
 
 def _make(tmp_path: Path, clock: _Clock, **over: object) -> TestClient:
     db = tmp_path / "trader.sqlite"
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE heartbeat (id INTEGER PRIMARY KEY)")
-    conn.commit()
+    # Real schema so the authenticated dashboard (which queries heartbeat/kill_switch) renders.
+    from trader.state.db import connect
+    from trader.state.migrate import run_migrations
+
+    conn = connect(db)
+    run_migrations(conn)
     conn.close()
     app = create_app(_settings(db, **over), now=clock)
     return TestClient(app, follow_redirects=False)
@@ -120,7 +122,10 @@ def test_authenticated_access_after_login(tmp_path: Path, clock: _Clock) -> None
     _login(client)  # client jar now holds the session cookie
     resp = client.get("/", headers={"accept": "text/html"})
     assert resp.status_code == 200
-    assert "signed in as admin" in resp.text
+    # Renders the base chrome (nav + logged-in user + logout form).
+    assert "trader monitor" in resp.text
+    assert ">admin<" in resp.text
+    assert 'action="/logout"' in resp.text
 
 
 def test_logout_clears_cookie(tmp_path: Path, clock: _Clock) -> None:

@@ -46,6 +46,11 @@ class ZScoreRevertStrategy:
         # Generous calendar window to cover >= lookback TRADING days; the provider is
         # asof-bound, so nothing after `now` is visible (no lookahead).
         start = now - timedelta(days=self.lookback * 4 + 10)
+        # LIMITATION (design §6 / decision #16): exit sizing reads the COMMINGLED broker
+        # position, not this strategy's attributed sub-position. Safe only while each symbol
+        # is owned by a single binding (the current universes are disjoint). Two bindings on
+        # the same symbol would let one strategy close the other's position / suppress its own
+        # entry. Follow-up: plumb attributed positions (get_attributed) into decide().
         held_by_symbol = {pos.symbol: pos.quantity for pos in positions}
         decisions: list[Decision] = []
         for symbol, quote in snapshot.quotes.items():

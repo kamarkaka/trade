@@ -15,8 +15,16 @@ from pathlib import Path
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    """Open a read/write connection with WAL, a busy timeout, and FK enforcement."""
-    conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit; explicit BEGIN/COMMIT
+    """Open a read/write connection with WAL, a busy timeout, and FK enforcement.
+
+    ``check_same_thread=False`` so the connection (created on the main thread) is usable
+    from the scheduler's worker thread (M3.11). Concurrent use is avoided by design — the
+    daemon runs jobs on a single-worker executor and the global cycle lock serializes the
+    decision->submit critical section — so this only relaxes the thread-identity check.
+    """
+    conn = sqlite3.connect(
+        str(path), isolation_level=None, check_same_thread=False
+    )  # autocommit; explicit BEGIN/COMMIT
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")

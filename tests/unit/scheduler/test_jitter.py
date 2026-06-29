@@ -78,6 +78,14 @@ def test_seed_encoding_has_no_delimiter_collision() -> None:
     assert stable_seed(42, DAY, "a|b", "c") != stable_seed(42, DAY, "a", "b|c")
 
 
+def test_seed_fits_signed_sqlite_integer() -> None:
+    # the ledger persists the seed in a SQLite INTEGER (signed 64-bit); it must fit
+    limit = 2**63
+    for i in range(100):
+        assert 0 <= stable_seed(i, DAY, f"s{i}", "open") < limit
+    assert 0 <= stable_seed(None, DAY, "s", "open") < limit
+
+
 def test_entropy_when_seed_none() -> None:
     seeds = {stable_seed(None, DAY, "m", "open") for _ in range(10)}
     assert len(seeds) > 1  # fresh entropy each call

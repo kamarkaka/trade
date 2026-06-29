@@ -22,6 +22,7 @@ dependencies = [
   "pyarrow>=16",  # Parquet storage engine for the bar cache (M2.2)
   "numpy>=2",  # seeded backtest RNG (M2.9)
   "exchange_calendars>=4.5",  # XNYS trading calendar (M3.3)
+  "apscheduler>=3.10,<4",  # live scheduler daemon (M3.11)
 ]
 
 [project.optional-dependencies]
@@ -65,7 +66,7 @@ warn_redundant_casts = true
 # so our own code stays strictly typed without fighting incomplete upstream stubs.
 # (pyarrow/duckdb are added here when a module imports them directly.)
 [[tool.mypy.overrides]]
-module = ["pandas", "exchange_calendars"]
+module = ["pandas", "exchange_calendars", "apscheduler.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

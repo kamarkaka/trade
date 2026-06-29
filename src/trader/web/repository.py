@@ -206,6 +206,17 @@ class MonitoringRepo:
             )
         )
 
+    def trades_today_by_strategy(self, trading_date: str) -> dict[str, int]:
+        """Order count per strategy for ``trading_date`` (ISO date). Per-strategy daily
+        counters aren't persisted (§12 daily_counters is account-level), so this is derived
+        from the orders' ``created_at`` date — a read-only display approximation."""
+        rows = self._db.query(
+            "SELECT strategy_id, COUNT(*) AS n FROM orders "
+            "WHERE substr(created_at, 1, 10) = ? GROUP BY strategy_id",
+            (trading_date,),
+        )
+        return {str(r["strategy_id"]): int(r["n"]) for r in rows}
+
     def order_fills(self, client_order_id: str) -> list[dict[str, Any]]:
         return _rows(
             self._db.query(

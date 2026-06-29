@@ -9,12 +9,12 @@ out by later milestones: ``backtest`` (M2), ``run`` (M3/M4), ``reconcile`` (M4),
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
+from trader.clock import RealClock
 from trader.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
 from trader.schwab.config import SchwabClientConfig, schwab_config_from_env
 from trader.schwab.errors import SchwabAuthError, SchwabError
@@ -26,16 +26,6 @@ app = typer.Typer(
 )
 
 ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to the YAML config file.")]
-
-
-class _RealClock:
-    """Minimal wall-clock for CLI use (the full RealClock arrives in M2.1)."""
-
-    def now(self) -> datetime:
-        return datetime.now(UTC)
-
-    def is_market_open(self, at: datetime | None = None) -> bool:
-        return True
 
 
 def _load(config: Path) -> AppConfig:
@@ -68,7 +58,7 @@ def _auth_status_line(cfg: AppConfig) -> str:
     tok = TokenStore(schwab_cfg.token_store_path).load()
     if tok is None:
         return "auth: not authenticated (run `trader reauth`)"
-    remaining = schwab_cfg.refresh_token_max_age_days - tok.refresh_age_days(_RealClock())
+    remaining = schwab_cfg.refresh_token_max_age_days - tok.refresh_age_days(RealClock())
     if remaining <= 0:
         return "auth: refresh token EXPIRED — run `trader reauth`"
     return f"auth: authenticated; refresh token expires in ~{remaining:.1f} day(s)"
@@ -125,7 +115,7 @@ def reauth(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
     typer.echo("Opening browser for Schwab authorization…")
     try:
         with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
-            auth = Authenticator(schwab_cfg, client, store, clock=_RealClock())
+            auth = Authenticator(schwab_cfg, client, store, clock=RealClock())
             auth.interactive_authorize()
     except SchwabError as exc:
         typer.echo(f"reauth failed: {exc}", err=True)

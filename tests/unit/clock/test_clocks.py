@@ -18,6 +18,8 @@ START = datetime(2026, 6, 28, 14, 30, tzinfo=UTC)
 
 
 def test_both_clocks_satisfy_protocol() -> None:
+    # NOTE: @runtime_checkable isinstance only verifies method *names*; the full
+    # signature/return-type conformance is enforced by mypy --strict.
     assert isinstance(RealClock(), Clock)
     assert isinstance(VirtualClock(START), Clock)
 
@@ -25,7 +27,7 @@ def test_both_clocks_satisfy_protocol() -> None:
 # --- RealClock -------------------------------------------------------------- #
 
 
-def test_real_clock_now_is_utc_aware() -> None:
+def test_realclock_tz_aware() -> None:
     now = RealClock().now()
     assert now.tzinfo is not None
     assert now.utcoffset() == timedelta(0)
@@ -81,11 +83,14 @@ def test_virtual_advance_to_same_instant_is_allowed() -> None:
     assert clock.now() == START
 
 
-def test_virtual_advance_to_backward_raises() -> None:
+def test_virtual_advances_forward_only() -> None:
     clock = VirtualClock(START)
+    # forward works
+    clock.advance_to(START + timedelta(hours=1))
+    # backward is rejected and leaves state unchanged
     with pytest.raises(ValueError, match="cannot move backward"):
-        clock.advance_to(START - timedelta(seconds=1))
-    assert clock.now() == START  # unchanged after the rejected move
+        clock.advance_to(START)
+    assert clock.now() == START + timedelta(hours=1)
 
 
 def test_virtual_advance_by_delta() -> None:

@@ -126,28 +126,30 @@ class RiskManager:
         # 2) Remaining rules on the POST-CLAMP order. Scope assignment (design §10):
         #    - Data-integrity gates (price_sanity) and account-wide caps (gross/loss/
         #      trades) run under `acct` only -- the HARD floor an override can't loosen.
-        #    - Sizing caps that a strategy may tighten (allowlist, position size) run
-        #      under `merged` AND `acct`, so a stricter override bites and a looser one
-        #      can't remove the account-wide floor.
+        #    - Sizing caps a strategy may tighten (allowlist, position size) run under
+        #      `acct` (the floor) and, ONLY when the strategy actually has overrides,
+        #      additionally under `merged` so a stricter override bites too.
         #    Per-strategy loss/trade *budgets* (vs an attributed day-state) need the
         #    orchestrator's per-strategy state and land in M4.4; here they're account-wide.
-        checks: tuple[tuple[Callable[[Order, RuleContext], RuleResult], RiskConfig, str], ...] = (
-            (rules.allowlist_denylist, merged, "per-strategy"),
+        checks: list[tuple[Callable[[Order, RuleContext], RuleResult], RiskConfig, str]] = [
             (rules.allowlist_denylist, acct, "account-wide"),
             (rules.duplicate_order_guard, acct, "gate"),
             (rules.price_sanity, acct, "account-wide"),
             (rules.daily_loss_limit, acct, "account-wide"),
             (rules.max_trades_per_day, acct, "account-wide"),
-            (rules.max_position_size, merged, "per-strategy"),
             (rules.max_position_size, acct, "account-wide"),
             (rules.max_gross_exposure, acct, "account-wide"),
-        )
+        ]
+        if merged is not acct:  # only when overrides differ -- avoids redundant double runs
+            checks += [
+                (rules.allowlist_denylist, merged, "per-strategy"),
+                (rules.max_position_size, merged, "per-strategy"),
+            ]
         for rule, cfg, scope in checks:
             res = rule(eff_order, ctx(cfg))
             if not res.ok:
                 reasons.append(f"{scope} {rule.__name__}: {res.reason}")
 
-        reasons = list(dict.fromkeys(reasons))  # an account==merged run can duplicate a reason
         approved = not reasons
         # Contract: reasons are non-empty IFF rejected. A clamp is signalled purely by a
         # non-None adjusted_order (the size change is logged), so consumers branch on

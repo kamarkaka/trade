@@ -12,8 +12,9 @@ Two invariants from §10 shape these rules:
    such as ``price_sanity`` / ``allowlist_denylist`` still apply to every order — with
    auto-flatten OFF by default we deliberately do not force trades on uncertain data.)
 
-The kill-switch check (``DayState.kill_switch_engaged``) and the per-strategy vs
-account-wide limit-scope merge are owned by the gate in M4.3, not by these primitives.
+The per-strategy vs account-wide limit-scope merge is owned by the gate (M4.3), not by
+these primitives. The kill-switch check (``DayState.kill_switch_engaged``) is enforced
+separately at cycle start and pre-submit in M5.4.
 """
 
 from __future__ import annotations

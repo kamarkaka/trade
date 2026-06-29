@@ -75,11 +75,7 @@ def _effective_caps(
             if "max_order_notional_usd" in ov
             else base_notional
         )
-        pct = (
-            float(str(ov["max_position_size_pct"]))
-            if "max_position_size_pct" in ov
-            else base_pct
-        )
+        pct = float(str(ov["max_position_size_pct"])) if "max_position_size_pct" in ov else base_pct
         out.append((b.strategy_id, notional, pct))
     return out
 

@@ -23,7 +23,9 @@ dependencies = [
   "numpy>=2",  # seeded backtest RNG (M2.9)
   "exchange_calendars>=4.5",  # XNYS trading calendar (M3.3)
   "apscheduler>=3.10,<4",  # live scheduler daemon (M3.11)
-  "jinja2>=3.1",  # backtest HTML report templating (M6.6)
+  "jinja2>=3.1",  # backtest HTML report templating (M6.6) + web UI (M7)
+  "fastapi>=0.115",  # read-only monitoring web UI (M7.2)
+  "uvicorn[standard]>=0.30",  # ASGI server for the web UI (M7)
 ]
 
 [project.optional-dependencies]

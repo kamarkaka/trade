@@ -123,7 +123,14 @@ class Orchestrator:
                 for decision in decisions:
                     self._handle_decision(decision, strategy_id, cycle_id, result)
             except Exception as exc:
-                self._log.error("cycle failed", strategy_id=strategy_id, error=str(exc))
+                # Strategy isolation (Appendix C#6): a failing cycle must never crash the
+                # daemon or block other strategies. exc_info carries the traceback to logs
+                # so an orchestrator bug (vs a strategy bug) is still diagnosable. Partial
+                # effects (earlier fills already attributed) are intentional — each order is
+                # write-ahead-logged + idempotent, so recovery is via reconcile, not rollback.
+                self._log.error(
+                    "cycle failed", strategy_id=strategy_id, error=str(exc), exc_info=True
+                )
                 self._audit.record(AuditEvent(cycle_id, strategy_id, "cycle_error", str(exc)))
                 result.errors.append(str(exc))
         return result
@@ -143,6 +150,8 @@ class Orchestrator:
             AuditEvent(cycle_id, strategy_id, "order_pending", order.client_order_id)
         )
         broker_order_id = self._broker.submit_order(order)
+        # TODO(M5, §4.2): poll get_order until a terminal status (FILLED/PARTIAL/REJECTED)
+        # with a bounded timeout; M3's SimBroker/FakeBroker fill synchronously.
         fill = self._broker.get_order(broker_order_id)
         self._attribution.apply(fill, strategy_id, order.side)
         self._audit.record(AuditEvent(cycle_id, strategy_id, "fill", fill.broker_order_id))

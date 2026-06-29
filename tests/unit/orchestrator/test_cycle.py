@@ -12,8 +12,8 @@ from trader.config.models import ExecutionConfig
 from trader.core import Account, Decision, MarketSnapshot, Order, Position, Quote
 from trader.core.enums import Action
 from trader.core.protocols import Clock, MarketDataProvider
-from trader.orchestrator.cycle import Orchestrator
-from trader.orchestrator.lock import NullLock
+from trader.orchestrator.cycle import ListAuditSink, Orchestrator
+from trader.orchestrator.lock import GlobalCycleLock, NullLock
 from trader.sizing.sizer import size_decision
 from trader.state.attribution import AttributionLedger
 from trader.state.db import connect
@@ -170,6 +170,31 @@ class _SpyAudit:
 
     def record(self, event: object) -> None:
         self._log.append(event.kind)  # type: ignore[attr-defined]
+
+
+def test_broker_error_isolated_and_lock_released(tmp_path: Path) -> None:
+    lock = GlobalCycleLock()
+    broker = FakeBroker()
+    broker.fail_next_submit = True  # submit raises mid-cycle
+    orch, _broker, _ = _orchestrator(tmp_path, broker=broker, lock=lock)
+    result = orch.run_cycle(_Decide([Decision(Action.BUY, "AAPL", 10)]), ["AAPL"], "m", NOW)
+    assert result.errors  # broker error caught, not propagated
+    assert result.fills == []
+    assert lock.acquire(timeout=0.1) is True  # the with-block released the lock
+    lock.release()
+
+
+def test_missing_data_symbol_flagged(tmp_path: Path) -> None:
+    orch, _broker, _ = _orchestrator(tmp_path)  # data only has AAPL
+    result = orch.run_cycle(_Decide([]), ["AAPL", "NOPE"], "m", NOW)
+    assert result.missing_symbols == ["NOPE"]
+
+
+def test_rejected_audit_recorded(tmp_path: Path) -> None:
+    audit = ListAuditSink()
+    orch, _broker, _ = _orchestrator(tmp_path, risk=_SpyRisk(approve=False), audit=audit)
+    orch.run_cycle(_Decide([Decision(Action.BUY, "AAPL", 10)]), ["AAPL"], "m", NOW)
+    assert [e.kind for e in audit.events] == ["rejected"]  # rejected recorded, no pending/fill
 
 
 def test_pending_before_submit_and_lock_wraps_cycle(tmp_path: Path) -> None:

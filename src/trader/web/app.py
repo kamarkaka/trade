@@ -19,15 +19,15 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from trader.web.auth import install_session_refresh, require_session
+from trader.web.auth import install_session_refresh
 from trader.web.db import ReadOnlyStateDB
 from trader.web.repository import MonitoringRepo
-from trader.web.routes import auth_routes
-from trader.web.security import LoginThrottle, make_csrf_token
+from trader.web.routes import auth_routes, system_routes
+from trader.web.security import LoginThrottle
 from trader.web.settings import WebSettings
 from trader.web.templating import make_templates
 
@@ -68,26 +68,10 @@ def create_app(settings: WebSettings, *, now: Callable[[], datetime] | None = No
 
     install_session_refresh(app)  # writes the idle-refreshed cookie on authenticated responses
     app.include_router(auth_routes.router)  # PUBLIC: /login, /logout
-
-    @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, user: str = Depends(require_session)) -> Response:
-        # Page chrome (base.html). The real data fragments land in M7.7+; this renders the
-        # shared layout (nav, mode + kill-switch badges, logout form with CSRF).
-        repo: MonitoringRepo = request.app.state.repo
-        kill = repo.system_status().get("kill_switch") or {}
-        page: Response = request.app.state.templates.TemplateResponse(
-            request,
-            "base.html",
-            {
-                "user": user,
-                "mode": repo.config_view().get("mode", "?"),
-                "kill_switch_engaged": bool(kill.get("engaged")),
-                "csrf_token": make_csrf_token(
-                    settings.session_secret.get_secret_value(), request.app.state.now()
-                ),
-            },
-        )
-        return page
+    # Monitoring routers are default-deny: each carries a router-level require_session, so a
+    # route can't be silently public. /login, /logout, /healthz, /static are the only public
+    # surfaces (M7.10 asserts this).
+    app.include_router(system_routes.router)
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Re-auth — trader monitor{% endblock %}
+{% block content %}
+<h1>Schwab re-authentication</h1>
+
+{% if token.authenticated %}
+  <p>
+    Refresh token issued {{ token.refresh_token_issued_at | nyt }} —
+    <span class="{{ token.badge_level | badge }}">
+      {{ '%.1f' | format(token.days_until_refresh_expiry) }} days</span>
+    until the weekly cap.
+  </p>
+{% else %}
+  <p><span class="{{ 'alert' | badge }}">not authenticated</span></p>
+{% endif %}
+
+<p class="muted">
+  Re-authentication is performed via the CLI (read-only UI — this page executes nothing).
+  See the weekly re-auth runbook for option A (laptop OAuth + copy token into the state
+  volume) or option B (SSH port-forward the callback):
+</p>
+<pre>  trader reauth --config /config/config.yaml</pre>
+<p class="muted">
+  The Schwab refresh token expires ~7 days after issue and is NOT programmatically
+  renewable; re-auth requires a human browser login (design §8.2 / §16.4).
+</p>
+{% endblock %}

@@ -35,11 +35,20 @@ PATH_FILL = {"strategy_id": "momentum", "order_id": "c1"}
 
 _CONFIG = {
     "mode": "paper",
-    "risk": {"max_trades_per_day": 6},
-    "strategies": [{"id": "momentum", "name": "threshold", "enabled": True, "universe": ["AAPL"]}],
-    # secret-ish keys the scrub must redact -> must NOT render
+    # Secret-ish keys placed INSIDE rendered sections (risk table + strategy params) so the
+    # crawl genuinely exercises scrub: if scrub were a no-op these would leak into the page.
+    "risk": {"max_trades_per_day": 6, "api_secret": APP_SECRET},
+    "strategies": [
+        {
+            "id": "momentum",
+            "name": "threshold",
+            "enabled": True,
+            "universe": ["AAPL"],
+            "params": {"lot": 10, "client_secret": PW_HASH},
+        }
+    ],
+    # also at the top level / account (defense in depth; not rendered, but must stay absent)
     "session_secret": SESSION_SECRET,
-    "admin_password_hash": PW_HASH,
     "account": {"secrets_ref": "keychain", "app_secret": APP_SECRET},
 }
 
@@ -142,9 +151,12 @@ def test_no_sentinel_secret_in_any_response(tmp_path: Path) -> None:
             continue
         url = _concrete(route.path)
         assert "{" not in url, f"unfilled path param in {route.path}"
-        body = client.get(url).text
+        resp = client.get(url)
+        # A 500'd secret page would trivially lack the sentinel -> assert it actually rendered
+        # so a crashed page can't vacuously "pass" the leak check.
+        assert resp.status_code == 200, f"{url} -> {resp.status_code} (secret page must render)"
         for sentinel in SENTINELS:
-            assert sentinel not in body, f"{sentinel} leaked at {url}"
+            assert sentinel not in resp.text, f"{sentinel} leaked at {url}"
 
 
 def test_crawl_covers_all_get_routes(tmp_path: Path) -> None:

@@ -10,7 +10,6 @@ output or in a raised exception's message. Also pins the central scrub behavior
 from __future__ import annotations
 
 import io
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -24,9 +23,9 @@ from trader.auth.token_store import TokenStore
 from trader.auth.tokens import TokenSet
 from trader.observability.logging import (
     REDACTED,
-    clear_secrets,
     configure_logging,
     get_logger,
+    register_secret,
 )
 from trader.schwab.config import SchwabClientConfig
 from trader.schwab.constants import ACCOUNT_NUMBERS_PATH, OAUTH_TOKEN_URL, QUOTES_PATH
@@ -48,13 +47,8 @@ HASH = "HASHVALUE_eeeeeeeeeeee"
 
 ALL_SECRETS = (ACCESS, REFRESH, CODE, APP_SECRET, ACCOUNT)
 
-
-@pytest.fixture(autouse=True)
-def _clean_secret_registry() -> Iterator[None]:
-    # Registered literals are process-global; isolate this module's tests.
-    clear_secrets()
-    yield
-    clear_secrets()
+# The scrub-literal registry is cleared around every test by the autouse fixture
+# in tests/conftest.py, so registrations here don't leak into other tests.
 
 
 def _cfg(tmp_path: Path) -> SchwabClientConfig:
@@ -126,6 +120,20 @@ def test_no_token_in_logs(tmp_path: Path) -> None:
     assert REDACTED in out  # scrubbing actually fired
 
 
+def test_registered_literal_scrubbed_under_nonsensitive_key() -> None:
+    """Pin the *literal* scrub path distinctly from key-based redaction: a
+    registered secret is redacted even under a harmless field name / in free text."""
+    buf = io.StringIO()
+    configure_logging(level="DEBUG", json_output=True, stream=buf)
+    secret = "LITERALSECRET_zzzzzzzzzzzzzzzz"
+    register_secret(secret)
+    log = get_logger("literal.test")
+    log.info(f"free text {secret}", harmless_field=f"value {secret} here")
+    out = buf.getvalue()
+    assert secret not in out  # literal scrub, not key-based
+    assert REDACTED in out
+
+
 @respx.mock
 def test_no_secret_in_exception_messages(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
@@ -161,6 +169,11 @@ def test_no_raw_account_number_leak() -> None:
     out = buf.getvalue()
     assert ACCOUNT not in out
     assert HASH in out  # hashed id is safe to log
+
+    # once registered (as get_account_numbers does), it's also scrubbed in free text
+    register_secret(mapping.account_number)
+    log.info(f"account {mapping.account_number} resolved")
+    assert ACCOUNT not in buf.getvalue()
 
 
 def test_authorization_header_value_scrubbed() -> None:

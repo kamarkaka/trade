@@ -35,6 +35,7 @@ class WebSettings(BaseModel):
     login_max_attempts: int = 5  # before lockout
     login_lockout_seconds: int = 300  # 5 min lockout window
     auto_refresh_seconds: int = 15  # HTMX dashboard poll interval
+    cookie_secure: bool = True  # Secure flag on the session cookie (TLS-only); False for http tests
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> WebSettings:
@@ -68,6 +69,7 @@ class WebSettings(BaseModel):
             login_max_attempts=_int("LOGIN_MAX_ATTEMPTS", 5),
             login_lockout_seconds=_int("LOGIN_LOCKOUT_SECONDS", 300),
             auto_refresh_seconds=_int("AUTO_REFRESH_SECONDS", 15),
+            cookie_secure=env.get("WEB_COOKIE_SECURE", "true").lower() not in ("0", "false", "no"),
         )
 
 

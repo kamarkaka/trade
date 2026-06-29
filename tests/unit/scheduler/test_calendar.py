@@ -94,9 +94,25 @@ def test_is_open() -> None:
     assert cal.is_open(cal.localize(date(2024, 12, 25), time(10, 0))) is False  # holiday
 
 
+def test_sessions_range_is_end_inclusive() -> None:
+    sessions = _cal().sessions(date(2024, 7, 1), date(2024, 7, 8))
+    assert date(2024, 7, 8) in sessions  # end-inclusive
+    assert date(2024, 7, 1) in sessions
+
+
+def test_resolve_fire_utc_input_maps_to_correct_session() -> None:
+    # a fire given in UTC late at night maps to the prior ET session and clamps there
+    cal = _cal()
+    fire = datetime(2024, 7, 3, 2, 0, tzinfo=UTC)  # = 2024-07-02 22:00 ET (after close)
+    resolved = cal.resolve_fire(fire, _slot(time(15, 30), OnOvershoot.CLAMP))
+    assert resolved is not None
+    assert resolved.astimezone(ET).date() == date(2024, 7, 2)  # prior session, not 07-03
+
+
 def test_localize_handles_dst_gap_and_fold() -> None:
     cal = _cal()
     gap = cal.localize(date(2024, 3, 10), time(2, 30))  # spring-forward gap (doesn't exist)
     fold = cal.localize(date(2024, 11, 3), time(1, 30))  # fall-back fold (happens twice)
-    assert gap.tzinfo is UTC
-    assert fold.tzinfo is UTC  # both resolve to a well-defined UTC instant, no error
+    # both resolve deterministically to a well-defined UTC instant (PEP 495 fold=0)
+    assert gap == datetime(2024, 3, 10, 7, 30, tzinfo=UTC)
+    assert fold == datetime(2024, 11, 3, 5, 30, tzinfo=UTC)

@@ -24,7 +24,14 @@ _EPSILON = timedelta(seconds=1)
 
 
 class TradingCalendar:
-    """Sessions, open/close, and the resolve_fire gate for one exchange."""
+    """Sessions, open/close, and the resolve_fire gate for one exchange.
+
+    Precondition: queried dates must lie within the bundled ``exchange_calendars``
+    horizon (it extends ~1 year past the install date). A date beyond it raises the
+    library's out-of-bounds error rather than silently returning "closed" — a
+    long-lived daemon must be redeployed (refreshing the calendar) before the horizon
+    is reached; M3.11 surfaces such errors via alerting rather than halting silently.
+    """
 
     def __init__(
         self,

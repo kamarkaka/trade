@@ -1,0 +1,29 @@
+{# Per-strategy fired-slot ledger: realized drift + status (failed = needs attention). M7.7.
+   Note: calendar-skipped slots never enter the ledger; failed claims are surfaced here. #}
+{% if slots %}
+<table>
+  <tr><th class="l">Session</th><th class="l">Strategy</th><th class="l">Slot</th>
+      <th class="l">Status</th><th class="l">Planned fire</th><th>Drift (s)</th>
+      <th>Seed</th><th class="l">Finished</th><th class="l">Error</th></tr>
+  {% for s in slots %}
+  <tr>
+    <td class="l">{{ s.slot_date }}</td>
+    <td class="l">{{ s.strategy_id }}</td>
+    <td class="l">{{ s.slot_id }}</td>
+    <td class="l">
+      {% if s.status == 'failed' %}<span class="{{ 'alert' | badge }}">failed</span>
+      {% elif s.status == 'done' %}<span class="{{ 'ok' | badge }}">done</span>
+      {% else %}<span class="{{ 'warn' | badge }}">{{ s.status }}</span>{% endif %}
+    </td>
+    <td class="l">{{ s.planned_fire_ts | nyt }}</td>
+    <td>{{ s.drift_seconds if s.drift_seconds is not none else '—' }}</td>
+    <td>{{ s.seed if s.seed is not none else '—' }}</td>
+    <td class="l">{{ s.finished_at | nyt }}</td>
+    <td class="l">{{ s.error or '' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">No fired slots recorded yet.</p>
+{% endif %}
+<p class="muted">updated {{ updated_at | nyt }}</p>

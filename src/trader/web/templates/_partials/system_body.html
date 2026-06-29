@@ -1,0 +1,40 @@
+{# System status fields (refreshable fragment). M7.7. #}
+<table>
+  <tr><th class="l">Mode</th>
+      <td class="l"><span class="{{ 'ok' | badge }}">{{ mode }}</span></td></tr>
+  <tr><th class="l">Daemon</th>
+      <td class="l">
+        {% if heartbeat %}
+          <span class="{{ ('alert' if heartbeat_stale else 'ok') | badge }}">
+            {{ 'STALE' if heartbeat_stale else 'healthy' }}</span>
+          last beat {{ heartbeat.last_alive_at | nyt }}
+          {% if heartbeat_age_minutes is not none %}({{ '%.1f' | format(heartbeat_age_minutes) }} min ago){% endif %}
+          — {{ heartbeat.scheduler_state }}
+        {% else %}
+          <span class="{{ 'warn' | badge }}">no heartbeat</span>
+        {% endif %}
+      </td></tr>
+  <tr><th class="l">Market</th>
+      <td class="l">
+        {% if market_open is none %}unknown
+        {% elif market_open %}<span class="{{ 'ok' | badge }}">open</span>
+        {% else %}closed{% endif %}
+      </td></tr>
+  <tr><th class="l">Kill switch</th>
+      <td class="l">
+        {% if kill_switch_engaged %}
+          <span class="{{ 'alert' | badge }}">ENGAGED</span> {{ kill_switch.reason or '' }}
+        {% else %}<span class="{{ 'ok' | badge }}">off</span>{% endif %}
+      </td></tr>
+  <tr><th class="l">Refresh token</th>
+      <td class="l">
+        {% if token.authenticated %}
+          <span class="{{ token.badge_level | badge }}">
+            {{ '%.1f' | format(token.days_until_refresh_expiry) }} days</span>
+          until weekly re-auth (issued {{ token.refresh_token_issued_at | nyt }})
+        {% else %}
+          <span class="{{ 'alert' | badge }}">not authenticated</span> — run `trader reauth`
+        {% endif %}
+      </td></tr>
+</table>
+<p class="muted">updated {{ updated_at | nyt }}</p>

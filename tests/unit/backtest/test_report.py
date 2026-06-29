@@ -45,17 +45,39 @@ def test_report_fields() -> None:
     assert report["blotter"][0]["price"] == "100"  # money as exact string
 
 
+def _q(value: Decimal) -> Decimal:
+    from decimal import ROUND_HALF_UP
+
+    return value.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+
+
 def test_summary_metrics() -> None:
     report = BacktestReport.build([_fill("AAPL", 10, "100", fees="2")], _curve(), _manifest())
     summary = report["summary"]
     assert summary["num_trades"] == 1
     assert summary["starting_equity"] == "100000"
     assert summary["ending_equity"] == "101000"
-    # max drawdown = (100500 - 100200)/100500
-    assert summary["max_drawdown"] == str(Decimal("300") / Decimal("100500"))
-    assert summary["total_fees"] == "2"
-    # turnover = 10*100 / 100000
-    assert summary["turnover"] == str(Decimal("1000") / Decimal("100000"))
+    # max drawdown = (100500 - 100200)/100500, quantized to 8dp
+    assert summary["max_drawdown"] == str(_q(Decimal("300") / Decimal("100500")))
+    assert summary["total_fees"] == "2"  # money kept exact (not quantized)
+    assert summary["turnover"] == str(_q(Decimal("1000") / Decimal("100000")))
+    assert summary["total_return"] == str(_q(Decimal("1000") / Decimal("100000")))
+
+
+def test_losing_run_negative_return() -> None:
+    curve = [
+        (NOW, Decimal("100000")),
+        (NOW + timedelta(days=1), Decimal("95000")),  # drop
+    ]
+    summary = BacktestReport.build([_fill("AAPL", 10, "100")], curve, _manifest())["summary"]
+    assert summary["total_return"].startswith("-")  # negative return
+    assert summary["max_drawdown"] == str(_q(Decimal("5000") / Decimal("100000")))
+
+
+def test_multi_symbol_blotter_preserves_order() -> None:
+    fills = [_fill("AAPL", 1, "100"), _fill("MSFT", 1, "200"), _fill("AAPL", 1, "101")]
+    blotter = BacktestReport.build(fills, _curve(), _manifest())["blotter"]
+    assert [row["symbol"] for row in blotter] == ["AAPL", "MSFT", "AAPL"]  # input order kept
 
 
 def test_empty_run_is_safe() -> None:

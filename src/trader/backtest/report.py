@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from trader.core import Fill
@@ -22,7 +22,16 @@ from trader.core import Fill
 # Manifest fields that vary by environment and must be dropped before a golden compare.
 VOLATILE_MANIFEST_FIELDS = ("git_commit", "lib_versions", "python_version")
 
+# Ratio metrics are quantized to a fixed scale so the report is independent of the
+# global decimal context (a non-terminating division would otherwise bake the
+# context precision into the golden).
+_RATIO_SCALE = Decimal("0.00000001")  # 8 dp
+
 EquityPoint = tuple[datetime, Decimal]
+
+
+def _q(value: Decimal) -> Decimal:
+    return value.quantize(_RATIO_SCALE, rounding=ROUND_HALF_UP)
 
 
 def _safe_div(numerator: Decimal, denominator: Decimal) -> Decimal:
@@ -30,25 +39,29 @@ def _safe_div(numerator: Decimal, denominator: Decimal) -> Decimal:
 
 
 def _max_drawdown(curve: Sequence[EquityPoint]) -> Decimal:
-    peak = Decimal("0")
+    if not curve:
+        return Decimal("0")
+    peak = curve[0][1]  # track the true running max from the start (handles all-negative)
     worst = Decimal("0")
     for _, equity in curve:
         peak = max(peak, equity)
         if peak > 0:
             worst = max(worst, (peak - equity) / peak)
-    return worst
+    return _q(worst)
 
 
 def _hit_rate(curve: Sequence[EquityPoint]) -> Decimal:
+    # Fraction of equity-curve *intervals* that rose (a curve proxy, NOT a per-trade
+    # win rate; per-trade attribution arrives with M3).
     if len(curve) < 2:
         return Decimal("0")
     ups = sum(1 for i in range(1, len(curve)) if curve[i][1] > curve[i - 1][1])
-    return Decimal(ups) / Decimal(len(curve) - 1)
+    return _q(Decimal(ups) / Decimal(len(curve) - 1))
 
 
 def _turnover(fills: Sequence[Fill], starting_equity: Decimal) -> Decimal:
     notional = sum((Decimal(f.quantity) * f.price for f in fills), Decimal("0"))
-    return _safe_div(notional, starting_equity)
+    return _q(_safe_div(notional, starting_equity))
 
 
 def _fill_row(fill: Fill) -> dict[str, Any]:
@@ -80,7 +93,7 @@ class BacktestReport:
                 "num_trades": len(fills),
                 "starting_equity": str(starting),
                 "ending_equity": str(ending),
-                "total_return": str(_safe_div(ending - starting, starting)),
+                "total_return": str(_q(_safe_div(ending - starting, starting))),
                 "max_drawdown": str(_max_drawdown(equity_curve)),
                 "hit_rate": str(_hit_rate(equity_curve)),
                 "turnover": str(_turnover(fills, starting)),

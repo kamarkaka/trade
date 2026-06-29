@@ -68,12 +68,12 @@
   },
   "summary": {
     "ending_equity": "100006",
-    "hit_rate": "0.75",
-    "max_drawdown": "0",
+    "hit_rate": "0.75000000",
+    "max_drawdown": "0E-8",
     "num_trades": 4,
     "starting_equity": "100000",
     "total_fees": "0",
-    "total_return": "0.00006",
-    "turnover": "0.00418"
+    "total_return": "0.00006000",
+    "turnover": "0.00418000"
   }
 }

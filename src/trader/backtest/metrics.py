@@ -88,7 +88,9 @@ def trade_records_from_multi(
         for fill, side in trades
         if fill.quantity > 0
     ]
-    records.sort(key=lambda t: t.ts)
+    # Tie-break on (strategy_id, symbol) so equal timestamps sort deterministically
+    # regardless of dict iteration order.
+    records.sort(key=lambda t: (t.ts, t.strategy_id, t.symbol))
     return records
 
 
@@ -124,11 +126,15 @@ def cagr(
     *,
     sessions_per_year: int = SESSIONS_PER_YEAR,
 ) -> Decimal:
-    """Annualized compound growth, using ``len(curve)`` as the session count
-    (``years = sessions / sessions_per_year``). ``0`` if the curve is too short or
-    either endpoint is non-positive (can't take a ratio's log)."""
-    sessions = len(curve)
-    if sessions < 2:
+    """Annualized compound growth (``years = sessions / sessions_per_year``).
+
+    ``sessions`` is the count of DISTINCT calendar dates in the curve, NOT the number of
+    equity points: a multi-strategy / multi-slot run emits one equity point per trigger,
+    so several points can share a date — counting points would overcount the elapsed time
+    and understate CAGR. ``0`` if the curve spans fewer than two sessions or either
+    endpoint is non-positive (can't take a ratio's log)."""
+    sessions = len({ts.date() for ts, _ in curve})
+    if sessions < 2 or len(curve) < 2:
         return _ZERO
     start, final = curve[0][1], curve[-1][1]
     if start <= 0 or final <= 0:
@@ -184,7 +190,8 @@ def hit_rate(
     """Fraction of closing trades that realized a positive price P&L, pairing
     entries/exits FIFO per ``(strategy_id, symbol)``. A "round trip" is one closing
     trade (the trade that reduces/flips an existing position); its P&L is summed across
-    every open lot it consumes. Open positions never closed are excluded. Returns
+    every open lot it consumes. P&L is GROSS of fees (price-only) — a break-even-price
+    round trip scores as a non-win. Open positions never closed are excluded. Returns
     ``None`` when there are no closing trades (nothing to score)."""
     selected = _select(trades, strategy_id)
     # FIFO of open lots per key: deque of [signed_remaining_qty, price].
@@ -192,7 +199,7 @@ def hit_rate(
     wins = 0
     closed = 0
     with localcontext(_CTX):
-        for t in sorted(selected, key=lambda x: x.ts):
+        for t in sorted(selected, key=lambda x: (x.ts, x.strategy_id, x.symbol)):
             key = (t.strategy_id, t.symbol)
             lots = open_lots.setdefault(key, deque())
             signed = Decimal(t.quantity) if t.side is Side.BUY else -Decimal(t.quantity)

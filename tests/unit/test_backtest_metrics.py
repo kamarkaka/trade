@@ -86,6 +86,20 @@ def test_cagr_subyear_annualization() -> None:
     assert abs(cagr(curve) - Decimal("15")) < Decimal("1e-12")
 
 
+def test_cagr_counts_distinct_sessions_not_points() -> None:
+    # Multi-strategy/multi-slot curves emit several equity points per calendar DAY.
+    # CAGR must count distinct dates, not points: 2 points/day over 252 days, 100 -> 200,
+    # is 1 year -> 2^1 - 1 = 1.0 (NOT 504/252 = 2 years -> 2^0.5 - 1 = 0.414).
+    curve: list[tuple[datetime, Decimal]] = []
+    for d in range(252):
+        ts = BASE + timedelta(days=d)
+        val = Decimal("100") if d < 251 else Decimal("200")
+        curve.append((ts, val))  # AM slot
+        curve.append((ts + timedelta(hours=3), val))  # PM slot, same calendar date
+    assert len(curve) == 504
+    assert abs(cagr(curve) - Decimal("1")) < Decimal("1e-12")
+
+
 def test_avg_equity() -> None:
     assert avg_equity(_curve(["100", "200", "300"])) == Decimal("200")
     assert avg_equity([]) == Decimal("0")

@@ -33,7 +33,7 @@
     <tr><th class="l">Time</th><th class="l">Strategy</th><th class="l">Reason</th></tr>
     {% for r in rejections %}
     <tr><td class="l">{{ r.ts | nyt }}</td><td class="l">{{ r.strategy_id }}</td>
-        <td class="l"><span class="{{ 'alert' | badge }}">{{ r.payload.get('reason', r.payload) }}</span></td></tr>
+        <td class="l"><span class="{{ 'alert' | badge }}">{{ r.payload.get('reason', r.payload) if r.payload is mapping else r.payload }}</span></td></tr>
     {% endfor %}
   </table>
   {% else %}<p class="muted">No rejections.</p>{% endif %}

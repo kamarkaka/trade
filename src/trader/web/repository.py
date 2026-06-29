@@ -35,6 +35,13 @@ SECRET_KEYS = (
     "password",
     "hash",
     "app_key",
+    # separator-less variants a custom strategy param might use (key-based scrub can't see
+    # inside a value, so cover the common spellings)
+    "apikey",
+    "apitoken",
+    "clientsecret",
+    "privatekey",
+    "credential",
 )
 
 # The Schwab token store lives next to the state DB (cli `_schwab_config` default).

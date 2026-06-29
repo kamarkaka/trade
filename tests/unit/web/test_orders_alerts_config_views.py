@@ -91,6 +91,54 @@ def test_order_detail_shows_fills(tmp_path: Path) -> None:
     assert _build(tmp_path / "b").get("/orders/nope").status_code == 404
 
 
+def test_orders_non_dict_rejection_payload_does_not_500(tmp_path: Path) -> None:
+    # A rejected audit row whose payload isn't a JSON object must not 500 the orders page.
+    db = tmp_path / "trader.sqlite"
+    _seed(db)
+    conn = connect(db)
+    conn.execute(
+        "INSERT INTO audit_log (ts, cycle_id, strategy_id, kind, payload) VALUES "
+        "(?, 'cyc3','x','rejected',?)",
+        (NOW.isoformat(), json.dumps(["bare", "list", "payload"])),
+    )
+    conn.commit()
+    conn.close()
+    settings = WebSettings(
+        admin_user="admin",
+        admin_password_hash="$argon2id$dummy",
+        session_secret=SECRET,
+        db_path=db,
+        cookie_secure=False,
+    )
+    app = create_app(settings, now=lambda: NOW)
+    app.state.repo = MonitoringRepo(ReadOnlyStateDB(db), config_loader=lambda: _CONFIG)
+    client = TestClient(app, follow_redirects=False)
+    client.cookies.set("session", make_session_token(SECRET, "admin", NOW))
+    assert client.get("/orders").status_code == 200
+    assert client.get("/orders/fragment", headers={"HX-Request": "true"}).status_code == 200
+
+
+def test_config_scrubs_separatorless_secret_param(tmp_path: Path) -> None:
+    cfg = {
+        "mode": "paper",
+        "strategies": [{"id": "s", "name": "x", "universe": ["A"], "params": {"apikey": "LEAK"}}],
+    }
+    db = tmp_path / "trader.sqlite"
+    _seed(db)
+    settings = WebSettings(
+        admin_user="admin",
+        admin_password_hash="$argon2id$dummy",
+        session_secret=SECRET,
+        db_path=db,
+        cookie_secure=False,
+    )
+    app = create_app(settings, now=lambda: NOW)
+    app.state.repo = MonitoringRepo(ReadOnlyStateDB(db), config_loader=lambda: cfg)
+    client = TestClient(app, follow_redirects=False)
+    client.cookies.set("session", make_session_token(SECRET, "admin", NOW))
+    assert "LEAK" not in client.get("/config").text  # apikey scrubbed
+
+
 def test_alerts_lists_recent(tmp_path: Path) -> None:
     body = _build(tmp_path).get("/alerts").text
     assert "rejected" in body

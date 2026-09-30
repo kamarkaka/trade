@@ -62,7 +62,8 @@ services:
     restart: unless-stopped
     environment:
       TZ: America/New_York
-      WEB_DB_PATH: /state/trader.sqlite      # opened read-only by ReadOnlyStateDB
+      # The state DB path comes from the mounted config's observability.db_path (paper or
+      # live), opened read-only by ReadOnlyStateDB; WEB_DB_PATH would override it.
       WEB_CONFIG_PATH: /config/trader.yaml
       # WEB_ADMIN_USER / WEB_ADMIN_PASSWORD_HASH (argon2id) / SESSION_SECRET come from env_file.
     env_file:

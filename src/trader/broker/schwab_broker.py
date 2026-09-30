@@ -8,8 +8,10 @@ and raises a typed error rather than silently dropping the order.
 Idempotency (write-ahead client_order_id + reconcile-before-resend) is layered ABOVE this
 broker in M5.3 — and the transport already refuses to auto-retry the order POST (M5.1), so a
 duplicate order is never created at this layer. Schwab does not echo our ``client_order_id``,
-so we map each returned broker order id back to the originating id + symbol to build a
-complete ``Fill``.
+so each returned broker order id is mapped back to the originating id: from memory for orders
+placed by this process, and through an injected durable lookup (the ``orders`` table) for
+orders placed before a restart. A ``Fill`` reports Schwab's own order id and symbol, so a
+response for a different order is visible to the caller rather than masked.
 
 SAFETY: this is the real-money order path. It is only constructed by the go-live wiring
 (M5.6) after the double-confirm; the paper daemon still uses SimBroker and refuses mode=live.
@@ -17,6 +19,7 @@ SAFETY: this is the real-money order path. It is only constructed by the go-live
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from decimal import Decimal
 
 from trader.core import Account, Fill, Order, Position
@@ -29,14 +32,22 @@ from trader.schwab.orders import SchwabTradingClient, build_order_json
 class SchwabBroker:
     """Live broker over the Schwab trading client (implements the core ``Broker`` protocol)."""
 
-    def __init__(self, client: SchwabTradingClient, account_hash: str, *, clock: Clock) -> None:
+    def __init__(
+        self,
+        client: SchwabTradingClient,
+        account_hash: str,
+        *,
+        clock: Clock,
+        client_id_for: Callable[[str], str | None] | None = None,
+    ) -> None:
         self._client = client
         self._account = account_hash
         self._clock = clock
-        # broker_order_id -> (client_order_id, symbol). Schwab doesn't echo our client id, so
-        # we remember it (+ the symbol we sent) to assemble a complete Fill. In-memory only;
-        # crash-safe recovery is M5.3's job.
+        # broker_order_id -> (client_order_id, symbol) for orders placed by THIS process.
+        # Schwab doesn't echo our client id; ``client_id_for`` (a durable lookup over the
+        # orders table) answers for orders placed before a restart.
         self._submitted: dict[str, tuple[str, str]] = {}
+        self._client_id_for = client_id_for
         self._log = get_logger("broker.schwab")
 
     def submit_order(self, order: Order) -> str:
@@ -64,11 +75,22 @@ class SchwabBroker:
 
     def get_order(self, broker_order_id: str) -> Fill:
         status = self._client.get_order(self._account, broker_order_id)
-        client_order_id, symbol = self._submitted.get(broker_order_id, ("", status.symbol))
+        client_order_id, sent_symbol = self._submitted.get(broker_order_id, ("", ""))
+        if not client_order_id and self._client_id_for is not None:
+            client_order_id = self._client_id_for(broker_order_id) or ""
+        if sent_symbol and status.symbol and sent_symbol != status.symbol:
+            self._log.error(
+                "order status symbol differs from the order sent",
+                broker_order_id=broker_order_id,
+                sent=sent_symbol,
+                reported=status.symbol,
+            )
         return Fill(
             client_order_id=client_order_id,
-            broker_order_id=broker_order_id,
-            symbol=symbol or status.symbol,
+            # Report Schwab's own id and symbol: a response for another order must stay
+            # visible (the poller rejects a mismatched id) rather than be relabelled.
+            broker_order_id=status.order_id or broker_order_id,
+            symbol=status.symbol or sent_symbol,
             quantity=status.filled_quantity,  # 0 while still WORKING (valid; no fill yet)
             price=status.average_price,  # 0 until something fills
             fees=Decimal(0),  # real fees come from the transaction record (reconciled later)

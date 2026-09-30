@@ -4,6 +4,8 @@ account mapping, and READ-ONLY safe-mode refusal (M5.2). Uses a fake trading cli
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
 from fakes import FakeClock
 from trader.broker.schwab_broker import SchwabBroker
 from trader.core import Order
@@ -134,16 +136,56 @@ def test_status_mapping_partial_fill() -> None:
     assert fill.quantity == 6 and fill.price == Decimal("150.00")  # cumulative filled qty
 
 
-def test_get_order_after_restart_has_empty_cid() -> None:
-    # No submit recorded this process (in-memory map empty) -> client_order_id falls back to
-    # "" and symbol comes from the status (crash-safe recovery is M5.3).
+def _filled(order_id: str, symbol: str = "TSLA") -> SchwabOrderStatus:
+    return SchwabOrderStatus(order_id, OrderStatus.FILLED, symbol, 5, 5, Decimal("200"), "FILLED")
+
+
+def test_get_order_after_restart_uses_the_durable_lookup() -> None:
+    # A fresh process has no in-memory record of SCHWAB-9; the durable lookup (the orders
+    # table in production) still yields the originating client order id.
     client = _FakeTradingClient()
-    client.set_status(
-        "SCHWAB-9",
-        SchwabOrderStatus("SCHWAB-9", OrderStatus.FILLED, "TSLA", 5, 5, Decimal("200"), "FILLED"),
+    client.set_status("SCHWAB-9", _filled("SCHWAB-9"))
+    lookups: list[str] = []
+
+    def client_id_for(broker_order_id: str) -> str | None:
+        lookups.append(broker_order_id)
+        return {"SCHWAB-9": "c-before-restart"}.get(broker_order_id)
+
+    broker = SchwabBroker(client, ACCT, clock=FakeClock(NOW), client_id_for=client_id_for)  # type: ignore[arg-type]
+    fill = broker.get_order("SCHWAB-9")
+    assert fill.client_order_id == "c-before-restart" and fill.symbol == "TSLA"
+    assert lookups == ["SCHWAB-9"]
+
+
+def test_in_memory_mapping_wins_over_the_durable_lookup() -> None:
+    client = _FakeTradingClient()
+    broker = SchwabBroker(
+        client,  # type: ignore[arg-type]
+        ACCT,
+        clock=FakeClock(NOW),
+        client_id_for=lambda _id: pytest.fail("durable lookup not needed"),  # type: ignore[arg-type,return-value]
     )
+    broker.submit_order(_order())
+    client.set_status("SCHWAB-1", _filled("SCHWAB-1", symbol="AAPL"))
+    assert broker.get_order("SCHWAB-1").client_order_id == "c1"
+
+
+def test_get_order_without_any_mapping_has_empty_cid() -> None:
+    client = _FakeTradingClient()
+    client.set_status("SCHWAB-9", _filled("SCHWAB-9"))
     fill = _broker(client).get_order("SCHWAB-9")
     assert fill.client_order_id == "" and fill.symbol == "TSLA"
+
+
+def test_fill_reports_schwabs_own_order_id_and_symbol() -> None:
+    # If Schwab answers with a different order, the Fill must say so (the poller rejects a
+    # mismatched id) instead of relabelling it as the order we asked about.
+    client = _FakeTradingClient()
+    broker = _broker(client)
+    broker.submit_order(_order())  # SCHWAB-1 / AAPL
+    client.set_status("SCHWAB-1", _filled("SCHWAB-OTHER", symbol="MSFT"))
+    fill = broker.get_order("SCHWAB-1")
+    assert fill.broker_order_id == "SCHWAB-OTHER" and fill.symbol == "MSFT"
 
 
 def test_cancel_delegates() -> None:

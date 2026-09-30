@@ -18,6 +18,7 @@ Safety choices for real money:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit
@@ -131,15 +132,61 @@ class SchwabOrderStatus:
     filled_quantity: int
     average_price: Decimal  # weighted avg execution price (0 if nothing filled yet)
     raw_status: str
+    # Intent fields used to match a listed order back to a local order (reconciliation).
+    # An empty string / None means UNKNOWN (absent or unparseable), never "different".
+    entered_time: datetime | None = None  # when Schwab accepted the order (tz-aware UTC)
+    instruction: str = ""  # the leg's raw instruction, upper-cased (BUY, SELL, SELL_SHORT…)
+    side: Side | None = None  # the side of the book that instruction trades
+    order_type: str = ""  # raw Schwab orderType, upper-cased (MARKET, LIMIT…)
+    price: Decimal | None = None  # the order's price field (None for MARKET / absent)
+
+
+def _first_leg(data: Any) -> dict[str, Any] | None:
+    legs = data.get("orderLegCollection") if isinstance(data, dict) else None
+    if isinstance(legs, list) and legs and isinstance(legs[0], dict):
+        return legs[0]
+    return None
 
 
 def _symbol_of(data: Any) -> str:
-    legs = data.get("orderLegCollection") if isinstance(data, dict) else None
-    if isinstance(legs, list) and legs:
-        instrument = legs[0].get("instrument") if isinstance(legs[0], dict) else None
-        if isinstance(instrument, dict) and "symbol" in instrument:
-            return str(instrument["symbol"])
+    leg = _first_leg(data)
+    instrument = leg.get("instrument") if leg is not None else None
+    if isinstance(instrument, dict) and "symbol" in instrument:
+        return str(instrument["symbol"])
     return ""
+
+
+# Schwab equity instructions -> the side of the book they trade. [VERIFY] the short-sale
+# spellings. We only ever send BUY/SELL; match OUR orders on ``instruction`` exactly and use
+# ``side`` only to spot orders that could conflict with one (e.g. a manual SELL_SHORT).
+_SIDE_BY_INSTRUCTION: dict[str, Side] = {
+    "BUY": Side.BUY,
+    "BUY_TO_COVER": Side.BUY,
+    "SELL": Side.SELL,
+    "SELL_SHORT": Side.SELL,
+}
+
+
+def _instruction_of(data: Any) -> str:
+    leg = _first_leg(data)
+    instruction = leg.get("instruction") if leg is not None else None
+    return str(instruction).upper() if instruction else ""
+
+
+# enteredTime arrives like "2026-06-29T14:30:05+0000" [VERIFY]; %z also accepts "Z"/"+00:00".
+_ENTERED_TIME_FORMATS = ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z")
+
+
+def _entered_time_of(data: Any) -> datetime | None:
+    raw = data.get("enteredTime") if isinstance(data, dict) else None
+    if raw is None:
+        return None
+    for fmt in _ENTERED_TIME_FORMATS:
+        try:
+            return datetime.strptime(str(raw), fmt).astimezone(UTC)
+        except ValueError:
+            continue
+    raise SchwabBadResponseError(f"unparseable enteredTime: {raw!r}")
 
 
 def _average_fill_price(data: Any) -> Decimal:
@@ -159,8 +206,28 @@ def _average_fill_price(data: Any) -> Decimal:
     return (total_cost / total_qty) if total_qty > 0 else Decimal(0)
 
 
-def parse_order_status(data: Any) -> SchwabOrderStatus:
+def _intent_fields(data: Any, order_type: str) -> tuple[datetime | None, Decimal | None]:
+    price = data.get("price") if order_type != "MARKET" else None
+    return _entered_time_of(data), (_dec(price, "price") if price is not None else None)
+
+
+def parse_order_status(data: Any, *, strict_intent: bool = False) -> SchwabOrderStatus:
+    """Parse one order object.
+
+    The status/quantity/fill fields are always strict (a bad value raises). The intent-only
+    fields (``enteredTime``, ``price``) are parsed leniently by default — an unexpected
+    format becomes None so it can never break status POLLING — and strictly for
+    reconciliation listings (``strict_intent=True``), where a silently-dropped timestamp
+    could widen a match window."""
     raw = str(_require(data, "status"))
+    order_type = str(data.get("orderType") or "").upper()
+    try:
+        entered_time, price = _intent_fields(data, order_type)
+    except SchwabBadResponseError:
+        if strict_intent:
+            raise
+        entered_time, price = None, None
+    instruction = _instruction_of(data)
     return SchwabOrderStatus(
         order_id=str(_require(data, "orderId")),
         status=map_order_status(raw),
@@ -169,7 +236,58 @@ def parse_order_status(data: Any) -> SchwabOrderStatus:
         filled_quantity=_int(data.get("filledQuantity", 0), "filledQuantity"),
         average_price=_average_fill_price(data),
         raw_status=raw,
+        entered_time=entered_time,
+        instruction=instruction,
+        side=_SIDE_BY_INSTRUCTION.get(instruction),
+        order_type=order_type,
+        price=price,
     )
+
+
+@dataclass(frozen=True)
+class SchwabUnparsedOrder:
+    """A listed order that could not be parsed. Kept (not dropped) so a reconciler can
+    treat it as "might be ours" when it could match — an order hidden by a parse failure
+    must never be mistaken for an absent one."""
+
+    order_id: str  # "" if absent
+    symbol: str  # best effort from the first leg ("" if unknown)
+    error: str
+
+
+@dataclass(frozen=True)
+class OrderListing:
+    orders: tuple[SchwabOrderStatus, ...]
+    unparsed: tuple[SchwabUnparsedOrder, ...] = ()
+
+
+def parse_order_list(data: Any) -> OrderListing:
+    """Parse the list-orders response (a JSON array of order objects). One malformed order
+    (e.g. a fractional-share Stock Slice entered elsewhere) is isolated in ``unparsed``
+    instead of failing the whole listing."""
+    if not isinstance(data, list):
+        raise SchwabBadResponseError("list-orders response is not a JSON array")
+    orders: list[SchwabOrderStatus] = []
+    unparsed: list[SchwabUnparsedOrder] = []
+    for item in data:
+        try:
+            orders.append(parse_order_status(item, strict_intent=True))
+        except (SchwabBadResponseError, AttributeError, TypeError) as exc:
+            order_id = str(item.get("orderId", "")) if isinstance(item, dict) else ""
+            unparsed.append(SchwabUnparsedOrder(order_id, _symbol_of(item), str(exc)))
+    return OrderListing(tuple(orders), tuple(unparsed))
+
+
+def _entered_time_param(value: datetime, *, round_up: bool = False) -> str:
+    """Format a list-orders time bound: ``yyyy-MM-dd'T'HH:mm:ss.SSSZ`` in UTC [VERIFY].
+    Sub-millisecond precision is floored, or ceiled for an upper bound (``round_up``) so
+    the requested window is never narrowed."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("list-orders time bounds must be timezone-aware")
+    utc = value.astimezone(UTC)
+    if round_up and utc.microsecond % 1000:
+        utc += timedelta(microseconds=1000 - utc.microsecond % 1000)
+    return f"{utc:%Y-%m-%dT%H:%M:%S}.{utc.microsecond // 1000:03d}Z"
 
 
 @dataclass(frozen=True)
@@ -245,6 +363,42 @@ class SchwabTradingClient:
         data = self._http.get_json(f"{self._orders_path(account_hash)}/{order_id}")
         return parse_order_status(data)
 
+    def get_orders(
+        self,
+        account_hash: str,
+        *,
+        from_entered: datetime,
+        to_entered: datetime,
+        max_results: int = 3000,
+    ) -> OrderListing:
+        """List the account's orders entered between ``from_entered`` and ``to_entered``
+        (any status).
+
+        Read-only (GET, so the transport may retry it). Used by reconciliation to find an
+        order whose placement outcome is unknown. [VERIFY] whether the bounds are inclusive
+        (callers should pad the window for clock skew) and the ~60-day look-back limit on
+        ``fromEnteredTime`` (an older bound is rejected with a 400). Only top-level orders
+        are returned; we place SINGLE orders only, so child orders of complex strategies are
+        not traversed. Raises ``SchwabBadResponseError`` if the result may be truncated
+        (``max_results`` reached) — a cut-off listing must never read as "absent"."""
+        if max_results <= 0:
+            raise ValueError("max_results must be positive")
+        params: dict[str, Any] = {  # formatting validates tz-awareness before comparing
+            "fromEnteredTime": _entered_time_param(from_entered),
+            "toEnteredTime": _entered_time_param(to_entered, round_up=True),
+            "maxResults": max_results,
+        }
+        if to_entered < from_entered:
+            raise ValueError("to_entered must be on or after from_entered")
+        listing = parse_order_list(
+            self._http.get_json(self._orders_path(account_hash), params=params)
+        )
+        if len(listing.orders) + len(listing.unparsed) >= max_results:
+            raise SchwabBadResponseError(
+                f"list-orders returned {max_results}+ orders; the result may be truncated"
+            )
+        return listing
+
     def cancel_order(self, account_hash: str, order_id: str) -> None:
         self._http.request("DELETE", f"{self._orders_path(account_hash)}/{order_id}")
 
@@ -281,12 +435,15 @@ class SchwabTradingClient:
 
 
 __all__ = [
+    "OrderListing",
     "SchwabAccountSnapshot",
     "SchwabOrderStatus",
     "SchwabPositionRow",
     "SchwabTradingClient",
+    "SchwabUnparsedOrder",
     "build_order_json",
     "map_order_status",
     "parse_account",
+    "parse_order_list",
     "parse_order_status",
 ]

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -26,6 +27,7 @@ from trader.schwab.orders import (
     build_order_json,
     map_order_status,
     parse_account,
+    parse_order_list,
     parse_order_status,
 )
 
@@ -215,6 +217,135 @@ def test_get_order_polls(tmp_path: Path) -> None:
     with httpx.Client() as c:
         status = _client(tmp_path, c).get_order(ACCT, "1003490104")
     assert status.order_id == "1003490104" and status.status is OrderStatus.FILLED
+
+
+# --- list orders (reconciliation lookups) ------------------------------------ #
+
+
+@respx.mock
+def test_get_orders_sends_utc_time_bounds_and_parses_list(tmp_path: Path) -> None:
+    route = respx.get(ORDERS_URL).mock(
+        return_value=httpx.Response(200, json=_fixture("order_list.json"))
+    )
+    # Bounds given in New York time must be sent as UTC ("Z"), never as local wall-clock.
+    start = datetime(2026, 6, 29, 9, 30, tzinfo=ZoneInfo("America/New_York"))  # 13:30Z (EDT)
+    end = start + timedelta(hours=1, microseconds=250_500)
+    with httpx.Client() as c:
+        listing = _client(tmp_path, c).get_orders(ACCT, from_entered=start, to_entered=end)
+    params = route.calls.last.request.url.params
+    assert params["fromEnteredTime"] == "2026-06-29T13:30:00.000Z"
+    assert params["toEnteredTime"] == "2026-06-29T14:30:00.251Z"  # upper bound ceiled to ms
+    assert params["maxResults"] == "3000"  # explicit, so truncation is detectable
+    assert [o.order_id for o in listing.orders] == ["1003490104", "1003490105"]
+    assert listing.unparsed == ()
+    filled, working = listing.orders
+    assert filled.entered_time == datetime(2026, 6, 29, 14, 30, 5, tzinfo=UTC)
+    assert filled.instruction == "BUY" and filled.side is Side.BUY
+    assert filled.order_type == "MARKET" and filled.price is None
+    assert working.instruction == "SELL" and working.side is Side.SELL
+    assert working.order_type == "LIMIT" and working.status is OrderStatus.WORKING
+    assert working.price == Decimal("410.5")  # a JSON number, decoded without binary float
+
+
+@respx.mock
+def test_get_orders_empty_list(tmp_path: Path) -> None:
+    respx.get(ORDERS_URL).mock(return_value=httpx.Response(200, json=[]))
+    with httpx.Client() as c:
+        listing = _client(tmp_path, c).get_orders(ACCT, from_entered=NOW, to_entered=NOW)
+    assert listing.orders == () and listing.unparsed == ()
+
+
+@respx.mock
+def test_get_orders_non_list_payload_raises(tmp_path: Path) -> None:
+    respx.get(ORDERS_URL).mock(return_value=httpx.Response(200, json={"orderId": "1"}))
+    with httpx.Client() as c, pytest.raises(SchwabBadResponseError, match="array"):
+        _client(tmp_path, c).get_orders(ACCT, from_entered=NOW, to_entered=NOW)
+
+
+@respx.mock
+def test_get_orders_possible_truncation_raises(tmp_path: Path) -> None:
+    respx.get(ORDERS_URL).mock(return_value=httpx.Response(200, json=_fixture("order_list.json")))
+    with httpx.Client() as c, pytest.raises(SchwabBadResponseError, match="truncated"):
+        _client(tmp_path, c).get_orders(ACCT, from_entered=NOW, to_entered=NOW, max_results=2)
+
+
+@respx.mock
+def test_get_orders_isolates_an_unparseable_order(tmp_path: Path) -> None:
+    stock_slice = {
+        "orderId": "77",
+        "status": "FILLED",
+        "quantity": 0.5,  # fractional share entered elsewhere: not an order we could place
+        "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "NVDA"}}],
+    }
+    respx.get(ORDERS_URL).mock(
+        return_value=httpx.Response(200, json=[*_fixture("order_list.json"), stock_slice])
+    )
+    with httpx.Client() as c:
+        listing = _client(tmp_path, c).get_orders(ACCT, from_entered=NOW, to_entered=NOW)
+    assert len(listing.orders) == 2  # the rest of the listing still parses
+    (bad,) = listing.unparsed
+    assert (bad.order_id, bad.symbol) == ("77", "NVDA") and "integer" in bad.error
+
+
+def test_get_orders_rejects_naive_or_inverted_bounds(tmp_path: Path) -> None:
+    with httpx.Client() as c:
+        client = _client(tmp_path, c)
+        with pytest.raises(ValueError, match="timezone-aware"):
+            client.get_orders(ACCT, from_entered=datetime(2026, 6, 29), to_entered=NOW)
+        with pytest.raises(ValueError, match="on or after"):
+            client.get_orders(ACCT, from_entered=NOW, to_entered=NOW - timedelta(seconds=1))
+        with pytest.raises(ValueError, match="max_results"):
+            client.get_orders(ACCT, from_entered=NOW, to_entered=NOW, max_results=0)
+
+
+def test_parse_order_status_intent_fields() -> None:
+    base = {"orderId": "1", "status": "WORKING"}
+    legs = lambda instr: [{"instruction": instr, "instrument": {"symbol": "X"}}]  # noqa: E731
+    short = parse_order_status({**base, "orderLegCollection": legs("sell_short")})
+    assert short.instruction == "SELL_SHORT" and short.side is Side.SELL  # raw kept, upper-cased
+    cover = parse_order_status({**base, "orderLegCollection": legs("BUY_TO_COVER")})
+    assert cover.instruction == "BUY_TO_COVER" and cover.side is Side.BUY
+    other = parse_order_status({**base, "orderLegCollection": legs("EXCHANGE")})
+    assert other.instruction == "EXCHANGE" and other.side is None
+    bare = parse_order_status(base)  # no legs / time / type: unknown, not a guess
+    assert (bare.instruction, bare.side, bare.entered_time, bare.order_type) == ("", None, None, "")
+    assert parse_order_status({**base, "orderType": None}).order_type == ""  # not "NONE"
+    assert parse_order_status({**base, "orderType": "limit"}).order_type == "LIMIT"
+    market = parse_order_status({**base, "orderType": "MARKET", "price": 0})
+    assert market.price is None  # a MARKET order carries no price
+
+
+def test_entered_time_formats_normalize_to_utc() -> None:
+    base = {"orderId": "1", "status": "WORKING"}
+    at = datetime(2026, 6, 29, 14, 30, 5, tzinfo=UTC)
+    for raw in ("2026-06-29T14:30:05Z", "2026-06-29T14:30:05+0000", "2026-06-29T10:30:05-0400"):
+        parsed = parse_order_status({**base, "enteredTime": raw}).entered_time
+        assert parsed == at and parsed is not None and parsed.tzinfo is UTC
+    frac = parse_order_status({**base, "enteredTime": "2026-06-29T14:30:05.125+0000"})
+    assert frac.entered_time == at + timedelta(milliseconds=125)
+
+
+def test_intent_fields_strict_for_listings_lenient_for_polling() -> None:
+    bad = {
+        "orderId": "1",
+        "status": "FILLED",
+        "orderType": "LIMIT",
+        "enteredTime": "1719671405000",  # epoch-ms: an unexpected format
+        "price": "n/a",
+    }
+    polled = parse_order_status(bad)  # polling must never break on reconciliation-only fields
+    assert polled.status is OrderStatus.FILLED
+    assert polled.entered_time is None and polled.price is None
+    with pytest.raises(SchwabBadResponseError, match="enteredTime"):
+        parse_order_status(bad, strict_intent=True)
+    with pytest.raises(SchwabBadResponseError, match="price"):
+        parse_order_status({**bad, "enteredTime": "2026-06-29T14:30:05Z"}, strict_intent=True)
+
+
+def test_parse_order_list_isolates_malformed_items() -> None:
+    listing = parse_order_list([{"orderId": "1"}, "junk"])  # missing status / not an object
+    assert listing.orders == ()
+    assert [(u.order_id, u.symbol) for u in listing.unparsed] == [("1", ""), ("", "")]
 
 
 # --- cancel ----------------------------------------------------------------- #

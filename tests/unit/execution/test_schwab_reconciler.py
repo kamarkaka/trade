@@ -521,3 +521,74 @@ def test_a_clock_that_stepped_back_during_the_send_is_inconclusive() -> None:
     record = _record(created=T0, updated=T0 - timedelta(minutes=10))
     result, client = _reconcile(_one(), record, at=T0 + timedelta(hours=1))
     assert result.code == CLOCK_SKEW and client.calls == []
+
+
+# --- verify_binding: the check behind `trader reconcile --adopt` (LR9) ------------------ #
+
+
+class _OneOrder(_Client):
+    def __init__(self, order: SchwabOrderStatus | Exception) -> None:
+        super().__init__(_one())
+        self._order = order
+        self.reads: list[str] = []
+
+    def get_order(self, account_hash: str, order_id: str) -> SchwabOrderStatus:
+        self.reads.append(order_id)
+        if isinstance(self._order, Exception):
+            raise self._order
+        return self._order
+
+
+def _verify(order: SchwabOrderStatus | Exception, record: OrderRecord | None = None) -> str | None:
+    reconciler = SchwabOrderReconciler(
+        _OneOrder(order),  # type: ignore[arg-type]
+        ACCT,
+        clock=FakeClock(LATE),
+        bound_broker_ids=lambda: (),
+        bound_orders_created_between=lambda lo, hi: {},
+        awaiting_resolution=lambda: (),
+        consistency_window=WINDOW,
+        clock_skew=SKEW,
+        max_send_duration=MAX_SEND,
+    )
+    return reconciler.verify_binding(record or _record(), "SCH-1")
+
+
+def test_an_adopted_order_must_match_the_intent_exactly() -> None:
+    assert _verify(_listed()) is None
+    limit = _record(order_type=OrderType.LIMIT, limit=Decimal("101.50"))
+    assert _verify(_listed(order_type="LIMIT", price=Decimal("101.50")), limit) is None
+    cases = {
+        "symbol": _listed(symbol="TSLA"),
+        "instruction": _listed(instruction="SELL", side=Side.SELL),
+        "quantity": _listed(quantity=5, leg_quantity=5),
+        "order type": _listed(order_type="LIMIT", price=Decimal("100")),
+        "duration": _listed(duration="GTC"),
+        "session": _listed(session="SEAMLESS"),
+        "strategy type": _listed(strategy_type="OCO"),
+    }
+    for field, order in cases.items():
+        reason = _verify(order)
+        assert reason is not None and reason.endswith(field), (field, reason)
+    wrong_price = _verify(_listed(order_type="LIMIT", price=Decimal("101.51")), limit)
+    assert wrong_price is not None and "limit price" in wrong_price
+
+
+def test_an_adopted_order_entered_before_the_write_ahead_is_refused() -> None:
+    before = _verify(_listed(entered=T0 - SKEW - timedelta(seconds=1)))  # e.g. a manual order
+    assert before is not None and "entry time" in before
+    assert _verify(_listed(entered=T0 - SKEW)) is None  # within the skew allowance
+    assert _verify(_listed(entered=DOUBT_HI)) is None  # could still have landed then
+    late = _verify(_listed(entered=DOUBT_HI + timedelta(seconds=1)))
+    assert late is not None and "entry time" in late
+    unknown = _verify(_listed(entered=None))
+    assert unknown is not None and "entry time" in unknown
+
+
+def test_an_adopted_id_the_broker_cannot_show_is_refused() -> None:
+    missing = _verify(SchwabBadResponseError(f"accounts/{ACCT}/orders/SCH-1 404"))
+    assert missing is not None and "could not be read" in missing and ACCT not in missing
+    other = _verify(_listed("SCH-2"))
+    assert other is not None and "different order" in other
+    replaced = _verify(_listed(raw_status="REPLACED"))
+    assert replaced is not None and "replaced" in replaced

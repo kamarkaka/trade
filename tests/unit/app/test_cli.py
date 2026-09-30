@@ -55,11 +55,80 @@ def test_healthcheck_invalid_config_exits_nonzero(tmp_path: Path) -> None:
     assert result.exit_code != 0
 
 
-def test_stub_commands_run() -> None:
-    # `kill` is implemented as of M5.4 (see test_kill_switch.py); `reconcile` is still a stub.
-    result = runner.invoke(app, ["reconcile"])
+def test_reconcile_in_paper_mode_has_nothing_to_do() -> None:
+    result = runner.invoke(app, ["reconcile"])  # config/default.yaml is paper
     assert result.exit_code == 0
-    assert "not implemented" in result.output
+    assert "paper mode" in result.output
+
+
+def test_reconcile_refuses_while_another_process_holds_the_lease(tmp_path: Path) -> None:
+    from trader.state.lease import TradingLease
+
+    cfg = tmp_path / "c.yaml"
+    _write_run_config(cfg, "live", tmp_path)
+    with TradingLease(tmp_path / "state.sqlite"):  # e.g. the running daemon
+        result = runner.invoke(app, ["reconcile", "--config", str(cfg)])
+    assert result.exit_code == 3 and "trading lease" in result.output
+
+
+def test_reconcile_overrides_wait_for_the_broker_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Overrides are applied only once the broker is reachable (each --adopt is verified
+    # against the broker's order first); without credentials nothing is changed.
+    from trader.core import Order
+    from trader.core.enums import OrderType, Side
+    from trader.execution.idempotency import OrderRepository
+    from trader.state.db import connect
+    from trader.state.migrate import run_migrations
+
+    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)
+    monkeypatch.delenv("SCHWAB_APP_SECRET", raising=False)
+    conn = connect(tmp_path / "state.sqlite")
+    run_migrations(conn)
+    repo = OrderRepository(conn)
+    for cid in ("c-gone", "c-found"):
+        repo._write_pending(Order(cid, "s1", "AAPL", Side.BUY, 1, OrderType.MARKET))
+        repo.mark_unknown_after_send(cid)
+    cfg = tmp_path / "c.yaml"
+    _write_run_config(cfg, "live", tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "reconcile",
+            "--config",
+            str(cfg),
+            "--mark-not-placed",
+            "c-gone",
+            "--adopt",
+            "c-found=SCH-7",
+        ],
+    )
+    assert result.exit_code == 1  # no credentials to reach the broker
+    gone, found = repo.get("c-gone"), repo.get("c-found")
+    assert gone is not None and gone.status == "unknown"
+    assert found is not None and found.broker_order_id is None
+
+
+def test_reconcile_rejects_a_malformed_override(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.yaml"
+    _write_run_config(cfg, "live", tmp_path)
+    result = runner.invoke(app, ["reconcile", "--config", str(cfg), "--adopt", "no-equals"])
+    assert result.exit_code == 2 and "CID=BROKER_ORDER_ID" in result.output
+
+
+def test_run_refuses_while_another_process_holds_the_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from trader.state.lease import TradingLease
+
+    monkeypatch.setenv("SCHWAB_APP_KEY", "k")
+    monkeypatch.setenv("SCHWAB_APP_SECRET", "s")
+    cfg = tmp_path / "c.yaml"
+    _write_run_config(cfg, "paper", tmp_path)
+    with TradingLease(tmp_path / "state.sqlite"):
+        result = runner.invoke(app, ["run", "--config", str(cfg), "--once"])
+    assert result.exit_code == 3 and "trading lease" in result.output
 
 
 def _write_run_config(path: Path, mode: str, data_cache: Path) -> None:

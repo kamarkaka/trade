@@ -1,8 +1,11 @@
 """Tests for the per-strategy attribution ledger (M3.9b)."""
 
+import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 from trader.core import Fill, Position
 from trader.core.enums import OrderStatus, Side
@@ -98,3 +101,33 @@ def test_reconcile_multi_symbol(tmp_path: Path) -> None:
     ]
     parked = ledger.reconcile_total(broker)
     assert parked == [AttributedPosition(UNKNOWN, "MSFT", 1, Decimal("200"))]
+
+
+def test_reconcile_total_is_all_or_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ledger = _ledger(tmp_path)
+    ledger.reconcile_total(
+        [
+            Position("AAPL", 10, Decimal("100"), Decimal("1000")),
+            Position("MSFT", 5, Decimal("200"), Decimal("1000")),
+        ]
+    )
+    real_upsert = ledger._upsert
+    writes = {"n": 0}
+
+    def fail_on_the_second(*args: object) -> None:
+        writes["n"] += 1
+        if writes["n"] == 2:
+            raise sqlite3.OperationalError("disk I/O error")
+        real_upsert(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ledger, "_upsert", fail_on_the_second)
+    with pytest.raises(sqlite3.OperationalError):
+        ledger.reconcile_total(
+            [
+                Position("AAPL", 12, Decimal("100"), Decimal("1200")),
+                Position("MSFT", 7, Decimal("200"), Decimal("1400")),
+            ]
+        )
+    parked = {p.symbol: p.quantity for p in ledger.get_attributed(UNKNOWN)}
+    assert parked == {"AAPL": 10, "MSFT": 5}  # the AAPL write was rolled back too
+    assert not ledger.connection.in_transaction

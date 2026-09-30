@@ -40,8 +40,9 @@ created beneath this layer either.
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -81,6 +82,10 @@ class OrderOutcomeUnknownError(Exception):
         super().__init__(f"order {client_order_id}: outcome unknown ({detail}); not re-sent")
         self.client_order_id = client_order_id
         self.detail = detail
+
+
+class OverrideRefusedError(Exception):
+    """An operator override was refused; nothing was written."""
 
 
 class ReconcileOutcome(StrEnum):
@@ -172,6 +177,12 @@ class ResolveResult:
     outcome: ResolveOutcome
     broker_order_id: str | None = None
     detail: str = ""
+    # Why an UNRESOLVED row is unresolved: "re_anchored" / the reconciler's "window_open" mean
+    # "retry after the consistency window"; anything else needs a later listing or a human.
+    code: str = ""
+
+
+RETRY_LATER_CODES = frozenset({"re_anchored", "window_open"})
 
 
 _COLUMNS = (
@@ -233,6 +244,115 @@ class OrderRepository:
             (_iso(start), _iso(end)),
         ).fetchall()
         return {str(r[0]): _parse_ts(r[1]) for r in rows}
+
+    def open_orders(self) -> list[OrderRecord]:
+        """Every order not yet settled: pending/unknown (no broker id) or placed but not
+        completed (WORKING). Reconciliation drives each to a terminal state."""
+        rows = self._conn.execute(
+            "SELECT client_order_id FROM orders WHERE status IN (?, ?, ?) "
+            "ORDER BY created_at, rowid",
+            (PENDING, UNKNOWN, PLACED),
+        ).fetchall()
+        records = (self.get(str(r[0])) for r in rows)
+        return [r for r in records if r is not None]
+
+    # -- operator overrides (``trader reconcile``; only after checking the broker's records) - #
+
+    def apply_overrides(
+        self,
+        *,
+        not_placed: Sequence[OrderRecord] = (),
+        adopt: Sequence[tuple[OrderRecord, str]] = (),
+        unbind: Sequence[OrderRecord] = (),
+    ) -> None:
+        """Apply operator overrides all-or-nothing, each a compare-and-swap on the row as the
+        operator's command read it, with an ``audit_log`` row per override:
+
+        - ``not_placed``: an unsettled row without a broker id is not at the broker;
+        - ``adopt``: an unsettled row without a broker id is the broker's order (the caller
+          checks that order against the intent first);
+        - ``unbind``: a placed, uncompleted row is bound to the wrong broker order; it returns
+          to ``unknown`` without an id (re-anchored now) to be resolved afresh.
+
+        Raises ``OverrideRefusedError`` — having written nothing — if any row changed since it
+        was read or is not eligible, or if a broker id already belongs to another order."""
+        now = _iso(self._now())
+        self._conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            for record in not_placed:
+                self._override(
+                    record,
+                    "not_placed",
+                    "UPDATE orders SET status = ?, updated_at = ?, version = version + 1 "
+                    "WHERE client_order_id = ? AND version = ? AND broker_order_id IS NULL "
+                    "AND status IN (?, ?)",
+                    (NOT_PLACED, now, record.client_order_id, record.version, PENDING, UNKNOWN),
+                    now,
+                )
+            for record, broker_order_id in adopt:
+                try:
+                    self._override(
+                        record,
+                        "adopt",
+                        "UPDATE orders SET status = ?, broker_order_id = ?, updated_at = ?, "
+                        "version = version + 1 WHERE client_order_id = ? AND version = ? "
+                        "AND broker_order_id IS NULL AND status IN (?, ?)",
+                        (
+                            PLACED,
+                            broker_order_id,
+                            now,
+                            record.client_order_id,
+                            record.version,
+                            PENDING,
+                            UNKNOWN,
+                        ),
+                        now,
+                        broker_order_id=broker_order_id,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise OverrideRefusedError(
+                        f"{broker_order_id} is already bound to another order"
+                    ) from exc
+            for record in unbind:
+                self._override(
+                    record,
+                    "unbind",
+                    "UPDATE orders SET status = ?, broker_order_id = NULL, updated_at = ?, "
+                    "version = version + 1 WHERE client_order_id = ? AND version = ? "
+                    "AND broker_order_id IS NOT NULL AND status = ?",
+                    (UNKNOWN, now, record.client_order_id, record.version, PLACED),
+                    now,
+                    broker_order_id=record.broker_order_id,
+                )
+            self._conn.execute("COMMIT")
+            committed = True
+        finally:
+            if not committed and self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+
+    def _override(
+        self,
+        record: OrderRecord,
+        action: str,
+        sql: str,
+        params: tuple[object, ...],
+        now: str,
+        *,
+        broker_order_id: str | None = None,
+    ) -> None:
+        cid = record.client_order_id
+        if self._conn.execute(sql, params).rowcount != 1:
+            raise OverrideRefusedError(f"{cid} changed since it was read, or is not eligible")
+        payload = {"detail": f"operator override: {action}", "action": action, "cid": cid}
+        if broker_order_id is not None:
+            payload["broker_order_id"] = broker_order_id
+        self._conn.execute(
+            "INSERT INTO audit_log (ts, cycle_id, strategy_id, kind, payload) "
+            "VALUES (?, NULL, ?, 'operator_override', ?)",
+            (now, record.strategy_id, json.dumps(payload)),
+        )
+        _log.warning("operator override", action=action, cid=cid, broker_order_id=broker_order_id)
 
     def awaiting_resolution(self) -> list[OrderRecord]:
         """Rows whose placement outcome is not settled: pending/unknown with no broker id."""
@@ -416,6 +536,16 @@ class OrderRepository:
                 self._conn.execute("ROLLBACK")
 
 
+def unsettled_without_id(record: OrderRecord) -> bool:
+    """Eligible for ``--mark-not-placed`` / ``--adopt``: placement outcome not settled."""
+    return record.broker_order_id is None and record.status in (PENDING, UNKNOWN)
+
+
+def placed_uncompleted(record: OrderRecord) -> bool:
+    """Eligible for ``--unbind``: bound to a broker order, not yet completed."""
+    return record.broker_order_id is not None and record.status == PLACED
+
+
 def _safe_reconcile(reconcile: Reconciler, record: OrderRecord) -> ReconcileResult:
     """A reconciler that raises has not proven anything: treat it as INCONCLUSIVE."""
     try:
@@ -439,7 +569,9 @@ def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler
         return ResolveResult(ResolveOutcome.NOT_PLACED)
     if record.status not in (PENDING, UNKNOWN):
         return ResolveResult(
-            ResolveOutcome.UNRESOLVED, detail=f"status {record.status!r} without a broker id"
+            ResolveOutcome.UNRESOLVED,
+            detail=f"status {record.status!r} without a broker id",
+            code="invalid_state",
         )
 
     result = _safe_reconcile(reconcile, record)
@@ -449,16 +581,22 @@ def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler
         except sqlite3.IntegrityError:
             _log.error("reconciled broker id already belongs to another order", cid=cid)
             return ResolveResult(
-                ResolveOutcome.UNRESOLVED, detail="broker id already bound to another order"
+                ResolveOutcome.UNRESOLVED,
+                detail="broker id already bound to another order",
+                code="conflict",
             )
         if not adopted:
-            return ResolveResult(ResolveOutcome.UNRESOLVED, detail="row changed concurrently")
+            return ResolveResult(
+                ResolveOutcome.UNRESOLVED, detail="row changed concurrently", code="conflict"
+            )
         _log.info("adopted already-placed order", cid=cid, broker_order_id=result.broker_order_id)
         return ResolveResult(ResolveOutcome.PLACED, result.broker_order_id)
 
     if result.outcome is ReconcileOutcome.ABSENT and record.status == UNKNOWN:
         if not repo.transition(record, NOT_PLACED):
-            return ResolveResult(ResolveOutcome.UNRESOLVED, detail="row changed concurrently")
+            return ResolveResult(
+                ResolveOutcome.UNRESOLVED, detail="row changed concurrently", code="conflict"
+            )
         _log.warning("order confirmed absent at the broker", cid=cid, detail=result.detail)
         return ResolveResult(ResolveOutcome.NOT_PLACED)
 
@@ -467,10 +605,11 @@ def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler
         # "absent" can't be trusted yet. Re-anchor at now — after the crash — so the
         # consistency window starts after any send the dead process could have made.
         repo.transition(record, UNKNOWN)
-        detail = "pending row re-anchored after an interrupted send"
+        detail, code = "pending row re-anchored after an interrupted send", "re_anchored"
     else:  # an unknown row keeps its anchor: a refusal must not push the window forward
         detail = f"reconcile {result.outcome.value}: {result.detail}"
-    return ResolveResult(ResolveOutcome.UNRESOLVED, detail=detail)
+        code = result.code or result.outcome.value
+    return ResolveResult(ResolveOutcome.UNRESOLVED, detail=detail, code=code)
 
 
 def _best_effort(action: Callable[[str], object], cid: str) -> object:
@@ -577,17 +716,21 @@ __all__ = [
     "NOT_PLACED",
     "PENDING",
     "PLACED",
+    "RETRY_LATER_CODES",
     "TERMINAL",
     "UNKNOWN",
     "OrderOutcomeUnknownError",
     "OrderRecord",
     "OrderRepository",
+    "OverrideRefusedError",
     "ReconcileOutcome",
     "ReconcileResult",
     "Reconciler",
     "ResolveOutcome",
     "ResolveResult",
     "place_idempotent",
+    "placed_uncompleted",
     "resolve",
     "submit_idempotent",
+    "unsettled_without_id",
 ]

@@ -81,8 +81,21 @@ class AttributionLedger:
 
         Idempotent in state: the parked 'unknown' quantity is always exactly the true
         residual (the *real*, non-'unknown' attribution is excluded from the sum), and a
-        symbol that has come to tie out has its stale 'unknown' row cleared.
+        symbol that has come to tie out has its stale 'unknown' row cleared. Atomic: a
+        failure part-way leaves the previous 'unknown' rows untouched.
         """
+        self._conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            residual = self._reconcile_total(broker_positions)
+            self._conn.execute("COMMIT")
+            committed = True
+            return residual
+        finally:
+            if not committed and self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+
+    def _reconcile_total(self, broker_positions: Sequence[Position]) -> list[AttributedPosition]:
         real = {
             sym: int(qty)
             for sym, qty in self._conn.execute(

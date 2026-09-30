@@ -149,8 +149,8 @@ class OrderRecord:
 #   intent exactly, was entered while this order could have been in flight, and no other
 #   unresolved local order could own it;
 # - return ABSENT only when the listing is complete and NO broker order that could be this
-#   one was entered anywhere it could have landed (the send window widened by the
-#   consistency window on both sides);
+#   one was entered anywhere it could have landed (the send window — reaching at least to
+#   updated_at, e.g. for a re-anchored row — widened by the consistency window both ways);
 # - otherwise return INCONCLUSIVE.
 Reconciler = Callable[[OrderRecord], ReconcileResult]
 

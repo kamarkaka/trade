@@ -505,3 +505,19 @@ def test_the_clock_check_tolerates_skew_in_both_directions() -> None:
     assert _reconcile(_one(ahead), known={"SCH-9": T0}, bound=("SCH-9",))[0].outcome is (
         ReconcileOutcome.ABSENT
     )
+
+
+def test_one_slow_known_send_does_not_trip_the_clock_check() -> None:
+    fast = _listed("SCH-8", symbol="MSFT", entered=T0 + timedelta(seconds=5))
+    slow = _listed("SCH-9", symbol="MSFT", entered=T0 + timedelta(minutes=7, seconds=1))
+    known = {"SCH-8": T0, "SCH-9": T0}
+    result, _ = _reconcile(_one(fast, slow), known=known, bound=("SCH-8", "SCH-9"))
+    assert result.outcome is ReconcileOutcome.ABSENT  # the fastest one calibrates the clock
+    only_slow = _reconcile(_one(slow), known={"SCH-9": T0}, bound=("SCH-9",))[0]
+    assert only_slow.code == CLOCK_SKEW  # every known order late: our clock is behind
+
+
+def test_a_clock_that_stepped_back_during_the_send_is_inconclusive() -> None:
+    record = _record(created=T0, updated=T0 - timedelta(minutes=10))
+    result, client = _reconcile(_one(), record, at=T0 + timedelta(hours=1))
+    assert result.code == CLOCK_SKEW and client.calls == []

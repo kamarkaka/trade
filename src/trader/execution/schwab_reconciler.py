@@ -112,6 +112,11 @@ class SchwabOrderReconciler:
             return ReconcileResult.inconclusive(
                 f"status {record.status!r} has no settled send window yet", NOT_SETTLED
             )
+        if record.updated_at < record.created_at:
+            # The local clock stepped back during the send: the windows would invert.
+            return ReconcileResult.inconclusive(
+                "the row was marked before it was written (clock stepped back)", CLOCK_SKEW
+            )
         snapshot = self._clock.now()  # the local time the listing is requested
         waited = snapshot - record.updated_at
         if waited < self._window:
@@ -150,15 +155,19 @@ class SchwabOrderReconciler:
             return ReconcileResult.inconclusive(
                 f"{len(missing)} known order(s) missing from the listing", LISTING_INCOMPLETE
             )
-        for broker_order_id, written_at in known.items():
-            entered = listed[broker_order_id].entered_time if broker_order_id in listed else None
-            if entered is not None and not (
-                written_at - self._skew <= entered <= written_at + self._max_send + self._skew
-            ):
-                _log.error("broker entry times disagree with our clock", cid=record.client_order_id)
-                return ReconcileResult.inconclusive(
-                    "a known order's entry time is outside its send window", CLOCK_SKEW
-                )
+        # Clock check on our known orders' (entered - written) offsets: no order can be
+        # entered before we wrote it (beyond skew), and even the FASTEST send must have been
+        # entered within max_send + skew — one slow send alone must not trip it.
+        offsets = [
+            listed[bid].entered_time - written_at  # type: ignore[operator]
+            for bid, written_at in known.items()
+            if bid in listed and listed[bid].entered_time is not None
+        ]
+        if offsets and not (-self._skew <= min(offsets) <= self._max_send + self._skew):
+            _log.error("broker entry times disagree with our clock", cid=record.client_order_id)
+            return ReconcileResult.inconclusive(
+                "known orders' entry times disagree with our clock", CLOCK_SKEW
+            )
 
         bound = set(self._bound_broker_ids())
         doubt = [

@@ -23,9 +23,18 @@ class ZScoreRevertParams(BaseModel):
     lot: int = Field(default=10, gt=0)
 
 
+class CanaryParams(BaseModel):
+    """Validated params for the canary strategy (guarded live verification)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    lot: int = Field(default=1, gt=0)
+
+
 # name -> param model. Strategies absent from this map accept params unvalidated.
 PARAM_MODELS: dict[str, type[BaseModel]] = {
     "zscore_revert": ZScoreRevertParams,
+    "canary": CanaryParams,
 }
 
 
@@ -41,4 +50,4 @@ def validate_params(name: str, params: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"invalid params for strategy {name!r}: {exc}") from exc
 
 
-__all__ = ["PARAM_MODELS", "ZScoreRevertParams", "validate_params"]
+__all__ = ["PARAM_MODELS", "CanaryParams", "ZScoreRevertParams", "validate_params"]

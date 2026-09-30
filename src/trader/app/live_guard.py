@@ -13,8 +13,9 @@ unconditional blocker so ``trader run`` **refuses every live start** and no real
 placed. M5.6 ships the gate machinery; M5.7 turns it on with the first real order.
 
 After these static checks pass, ``trader run`` connects and runs the startup reconciliation
-gate (``reconcile_before_live``): every open order settled and positions trued to the broker
-before trading — an unclean account refuses to start.
+gate (``reconcile_before_live``): every open order settled and positions matching the
+acknowledged baseline before trading — an unclean account refuses to start (and the refusal
+latches the kill switch).
 
 These functions are pure/inspectable so the safety gate is CI-enforced, not manual.
 """
@@ -166,13 +167,18 @@ def reconcile_before_live(
     *,
     wait: Callable[[float], None],
     window_seconds: float,
+    notify: Callable[[str], None] = lambda _message: None,
 ) -> AccountReconcileReport:
-    """The startup reconciliation gate: settle every open order and true positions before
+    """The startup reconciliation gate: settle every open order and compare positions before
     trading. If the only obstacle is a consistency window still open (e.g. a restart right
-    after a crash mid-send), wait it out once and try again; the caller refuses to start on
-    anything that is still not clean."""
+    after a crash mid-send), wait it out once and try again. Each pass is judged on its own
+    and neither acknowledges anything (reconciliation never moves the positions baseline),
+    so a change seen by the first pass is still a change on the second — and on every later
+    start — until the operator settles or accepts it. The caller refuses to start on
+    anything that is not clean."""
     report = run_reconcile()
     if not report.is_clean and report.retry_later:
+        notify(f"waiting {window_seconds:.0f}s for the consistency window before a second pass")
         wait(window_seconds)
         report = run_reconcile()
     return report

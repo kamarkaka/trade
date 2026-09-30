@@ -11,7 +11,12 @@ import pytest
 from fakes import FakeBroker
 from trader.core import Fill, Order, Position
 from trader.core.enums import OrderStatus, OrderType, Side
-from trader.execution.account_reconcile import Settlement, reconcile_account, summary_lines
+from trader.execution.account_reconcile import (
+    Settlement,
+    accept_positions,
+    reconcile_account,
+    summary_lines,
+)
 from trader.execution.executor import in_memory_reconciler
 from trader.execution.idempotency import (
     OrderOutcomeUnknownError,
@@ -21,7 +26,7 @@ from trader.execution.idempotency import (
     place_idempotent,
 )
 from trader.execution.poller import PollPolicy
-from trader.state.attribution import AttributionLedger
+from trader.state.attribution import AttributionLedger, BaselineChange
 from trader.state.db import connect
 from trader.state.lease import TradingLease
 from trader.state.migrate import run_migrations
@@ -152,15 +157,37 @@ def test_an_unreadable_status_leaves_the_order_unresolved(tmp_path: Path) -> Non
     assert broker.cancelled == []  # nothing known about it: never cancelled blind
 
 
-def test_position_divergence_is_reported_and_parked(tmp_path: Path) -> None:
+def test_position_divergence_is_reported_until_accepted(tmp_path: Path) -> None:
     broker = _Cancellable()
     repo, attribution, _ = _setup(tmp_path, broker)
     broker.set_position(Position("TSLA", 5, Decimal("200"), Decimal("1000")))  # bought by hand
+    for _ in range(2):  # a second run doesn't acknowledge it either
+        report = _run(broker, repo, attribution)
+        assert report.orders == () and not report.positions.is_clean and not report.is_clean
+        lines = summary_lines(report)
+        assert "  TSLA: broker 5, attributed 0, unattributed 5, acknowledged 0" in lines
+        assert lines[-1] == "result: NOT CLEAN - needs attention"
+    assert attribution.get_attributed("unknown") == []
+    assert accept_positions(report, attribution) == [BaselineChange("TSLA", 0, 5)]
+    after = _run(broker, repo, attribution)
+    assert (
+        after.is_clean
+        and "acknowledged unattributed holding(s), unchanged: TSLA 5" in (summary_lines(after)[1])
+    )
+
+
+def test_positions_are_not_accepted_while_an_order_is_unresolved(tmp_path: Path) -> None:
+    # The unresolved order's fill may be exactly what is unattributed.
+    broker = _Cancellable()
+    repo, attribution, _ = _setup(tmp_path, broker)
+    repo._write_pending(_order("c1"))  # the sender died mid-send; the order may have filled
+    broker.set_position(Position("AAPL", 10, Decimal("100"), Decimal("1000")))
     report = _run(broker, repo, attribution)
-    assert report.orders == () and not report.positions.is_clean and not report.is_clean
-    lines = summary_lines(report)
-    assert any("TSLA: broker 5" in line for line in lines)
-    assert {p.symbol: p.quantity for p in attribution.get_attributed("unknown")} == {"TSLA": 5}
+    assert report.retry_later and not report.positions.is_clean
+    assert summary_lines(report)[-1] == "result: NOT CLEAN - run again after the consistency window"
+    with pytest.raises(ValueError, match="1 order\\(s\\) unresolved"):
+        accept_positions(report, attribution)
+    assert attribution.get_attributed("unknown") == []
 
 
 def test_a_clean_account_reports_clean(tmp_path: Path) -> None:

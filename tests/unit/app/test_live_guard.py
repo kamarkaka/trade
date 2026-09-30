@@ -206,6 +206,126 @@ def test_still_unclean_after_the_wait_is_returned_unclean() -> None:
     assert not report.is_clean and waits == [300]  # waits once, never loops
 
 
+def test_the_wait_is_announced() -> None:
+    from trader.app.live_guard import reconcile_before_live
+
+    notes: list[str] = []
+    reports = iter([_report(clean=False, retry_later=True), _report(clean=True)])
+    reconcile_before_live(
+        lambda: next(reports), wait=lambda _s: None, window_seconds=300, notify=notes.append
+    )
+    assert notes == ["waiting 300s for the consistency window before a second pass"]
+
+
+# --- the gate over a real account reconciliation (LR10 review) ----------------------- #
+
+
+class _Account:
+    """A live account after the daemon died mid-send: the order DID land and fill at the
+    broker, and the state database only has its write-ahead ``pending`` row. The broker's
+    reconciler answers like Schwab's: NOT_SETTLED for a pending row (``resolve`` re-anchors
+    it), then — once the window has passed — ``answer`` for the re-anchored unknown row."""
+
+    def __init__(self, tmp_path: Path, answer: str) -> None:
+        from fakes import FakeBroker
+        from trader.core import Order, Position
+        from trader.core.enums import OrderType, Side
+        from trader.execution.idempotency import OrderRepository
+        from trader.state.attribution import AttributionLedger
+        from trader.state.db import connect
+        from trader.state.migrate import run_migrations
+
+        conn = connect(tmp_path / "live.sqlite")
+        run_migrations(conn)
+        self.repo, self.attribution = OrderRepository(conn), AttributionLedger(conn)
+        self.broker = FakeBroker()
+        order = Order("c1", "canary", "AAPL", Side.BUY, 10, OrderType.MARKET)
+        self.repo._write_pending(order)
+        self.broker_order_id = self.broker.submit_order(order)
+        self.broker.set_position(Position("AAPL", 10, Decimal("100"), Decimal("1000")))
+        self.answer = answer
+        self.waits: list[float] = []
+
+    def reconcile_order(self, record):  # type: ignore[no-untyped-def]
+        from trader.execution.idempotency import ReconcileResult
+
+        if record.status != "unknown":
+            return ReconcileResult.inconclusive("no settled send window yet", "not_settled")
+        if self.answer == "found":
+            return ReconcileResult.found(self.broker_order_id, "unique intent match")
+        if self.answer == "absent":  # a false ABSENT (e.g. a lagging listing)
+            return ReconcileResult.absent("no listed order could be this one")
+        return ReconcileResult.inconclusive("two candidates", "ambiguous")
+
+    def start(self):  # type: ignore[no-untyped-def]
+        """One live start's gate."""
+        from trader.app.live_guard import reconcile_before_live
+        from trader.execution.account_reconcile import reconcile_account
+        from trader.execution.poller import PollPolicy
+
+        class _Held:
+            held = True
+
+        return reconcile_before_live(
+            lambda: reconcile_account(
+                broker=self.broker,
+                repo=self.repo,
+                attribution=self.attribution,
+                reconcile_order=self.reconcile_order,
+                poll_policy=PollPolicy(timeout_seconds=0, post_cancel_polls=1),
+                lease=_Held(),  # type: ignore[arg-type]
+                sleep=lambda _s: None,
+            ),
+            wait=self.waits.append,
+            window_seconds=300,
+        )
+
+    def baseline(self) -> dict[str, int]:
+        return {p.symbol: p.quantity for p in self.attribution.get_attributed("unknown")}
+
+
+def test_crash_recovery_adopts_our_fill_without_reporting_a_change(tmp_path: Path) -> None:
+    account = _Account(tmp_path, answer="found")
+    report = account.start()
+    assert report.is_clean and account.waits == [300]  # one wait, then adopted + completed
+    assert [o.outcome.value for o in report.orders] == ["completed"]
+    attributed = account.attribution.get_attributed("canary")
+    assert {p.symbol: p.quantity for p in attributed} == {"AAPL": 10}
+    assert account.baseline() == {}  # nothing acknowledged along the way
+
+
+def test_a_false_absent_is_refused_on_every_start_until_someone_looks(tmp_path: Path) -> None:
+    account = _Account(tmp_path, answer="absent")
+    first = account.start()
+    assert not first.is_clean and account.waits == [300]
+    assert [o.outcome.value for o in first.orders] == ["not_placed"]
+    assert [d.symbol for d in first.positions.discrepancies] == ["AAPL"]  # 10 unexplained
+    second = account.start()  # e.g. the container restarted after the refusal
+    assert not second.is_clean and [d.symbol for d in second.positions.discrepancies] == ["AAPL"]
+    assert account.baseline() == {}
+
+
+def test_accepted_positions_let_the_next_start_through(tmp_path: Path) -> None:
+    from trader.execution.account_reconcile import accept_positions
+
+    account = _Account(tmp_path, answer="absent")
+    refused = account.start()
+    accept_positions(refused, account.attribution)  # the operator reviewed the 10 shares
+    report = account.start()
+    assert report.is_clean and [d.symbol for d in report.positions.standing] == ["AAPL"]
+
+
+def test_positions_are_not_accepted_while_an_order_is_unresolved(tmp_path: Path) -> None:
+    from trader.execution.account_reconcile import accept_positions
+
+    account = _Account(tmp_path, answer="ambiguous")
+    refused = account.start()
+    assert [o.code for o in refused.unresolved] == ["ambiguous"]
+    with pytest.raises(ValueError, match="unresolved"):
+        accept_positions(refused, account.attribution)
+    assert account.baseline() == {}
+
+
 # --- startup alert ---------------------------------------------------------- #
 
 

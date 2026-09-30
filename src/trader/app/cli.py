@@ -10,11 +10,12 @@ out by later milestones: ``backtest`` (M2), ``run`` (M3/M4), ``reconcile`` (M4),
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import sqlite3
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
@@ -27,6 +28,11 @@ from trader.observability.logging import configure_logging
 from trader.schwab.config import SchwabClientConfig, schwab_config_from_env
 from trader.schwab.errors import SchwabAuthError, SchwabError
 from trader.schwab.http import SchwabHttp
+
+if TYPE_CHECKING:
+    from trader.execution.account_reconcile import AccountReconcileReport
+    from trader.observability.alerting import Alerter, AlertKind
+    from trader.state.attribution import AttributionLedger
 
 # Default backtest starting capital until a config-driven account balance exists.
 _BACKTEST_STARTING_CASH = "100000"
@@ -170,6 +176,29 @@ def _live_account(
     return _LiveAccount(broker, reconciler, account_hash)
 
 
+def _refuse_live_start(
+    conn: sqlite3.Connection, alerter: Alerter, kind: AlertKind, reason: str
+) -> typer.Exit:
+    """Refuse a live start: latch the kill switch — so a container restart policy can't
+    retry the start (and re-alert) in a loop until someone has looked — alert once, and
+    return the exit to raise."""
+    from trader.observability.alerting import AlertEvent
+    from trader.observability.logging import get_logger
+    from trader.risk.kill_switch import KillSwitch
+
+    try:
+        KillSwitch(conn).engage(f"live start refused: {reason}", source="auto")
+    except Exception as exc:  # the alert below still goes out
+        get_logger("cli").error("could not engage the kill switch", error=type(exc).__name__)
+    alerter.alert(AlertEvent(kind, f"live start refused: {reason}; kill switch engaged"))
+    typer.echo(
+        f"run error: live start refused: {reason}. Settle the account (trader reconcile), "
+        "then release the kill switch (trader kill --off).",
+        err=True,
+    )
+    return typer.Exit(1)
+
+
 def _auth_status_line(cfg: AppConfig) -> str:
     """One-line Schwab auth/token-age summary for ``status`` (no network)."""
     from trader.auth.token_store import TokenStore
@@ -207,6 +236,7 @@ def status(
 
 @app.command()
 def run(
+    ctx: typer.Context,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
     once: Annotated[
         bool, typer.Option("--once", help="Fire each slot once and exit (no blocking loop).")
@@ -239,7 +269,7 @@ def run(
     from trader.execution.executor import DurableOrderExecutor, in_memory_reconciler
     from trader.execution.idempotency import OrderRepository, Reconciler
     from trader.execution.poller import DEFAULT_RETRYABLE, PollPolicy
-    from trader.observability.alerting import AlertEvent, AlertKind, build_alerter
+    from trader.observability.alerting import AlertKind, build_alerter
     from trader.observability.heartbeat import Heartbeat
     from trader.observability.logging import get_logger
     from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
@@ -303,6 +333,7 @@ def run(
             err=True,
         )
         raise typer.Exit(3)
+    ctx.call_on_close(lease.release)  # when the command returns (e.g. a refused start)
     state = connect(Path(cfg.observability.db_path))
     run_migrations(state)
     cash = Decimal(_BACKTEST_STARTING_CASH)
@@ -351,43 +382,58 @@ def run(
         attribution = AttributionLedger(state)  # same connection: atomic completion
         broker: Broker
         if is_live:
-            live = _live_account(cfg, http, repo, clock=clock, fees=fees, command="run")
+            poll_policy = PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds)
+            retryable = TRANSIENT_READ_ERRORS
+            # Startup reconciliation gate (design §10): settle every open order and check the
+            # positions against the broker BEFORE trading. The trading lease is held, so
+            # nothing else can be sending. Anything unclean — or a failure to find out —
+            # refuses the start.
+            try:
+                live = _live_account(cfg, http, repo, clock=clock, fees=fees, command="run")
+                report = reconcile_before_live(
+                    lambda: reconcile_account(
+                        broker=live.broker,
+                        repo=repo,
+                        attribution=attribution,
+                        reconcile_order=live.reconciler,
+                        poll_policy=poll_policy,
+                        lease=lease,
+                        retryable=TRANSIENT_READ_ERRORS,
+                    ),
+                    wait=_time.sleep,
+                    window_seconds=cfg.execution.reconcile_window_seconds,
+                    notify=lambda message: typer.echo(f"startup reconcile: {message}"),
+                )
+            except typer.Exit:
+                raise
+            except Exception as exc:  # e.g. the broker unreachable: never trade blind
+                # A traceback for a bug; for a broker error the type only (its text can carry
+                # the account hash).
+                broker_error = isinstance(exc, (SchwabError, httpx.HTTPError, OSError))
+                get_logger("cli").error(
+                    "startup reconciliation failed",
+                    error=type(exc).__name__,
+                    exc_info=not broker_error,
+                )
+                raise _refuse_live_start(
+                    state,
+                    alerter,
+                    AlertKind.CRASH,
+                    f"startup reconciliation failed ({type(exc).__name__})",
+                ) from exc
+            for line in summary_lines(report):
+                typer.echo(f"startup reconcile: {line}")
+            if not report.is_clean:
+                raise _refuse_live_start(
+                    state,
+                    alerter,
+                    AlertKind.RECONCILE_MISMATCH,
+                    "startup reconciliation is not clean",
+                )
             # Live counters persist across restarts; the live state database serves one account.
             counters_scope = "live"
             broker = live.broker
             reconciler: Reconciler = live.reconciler
-            poll_policy = PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds)
-            retryable = TRANSIENT_READ_ERRORS
-            # Startup reconciliation gate (design §10): settle every open order and true the
-            # positions to the broker BEFORE trading. The trading lease is held, so nothing
-            # else can be sending; an unclean account refuses to start (and alerts).
-            report = reconcile_before_live(
-                lambda: reconcile_account(
-                    broker=live.broker,
-                    repo=repo,
-                    attribution=attribution,
-                    reconcile_order=live.reconciler,
-                    poll_policy=poll_policy,
-                    retryable=TRANSIENT_READ_ERRORS,
-                ),
-                wait=_time.sleep,
-                window_seconds=cfg.execution.reconcile_window_seconds,
-            )
-            for line in summary_lines(report):
-                typer.echo(f"startup reconcile: {line}")
-            if not report.is_clean:
-                alerter.alert(
-                    AlertEvent(
-                        AlertKind.RECONCILE_MISMATCH,
-                        "live start refused: startup reconciliation is not clean",
-                    )
-                )
-                typer.echo(
-                    "run error: startup reconciliation is not clean; settle it (trader "
-                    "reconcile) before going live",
-                    err=True,
-                )
-                raise typer.Exit(1)
             # Live state is NEVER silent: log it loud and alert at startup (design §10).
             get_logger("cli").warning("STARTING IN LIVE MODE — REAL ORDERS ENABLED")
             announce_live(alerter)
@@ -447,11 +493,9 @@ def run(
                 cfg.risk,
             ),
         )
-        # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
-        # only for a broker whose positions survive a restart; SimBroker is in-memory (always
-        # flat on restart), so trueing the durable attribution ledger up to it would corrupt
-        # intent and fire a spurious mismatch alert every restart. In-session reconcile lands
-        # with the durable SchwabBroker (M5).
+        # Live reconciles at startup (the gate above) and on demand (`trader reconcile`).
+        # Paper doesn't: SimBroker is in-memory (flat after every restart), so comparing the
+        # durable attribution ledger with it would report each restart as a change.
         daemon = SchedulerDaemon(
             bindings=bindings,
             schedule=schedule,
@@ -740,20 +784,31 @@ def reconcile(
             "that id so the order is resolved afresh.",
         ),
     ] = None,
+    accept_positions: Annotated[
+        bool,
+        typer.Option(
+            "--accept-positions",
+            help="Acknowledge the account's current unattributed holdings (e.g. your own "
+            "positions or trades) as the new baseline. Refused while any order is unresolved.",
+        ),
+    ] = False,
 ) -> None:
-    """Settle open orders against the LIVE Schwab account, then true positions.
+    """Settle open orders against the LIVE Schwab account, then check positions.
 
     Never places an order (an unfinished order's remainder may be cancelled). Requires the
     trading lease, so the daemon must be stopped. Overrides are all checked before anything
     changes — each ``--adopt`` id against the Schwab order itself — and applied together or
     not at all.
 
+    Holdings the strategies are not attributed (e.g. your own positions in the account) must
+    match the acknowledged baseline; any change is reported until explained or accepted
+    with ``--accept-positions`` — so on the first run against an account with holdings,
+    review them, then accept them once.
+
     Exit codes: 0 clean; 1 configuration, credentials, account selection or state database
     error; 2 not clean (unresolved orders or position divergence) or an override refused;
     3 another trader process holds the trading lease; 4 the broker could not be reached or
     returned an error."""
-    import sqlite3
-
     import httpx
 
     from trader.auth.token_store import TokenStore
@@ -803,15 +858,20 @@ def reconcile(
                 live = _live_account(cfg, http, repo, clock=clock, fees=fees, command="reconcile")
                 _verify_adoptions(live.reconciler, plan)
                 _apply_overrides(repo, plan)
+                attribution = AttributionLedger(conn)
                 report = reconcile_account(
                     broker=live.broker,
                     repo=repo,
-                    attribution=AttributionLedger(conn),
+                    attribution=attribution,
                     reconcile_order=live.reconciler,
                     poll_policy=PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds),
                     lease=lease,
                     retryable=TRANSIENT_READ_ERRORS,
                 )
+                for line in summary_lines(report):
+                    typer.echo(line)
+                if accept_positions:
+                    report = _accept_positions(report, attribution, live.broker)
         except (SchwabError, httpx.HTTPError, OSError) as exc:
             # The type only: a broker error's text can carry the account hash.
             typer.echo(
@@ -820,8 +880,6 @@ def reconcile(
                 err=True,
             )
             raise typer.Exit(4) from exc
-        for line in summary_lines(report):
-            typer.echo(line)
         if not report.is_clean:
             raise typer.Exit(2)
     except sqlite3.Error as exc:
@@ -829,6 +887,29 @@ def reconcile(
         raise typer.Exit(1) from exc
     finally:
         lease.release()
+
+
+def _accept_positions(
+    report: AccountReconcileReport, attribution: AttributionLedger, broker: SchwabBroker
+) -> AccountReconcileReport:
+    """Acknowledge the unattributed holdings as the new baseline (refused, exit 2, while any
+    order is unresolved), then re-check the positions; returns the re-checked report."""
+    from trader.execution.account_reconcile import accept_positions
+    from trader.execution.reconcile import reconcile as check_positions
+
+    try:
+        changes = accept_positions(report, attribution)
+    except ValueError as exc:
+        typer.echo(f"reconcile error: positions not accepted: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    for change in changes:
+        typer.echo(f"accepted: {change.symbol} unattributed {change.old} -> {change.new}")
+    if not changes:
+        typer.echo("accepted: nothing to change")
+    checked = replace(report, positions=check_positions(broker, attribution))
+    verdict = "CLEAN" if checked.is_clean else "NOT CLEAN - positions moved meanwhile; run again"
+    typer.echo(f"result after accepting: {verdict}")
+    return checked
 
 
 @dataclass(frozen=True)

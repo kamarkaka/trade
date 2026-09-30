@@ -9,7 +9,12 @@ import pytest
 
 from trader.core import Fill, Position
 from trader.core.enums import OrderStatus, Side
-from trader.state.attribution import UNKNOWN, AttributedPosition, AttributionLedger
+from trader.state.attribution import (
+    UNKNOWN,
+    AttributedPosition,
+    AttributionLedger,
+    BaselineChange,
+)
 from trader.state.db import connect
 from trader.state.migrate import run_migrations
 
@@ -56,61 +61,36 @@ def test_independent_strategies_same_symbol(tmp_path: Path) -> None:
     assert ledger.get_attributed("meanrev")[0].quantity == -5  # separate sub-positions
 
 
-def test_reconcile_parks_unattributed_delta(tmp_path: Path) -> None:
+def _position(symbol: str, qty: int, avg: str = "100") -> Position:
+    return Position(symbol, qty, Decimal(avg), Decimal(avg) * qty)
+
+
+def test_unattributed_is_what_the_broker_holds_beyond_the_strategies(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
-    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # real attributed = 6
-    broker = [Position("AAPL", 10, Decimal("100"), Decimal("1000"))]  # broker holds 10
-    parked = ledger.reconcile_total(broker)
-    assert parked == [AttributedPosition(UNKNOWN, "AAPL", 4, Decimal("100"))]  # 10 - 6
-    assert ledger.get_attributed(UNKNOWN)[0].quantity == 4
-    # state-idempotent: re-running with the same broker keeps unknown = 4 (not doubled)
-    assert ledger.reconcile_total(broker) == parked
-    assert ledger.get_attributed(UNKNOWN)[0].quantity == 4
+    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # attributed 6
+    ledger.apply(_fill("MSFT", 3, "200"), "m", Side.BUY)
+    broker = [_position("AAPL", 10), _position("MSFT", 3, "200"), _position("VTI", 5)]
+    assert ledger.unattributed(broker) == {"AAPL": 4, "VTI": 5}  # MSFT ties out
+    assert ledger.unattributed([]) == {"AAPL": -6, "MSFT": -3}  # broker flat: negative
+    assert ledger.get_attributed(UNKNOWN) == []  # read-only
 
 
-def test_reconcile_tracks_drift_and_clears_when_tied(tmp_path: Path) -> None:
+def test_accepting_sets_the_baseline_and_reports_each_change(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
-    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # real = 6
-
-    ledger.reconcile_total([Position("AAPL", 10, Decimal("100"), Decimal("1000"))])
-    assert ledger.get_attributed(UNKNOWN)[0].quantity == 4  # 10 - 6
-
-    # broker grows: unknown becomes the new residual (9), not 4 + drift
-    ledger.reconcile_total([Position("AAPL", 15, Decimal("100"), Decimal("1500"))])
-    assert ledger.get_attributed(UNKNOWN)[0].quantity == 9  # 15 - 6
-
-    # broker returns to exactly the real attribution: stale unknown row is cleared
-    ledger.reconcile_total([Position("AAPL", 6, Decimal("100"), Decimal("600"))])
+    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # attributed 6
+    assert ledger.accept_unattributed([_position("AAPL", 10)]) == [BaselineChange("AAPL", 0, 4)]
+    assert ledger.get_attributed(UNKNOWN) == [AttributedPosition(UNKNOWN, "AAPL", 4, Decimal(100))]
+    assert ledger.accept_unattributed([_position("AAPL", 10)]) == []  # nothing more to change
+    # the broker grew: the baseline becomes the new unattributed quantity, not 4 + drift
+    assert ledger.accept_unattributed([_position("AAPL", 15)]) == [BaselineChange("AAPL", 4, 9)]
+    # back to exactly the attribution: the baseline row goes
+    assert ledger.accept_unattributed([_position("AAPL", 6)]) == [BaselineChange("AAPL", 9, 0)]
     assert ledger.get_attributed(UNKNOWN) == []
 
 
-def test_reconcile_negative_delta_when_attributed_exceeds_broker(tmp_path: Path) -> None:
+def test_accepting_is_all_or_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ledger = _ledger(tmp_path)
-    ledger.apply(_fill("AAPL", 6, "100"), "momentum", Side.BUY)  # real = 6
-    parked = ledger.reconcile_total([])  # broker flat -> residual -6
-    assert parked == [AttributedPosition(UNKNOWN, "AAPL", -6, Decimal("0"))]
-
-
-def test_reconcile_multi_symbol(tmp_path: Path) -> None:
-    ledger = _ledger(tmp_path)
-    ledger.apply(_fill("AAPL", 5, "100"), "m", Side.BUY)
-    ledger.apply(_fill("MSFT", 3, "200"), "m", Side.BUY)
-    broker = [
-        Position("AAPL", 5, Decimal("100"), Decimal("500")),  # ties out -> no residual
-        Position("MSFT", 4, Decimal("200"), Decimal("800")),  # +1 residual
-    ]
-    parked = ledger.reconcile_total(broker)
-    assert parked == [AttributedPosition(UNKNOWN, "MSFT", 1, Decimal("200"))]
-
-
-def test_reconcile_total_is_all_or_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    ledger = _ledger(tmp_path)
-    ledger.reconcile_total(
-        [
-            Position("AAPL", 10, Decimal("100"), Decimal("1000")),
-            Position("MSFT", 5, Decimal("200"), Decimal("1000")),
-        ]
-    )
+    ledger.accept_unattributed([_position("AAPL", 10), _position("MSFT", 5, "200")])
     real_upsert = ledger._upsert
     writes = {"n": 0}
 
@@ -122,12 +102,7 @@ def test_reconcile_total_is_all_or_nothing(tmp_path: Path, monkeypatch: pytest.M
 
     monkeypatch.setattr(ledger, "_upsert", fail_on_the_second)
     with pytest.raises(sqlite3.OperationalError):
-        ledger.reconcile_total(
-            [
-                Position("AAPL", 12, Decimal("100"), Decimal("1200")),
-                Position("MSFT", 7, Decimal("200"), Decimal("1400")),
-            ]
-        )
-    parked = {p.symbol: p.quantity for p in ledger.get_attributed(UNKNOWN)}
-    assert parked == {"AAPL": 10, "MSFT": 5}  # the AAPL write was rolled back too
+        ledger.accept_unattributed([_position("AAPL", 12), _position("MSFT", 7, "200")])
+    baseline = {p.symbol: p.quantity for p in ledger.get_attributed(UNKNOWN)}
+    assert baseline == {"AAPL": 10, "MSFT": 5}  # the AAPL write was rolled back too
     assert not ledger.connection.in_transaction

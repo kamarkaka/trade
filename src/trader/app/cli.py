@@ -170,7 +170,7 @@ def run(
     import time as _time
 
     from trader.app.live_guard import announce_live, live_confirmed, live_preflight
-    from trader.broker import SimBroker
+    from trader.broker import FeesModel, SimBroker
     from trader.core.enums import Mode
     from trader.core.protocols import Broker
     from trader.observability.alerting import build_alerter
@@ -268,6 +268,7 @@ def run(
     with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
         http = SchwabHttp(schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock)
         data = SchwabMarketData(SchwabClient(http), clock)
+        fees = FeesModel.from_config(cfg.execution.fees_model)  # same estimate paper + live
         broker: Broker
         if is_live:
             from trader.broker import SchwabBroker
@@ -283,12 +284,15 @@ def run(
                     err=True,
                 )
                 raise typer.Exit(1)
-            broker = SchwabBroker(SchwabTradingClient(http), mappings[0].hash_value, clock=clock)
+            broker = SchwabBroker(
+                SchwabTradingClient(http), mappings[0].hash_value, clock=clock, fees=fees
+            )
             # Live state is NEVER silent: log it loud and alert at startup (design §10).
             get_logger("cli").warning("STARTING IN LIVE MODE — REAL ORDERS ENABLED")
             announce_live(alerter)
         else:
-            broker = SimBroker(data, clock, starting_cash=cash)  # PAPER: SimBroker, never real
+            # PAPER: SimBroker, never real
+            broker = SimBroker(data, clock, starting_cash=cash, fees=fees)
         attribution = AttributionLedger(state)
         # Read the persisted kill switch fresh each cycle: an engage (CLI or auto-trip) halts
         # the daemon at the next cycle start AND pre-submit (gate). Its own connection so the

@@ -228,3 +228,17 @@ def test_defaults_fill_missing_sections() -> None:
     assert c.risk.enforce_pdt is True
     assert c.execution.rate_limit_per_min == 100
     assert c.schedule.timezone == "America/New_York"
+
+
+def test_execution_fees_model_defaults_to_zero_and_validates() -> None:
+    from decimal import Decimal
+
+    from trader.config.models import ExecutionConfig
+
+    assert ExecutionConfig().fees_model.commission == Decimal("0")
+    cfg = ExecutionConfig.model_validate(
+        {"fees_model": {"commission": "0.5", "regulatory_bps": 0.3}}
+    )
+    assert cfg.fees_model.commission == Decimal("0.5") and cfg.fees_model.regulatory_bps == 0.3
+    with pytest.raises(ValueError):
+        ExecutionConfig.model_validate({"fees_model": {"regulatory_bps": -1}})

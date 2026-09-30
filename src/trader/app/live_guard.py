@@ -35,8 +35,9 @@ MAX_LIVE_ORDER_NOTIONAL_USD = Decimal("1000")
 MAX_LIVE_POSITION_SIZE_PCT = 5.0
 MAX_LIVE_GROSS_EXPOSURE_USD = Decimal("5000")
 
-# Flipped ON in M5.7 once the live submit path is idempotent (write-ahead + reconcile-before-
-# resend wired into the orchestrator). While False, live preflight refuses to start.
+# Flipped ON in M5.7 once the live submit path is idempotent (write-ahead + one send per
+# client_order_id + reconciliation wired into the orchestrator). While False, live preflight
+# refuses to start.
 LIVE_ORDER_PATH_READY = False
 
 
@@ -99,8 +100,7 @@ def live_preflight(
         problems.append(
             PreflightProblem(
                 "idempotency",
-                "live submit path is not yet idempotent / reconcile-before-resend (M5.7); "
-                "refusing real orders",
+                "live submit path is not yet idempotent / reconciled (M5.7); refusing real orders",
             )
         )
 

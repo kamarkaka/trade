@@ -352,8 +352,9 @@ class SchwabTradingClient:
         """POST a new order; return the order id from the 201 ``Location`` header.
 
         NOT IDEMPOTENT: calling this twice places TWO real orders. On a timeout/unknown
-        response, the transport deliberately does NOT auto-retry the POST — the caller must
-        reconcile-before-resend and reuse the client_order_id (the M5.3 idempotent wrapper).
+        response, the transport deliberately does NOT auto-retry the POST — the idempotent
+        placement layer (execution.idempotency) sends each client_order_id at most once and
+        settles unknown outcomes by reconciliation.
         Never call this directly from ad-hoc/daemon code."""
         resp = self._http.request("POST", self._orders_path(account_hash), json=order_json)
         return self._order_id_from_location(resp)

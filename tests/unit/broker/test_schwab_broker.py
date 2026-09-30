@@ -4,14 +4,23 @@ account mapping, and READ-ONLY safe-mode refusal (M5.2). Uses a fake trading cli
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import httpx
 import pytest
 
 from fakes import FakeClock
 from trader.broker.schwab_broker import SchwabBroker
-from trader.core import Order
+from trader.core import Order, OrderNotPlacedError
 from trader.core.enums import OrderStatus, OrderType, Side
 from trader.core.protocols import Broker
-from trader.schwab.errors import SchwabReadOnlyModeError
+from trader.schwab.errors import (
+    SchwabAuthError,
+    SchwabBadResponseError,
+    SchwabError,
+    SchwabRateLimitError,
+    SchwabReadOnlyModeError,
+    SchwabRefreshTokenDeadError,
+    SchwabServerError,
+)
 from trader.schwab.orders import SchwabAccountSnapshot, SchwabOrderStatus, SchwabPositionRow
 
 NOW = datetime(2026, 6, 29, 15, 0, tzinfo=UTC)
@@ -81,15 +90,66 @@ def test_submit_builds_payload_and_returns_id() -> None:
     }
 
 
-def test_safe_mode_refuses_submit() -> None:
+def test_safe_mode_refuses_submit_as_definitely_not_placed() -> None:
     client = _FakeTradingClient(read_only=True)
     broker = _broker(client)
-    try:
+    with pytest.raises(OrderNotPlacedError) as excinfo:
         broker.submit_order(_order())
-        raise AssertionError("expected a refusal in READ-ONLY safe mode")
-    except SchwabReadOnlyModeError:
-        pass
+    assert isinstance(excinfo.value.__cause__, SchwabReadOnlyModeError)
     assert client.placed == []  # never reached the wire
+
+
+class _FailingClient(_FakeTradingClient):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self._error = error
+
+    def place_order(self, account_hash: str, order_json: dict) -> str:
+        raise self._error
+
+
+_REQUEST = httpx.Request("POST", "https://example.test/orders")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SchwabReadOnlyModeError("safe mode"),
+        SchwabAuthError("unauthorized (after refresh)", status_code=401),
+        SchwabAuthError("forbidden", status_code=403),
+        SchwabRefreshTokenDeadError("refresh token dead"),
+        SchwabAuthError("not authenticated; run reauth"),  # no token: never sent
+        SchwabRateLimitError("rate limited", status_code=429),
+        SchwabError("http error 400", status_code=400),
+        httpx.ConnectError("refused", request=_REQUEST),
+        httpx.ConnectTimeout("connect timeout", request=_REQUEST),
+        httpx.PoolTimeout("no connection available", request=_REQUEST),
+    ],
+    ids=type,
+)
+def test_failures_proving_the_order_never_reached_the_book(error: Exception) -> None:
+    with pytest.raises(OrderNotPlacedError) as excinfo:
+        _broker(_FailingClient(error)).submit_order(_order())
+    assert excinfo.value.__cause__ is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SchwabServerError("server error 503", status_code=503),  # may arrive after acceptance
+        SchwabBadResponseError("order placement returned no Location header"),  # placed, no id
+        httpx.ReadTimeout("read timeout", request=_REQUEST),  # sent; answer lost
+        httpx.WriteTimeout("write timeout", request=_REQUEST),  # possibly fully sent
+        httpx.RemoteProtocolError("server disconnected", request=_REQUEST),
+        SchwabError("no status"),  # can't tell
+        RuntimeError("bug"),
+    ],
+    ids=type,
+)
+def test_every_other_failure_is_an_unknown_outcome(error: Exception) -> None:
+    with pytest.raises(type(error)) as excinfo:
+        _broker(_FailingClient(error)).submit_order(_order())
+    assert excinfo.value is error  # propagated untouched: the placement layer marks it unknown
 
 
 def test_status_mapping_filled_to_fill() -> None:

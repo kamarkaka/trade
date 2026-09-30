@@ -13,7 +13,7 @@ A single-user service that runs continuously and triggers a configurable number 
 - [`plan/design.md`](plan/design.md) — full system design: architecture, core interfaces, scheduler + jitter, first-party Schwab integration, backtesting, risk controls, deployment, and the read-only web UI.
 - [`plan/milestones.md`](plan/milestones.md) — implementation plan: 8 milestones, 80 baby-step sub-steps with files, libraries, and validation each (starts with a quick-reference table).
 - [`docs/strategy_guide.md`](docs/strategy_guide.md) — how to write and register a new strategy.
-- [`docs/runbooks/`](docs/runbooks/) — operational runbooks (paper soak, weekly Schwab re-auth).
+- [`docs/runbooks/`](docs/runbooks/) — operational runbooks: paper soak, weekly Schwab re-auth, and [going live](docs/runbooks/go-live.md).
 - [`docs/security/m1-credential-review.md`](docs/security/m1-credential-review.md) — credential-handling security review.
 
 ## Key properties
@@ -37,9 +37,10 @@ trader research sweep --strategy zscore_revert --grid lookback=10,20 --data /dat
 trader run                                      # paper daemon: live quotes, simulated fills
 trader run --once                               # fire each slot once and exit
 trader kill --on --reason "why"                 # halt all new orders (persisted); --off releases
+trader reconcile -c config/live.yaml            # live: settle open orders, true positions
 ```
 
-`backtest` and `research` are fully offline and read only the local data cache. `run` in paper mode uses live Schwab quotes with simulated fills — no real orders.
+`backtest` and `research` are fully offline and read only the local data cache. `run` in paper mode uses live Schwab quotes with simulated fills — no real orders. Going live starts from [`config/live.example.yaml`](config/live.example.yaml) and follows [`docs/runbooks/go-live.md`](docs/runbooks/go-live.md).
 
 ### Deployment
 

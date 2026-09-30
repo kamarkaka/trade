@@ -9,6 +9,7 @@ out by later milestones: ``backtest`` (M2), ``run`` (M3/M4), ``reconcile`` (M4),
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -18,6 +19,7 @@ import typer
 
 from trader.clock import RealClock
 from trader.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
+from trader.observability.logging import configure_logging
 from trader.schwab.config import SchwabClientConfig, schwab_config_from_env
 from trader.schwab.errors import SchwabAuthError, SchwabError
 
@@ -43,13 +45,25 @@ app.add_typer(research_app, name="research")
 ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to the YAML config file.")]
 
 
+@app.callback()
+def _configure() -> None:
+    # Install the scrubbed logging pipeline before any command runs (never structlog's
+    # defaults, which render tracebacks with frame locals and skip secret scrubbing).
+    configure_logging(os.environ.get("TRADER_LOG_LEVEL", "INFO"))
+
+
 def _load(config: Path) -> AppConfig:
     """Load + validate config, exiting non-zero with a clean message on error."""
     try:
-        return load_config(config)
+        cfg = load_config(config)
     except Exception as exc:  # surface config errors as a clean CLI failure
         typer.echo(f"config error: {exc}", err=True)
         raise typer.Exit(1) from exc
+    configure_logging(
+        os.environ.get("TRADER_LOG_LEVEL", "INFO"),
+        json_output=cfg.observability.log_format == "json",
+    )
+    return cfg
 
 
 def _token_valid(cfg: AppConfig) -> bool:
@@ -153,7 +167,6 @@ def run(
 ) -> None:
     """Run the trading daemon. PAPER (default) uses SimBroker against live quotes (no real
     orders). LIVE places REAL orders and requires mode=live PLUS a second confirmation."""
-    import os
     import time as _time
 
     from trader.app.live_guard import announce_live, live_confirmed, live_preflight

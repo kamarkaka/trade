@@ -28,7 +28,7 @@ class WebSettings(BaseModel):
     # ``.get_secret_value()``.
     admin_password_hash: SecretStr  # argon2id hash; NEVER the plaintext password
     session_secret: SecretStr  # signs the stateless session cookie (itsdangerous)
-    db_path: Path  # read-only handle onto the trading state DB (observability.db_path)
+    db_path: Path  # read-only handle onto the trading state DB (the config's db_path)
     config_path: Path = Path("/config/config.yaml")
     session_idle_seconds: int = 1800  # 30 min idle timeout
     session_absolute_seconds: int = 28800  # 8 h absolute cap
@@ -58,12 +58,14 @@ class WebSettings(BaseModel):
             except ValueError as exc:
                 raise ValueError(f"invalid integer for web env var {key}: {raw!r}") from exc
 
+        config_path = Path(env.get("WEB_CONFIG_PATH", "/config/config.yaml"))
+        db_override = env.get("WEB_DB_PATH")
         return cls(
             admin_user=_required("WEB_ADMIN_USER"),
             admin_password_hash=SecretStr(_required("WEB_ADMIN_PASSWORD_HASH")),
             session_secret=SecretStr(_required("SESSION_SECRET")),
-            db_path=Path(env.get("WEB_DB_PATH", "/state/trader.sqlite")),
-            config_path=Path(env.get("WEB_CONFIG_PATH", "/config/config.yaml")),
+            db_path=Path(db_override) if db_override else _db_path_of(config_path, env),
+            config_path=config_path,
             session_idle_seconds=_int("SESSION_IDLE_SECONDS", 1800),
             session_absolute_seconds=_int("SESSION_ABSOLUTE_SECONDS", 28800),
             login_max_attempts=_int("LOGIN_MAX_ATTEMPTS", 5),
@@ -71,6 +73,21 @@ class WebSettings(BaseModel):
             auto_refresh_seconds=_int("AUTO_REFRESH_SECONDS", 15),
             cookie_secure=env.get("WEB_COOKIE_SECURE", "true").lower() not in ("0", "false", "no"),
         )
+
+
+def _db_path_of(config_path: Path, env: Mapping[str, str]) -> Path:
+    """The daemon's own ``observability.db_path`` from the mounted config (with the same
+    ``TRADER__`` env overrides), so the UI always reads the database the trader writes —
+    paper or live — without a second setting that could drift from it."""
+    from trader.config import load_config  # config models only: no broker/schwab imports
+
+    try:
+        return Path(load_config(config_path, environ=env).observability.db_path)
+    except Exception as exc:
+        raise ValueError(
+            f"cannot determine the state DB: set WEB_DB_PATH or mount a valid config at "
+            f"{config_path} ({type(exc).__name__})"
+        ) from exc
 
 
 __all__ = ["WebSettings"]

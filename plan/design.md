@@ -162,7 +162,8 @@ docker engine ── keeps container alive (restart: unless-stopped) ──► d
    │        │         ── violation ─► REJECT (logged with full context)
    │        ├─ persist Order as 'pending' (write-ahead, tagged strategy_id) BEFORE network call
    │        ├─ Broker.submit_order(order)  ─► 201 + Location header order id
-   │        ├─ poll Broker.get_order(id) until FILLED/PARTIAL/REJECTED (bounded)
+   │        ├─ poll Broker.get_order(id) until terminal (FILLED/CANCELED/REJECTED/EXPIRED;
+   │        │   PARTIAL keeps polling), bounded; at the deadline cancel the remainder
    │        └─ persist fills (attributed to strategy_id), update positions, P&L, audit row
    │
    └─► Slot ledger: UPDATE status='done'; record realized drift + seed; emit metrics; RELEASE LOCK
@@ -513,7 +514,7 @@ Schwab provides **no developer sandbox / paper-trading API** — every authentic
 
 ### 8.6 Idempotency, rate limits, retries
 
-- **Idempotency:** generate `client_order_id` and persist the order as `pending` **before** the network call (write-ahead). On timeout/unknown response, **reconcile first** (query order status) before any re-send; reuse the same id. **[VERIFY whether Schwab accepts/echoes a client-supplied order id; if not, dedupe by capturing the `Location` order id at submit and querying status.]** This is the highest-severity correctness concern (a naive retry can double a real position).
+- **Idempotency:** generate `client_order_id` and persist the order as `pending` **before** the network call (write-ahead). Each `client_order_id` is sent **at most once, ever**; the `Location` order id is recorded at submit, before any poll. A definite rejection is terminal; any other failure leaves the outcome **unknown** and is **never re-sent** — reconciliation settles it (Schwab does not echo a client order id [VERIFY], so it matches the listed orders on intent and entry time) or an operator does. A retry of an intent uses a new id. This is the highest-severity correctness concern (a naive retry can double a real position). Implemented in `execution/idempotency.py` and `execution/schwab_reconciler.py`.
 - **Rate limits:** plan around ~120 req/min per app (returns 429 over) — **[VERIFY; treat as a planning ceiling, not a guarantee].** Implement a centralized token-bucket limiter + exponential backoff with jitter on 429/5xx; prefer streaming over polling.
 - **First-party client (no third-party broker SDK):** we own all the client code, so a Schwab API change is something we track and fix ourselves rather than waiting on an unofficial library; the whole client sits behind our `Broker` interface so changes stay contained. Security rationale & parity approach in §8.7.
 
@@ -592,7 +593,7 @@ The risk gate is a **single, non-bypassable, fail-closed** function: `Order in �
 **Default-safe posture**
 
 - **Default mode = `paper`/dry-run.** Going live requires **two** signals: `mode: live` in config **plus** an env var / CLI confirmation. Live state is logged and alerted at startup so it is never silent.
-- **Kill switch:** persisted flag (survives restarts), checked at the start of every cycle and immediately before every submit; manual CLI to flip; auto-trips on daily-loss breach, repeated broker errors, stale-data, or reconciliation mismatch. On trip: halt new orders + alert. **Auto-flatten is OFF by default** (flattening in disorderly markets is itself risky); it's an explicit opt-in.
+- **Kill switch:** persisted flag (survives restarts), checked at the start of every cycle and immediately before every submit; manual CLI to flip; auto-trips on a daily-loss breach and on an order whose outcome is unknown or unresolved (a startup reconciliation mismatch refuses the live start instead; stale data is rejected per order by price sanity). On trip: halt new orders + alert. **Auto-flatten is OFF by default** (flattening in disorderly markets is itself risky); it's an explicit opt-in.
 
 **Per-order / per-day rails (all config-driven, evaluated on the *resulting* position, not the order in isolation)**
 
@@ -603,7 +604,7 @@ The risk gate is a **single, non-bypassable, fail-closed** function: `Order in �
 - `max_trades_per_day` (persisted counter, reset at session start)
 - **Allowlist** (default-deny: only trade listed symbols) and/or denylist
 - **Price sanity:** reject zero/negative/NaN; reject quotes older than `max_staleness_seconds`; reject if spread % exceeds a bound (illiquid/halted); optionally reject if price deviates from prev close beyond a band (bad ticks). Halted/locked symbols → no-trade.
-- **Duplicate-order guard** via the client-order-id idempotency pattern + pre-resend reconciliation.
+- **Duplicate-order guard** via the write-ahead order row, one send per `client_order_id`, and reconciliation of unknown outcomes (never a blind re-send).
 
 **Cross-strategy scope, attribution & conflicts (multi-strategy):**
 

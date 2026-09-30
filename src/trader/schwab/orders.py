@@ -18,6 +18,7 @@ Safety choices for real money:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit
@@ -131,15 +132,59 @@ class SchwabOrderStatus:
     filled_quantity: int
     average_price: Decimal  # weighted avg execution price (0 if nothing filled yet)
     raw_status: str
+    # Intent fields used to match a listed order back to a local order (reconciliation).
+    entered_time: datetime | None = None  # when Schwab accepted the order (tz-aware UTC)
+    side: Side | None = None  # from the leg's instruction (None if absent/unrecognized)
+    order_type: str = ""  # raw Schwab orderType, e.g. MARKET / LIMIT
+    price: Decimal | None = None  # the LIMIT price (None for MARKET / absent)
+
+
+def _first_leg(data: Any) -> dict[str, Any] | None:
+    legs = data.get("orderLegCollection") if isinstance(data, dict) else None
+    if isinstance(legs, list) and legs and isinstance(legs[0], dict):
+        return legs[0]
+    return None
 
 
 def _symbol_of(data: Any) -> str:
-    legs = data.get("orderLegCollection") if isinstance(data, dict) else None
-    if isinstance(legs, list) and legs:
-        instrument = legs[0].get("instrument") if isinstance(legs[0], dict) else None
-        if isinstance(instrument, dict) and "symbol" in instrument:
-            return str(instrument["symbol"])
+    leg = _first_leg(data)
+    instrument = leg.get("instrument") if leg is not None else None
+    if isinstance(instrument, dict) and "symbol" in instrument:
+        return str(instrument["symbol"])
     return ""
+
+
+# Schwab equity instructions -> the side of the book they trade. [VERIFY] the short-sale
+# spellings; we only ever send BUY/SELL, the rest can appear on orders entered elsewhere.
+_SIDE_BY_INSTRUCTION: dict[str, Side] = {
+    "BUY": Side.BUY,
+    "BUY_TO_COVER": Side.BUY,
+    "SELL": Side.SELL,
+    "SELL_SHORT": Side.SELL,
+}
+
+
+def _side_of(data: Any) -> Side | None:
+    leg = _first_leg(data)
+    instruction = leg.get("instruction") if leg is not None else None
+    return _SIDE_BY_INSTRUCTION.get(str(instruction).upper()) if instruction else None
+
+
+# enteredTime arrives like "2026-06-29T14:30:05+0000" [VERIFY]; %z also accepts "Z"/"+00:00".
+_ENTERED_TIME_FORMATS = ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z")
+
+
+def _entered_time_of(data: Any) -> datetime | None:
+    raw = data.get("enteredTime") if isinstance(data, dict) else None
+    if raw is None:
+        return None
+    for fmt in _ENTERED_TIME_FORMATS:
+        try:
+            return datetime.strptime(str(raw), fmt).astimezone(UTC)
+        except ValueError:
+            continue
+    # Fail loud: a silently-dropped timestamp would widen the reconciliation match window.
+    raise SchwabBadResponseError(f"unparseable enteredTime: {raw!r}")
 
 
 def _average_fill_price(data: Any) -> Decimal:
@@ -161,6 +206,7 @@ def _average_fill_price(data: Any) -> Decimal:
 
 def parse_order_status(data: Any) -> SchwabOrderStatus:
     raw = str(_require(data, "status"))
+    price = data.get("price")
     return SchwabOrderStatus(
         order_id=str(_require(data, "orderId")),
         status=map_order_status(raw),
@@ -169,7 +215,26 @@ def parse_order_status(data: Any) -> SchwabOrderStatus:
         filled_quantity=_int(data.get("filledQuantity", 0), "filledQuantity"),
         average_price=_average_fill_price(data),
         raw_status=raw,
+        entered_time=_entered_time_of(data),
+        side=_side_of(data),
+        order_type=str(data.get("orderType", "")).upper(),
+        price=_dec(price, "price") if price is not None else None,
     )
+
+
+def parse_order_list(data: Any) -> tuple[SchwabOrderStatus, ...]:
+    """Parse the list-orders response (a JSON array of order objects)."""
+    if not isinstance(data, list):
+        raise SchwabBadResponseError("list-orders response is not a JSON array")
+    return tuple(parse_order_status(item) for item in data)
+
+
+def _entered_time_param(value: datetime) -> str:
+    """Format a list-orders time bound: ``yyyy-MM-dd'T'HH:mm:ss.SSSZ`` in UTC [VERIFY]."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("list-orders time bounds must be timezone-aware")
+    utc = value.astimezone(UTC)
+    return f"{utc:%Y-%m-%dT%H:%M:%S}.{utc.microsecond // 1000:03d}Z"
 
 
 @dataclass(frozen=True)
@@ -245,6 +310,22 @@ class SchwabTradingClient:
         data = self._http.get_json(f"{self._orders_path(account_hash)}/{order_id}")
         return parse_order_status(data)
 
+    def get_orders(
+        self, account_hash: str, *, from_entered: datetime, to_entered: datetime
+    ) -> tuple[SchwabOrderStatus, ...]:
+        """List the account's orders entered in ``[from_entered, to_entered]`` (any status).
+
+        Read-only (GET, so the transport may retry it). Used by reconciliation to find an
+        order whose placement outcome is unknown. Only top-level orders are returned; we
+        place SINGLE orders only, so child orders of complex strategies are not traversed."""
+        params = {  # formatting validates tz-awareness before the bounds are compared
+            "fromEnteredTime": _entered_time_param(from_entered),
+            "toEnteredTime": _entered_time_param(to_entered),
+        }
+        if to_entered < from_entered:
+            raise ValueError("to_entered must be on or after from_entered")
+        return parse_order_list(self._http.get_json(self._orders_path(account_hash), params=params))
+
     def cancel_order(self, account_hash: str, order_id: str) -> None:
         self._http.request("DELETE", f"{self._orders_path(account_hash)}/{order_id}")
 
@@ -288,5 +369,6 @@ __all__ = [
     "build_order_json",
     "map_order_status",
     "parse_account",
+    "parse_order_list",
     "parse_order_status",
 ]

@@ -1,0 +1,28 @@
+[
+  {
+    "orderId": "1003490104",
+    "status": "FILLED",
+    "enteredTime": "2026-06-29T14:30:05+0000",
+    "quantity": 10,
+    "filledQuantity": 10,
+    "orderType": "MARKET",
+    "orderLegCollection": [
+      {"instruction": "BUY", "quantity": 10, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}
+    ],
+    "orderActivityCollection": [
+      {"activityType": "EXECUTION", "executionLegs": [{"quantity": 10, "price": "150.00"}]}
+    ]
+  },
+  {
+    "orderId": "1003490105",
+    "status": "WORKING",
+    "enteredTime": "2026-06-29T14:31:10+0000",
+    "quantity": 5,
+    "filledQuantity": 0,
+    "orderType": "LIMIT",
+    "price": "410.50",
+    "orderLegCollection": [
+      {"instruction": "SELL", "quantity": 5, "instrument": {"symbol": "MSFT", "assetType": "EQUITY"}}
+    ]
+  }
+]

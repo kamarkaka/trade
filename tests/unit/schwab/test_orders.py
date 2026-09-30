@@ -26,6 +26,7 @@ from trader.schwab.orders import (
     build_order_json,
     map_order_status,
     parse_account,
+    parse_order_list,
     parse_order_status,
 )
 
@@ -215,6 +216,72 @@ def test_get_order_polls(tmp_path: Path) -> None:
     with httpx.Client() as c:
         status = _client(tmp_path, c).get_order(ACCT, "1003490104")
     assert status.order_id == "1003490104" and status.status is OrderStatus.FILLED
+
+
+# --- list orders (reconciliation lookups) ------------------------------------ #
+
+
+@respx.mock
+def test_get_orders_sends_utc_time_bounds_and_parses_list(tmp_path: Path) -> None:
+    route = respx.get(ORDERS_URL).mock(
+        return_value=httpx.Response(200, json=_fixture("order_list.json"))
+    )
+    start = datetime(2026, 6, 29, 9, 30, tzinfo=UTC) + timedelta(hours=4)  # 13:30 UTC
+    end = start + timedelta(hours=1, milliseconds=250)
+    with httpx.Client() as c:
+        orders = _client(tmp_path, c).get_orders(ACCT, from_entered=start, to_entered=end)
+    params = route.calls.last.request.url.params
+    assert params["fromEnteredTime"] == "2026-06-29T13:30:00.000Z"
+    assert params["toEnteredTime"] == "2026-06-29T14:30:00.250Z"  # millisecond precision
+    assert [o.order_id for o in orders] == ["1003490104", "1003490105"]
+    filled, working = orders
+    assert filled.entered_time == datetime(2026, 6, 29, 14, 30, 5, tzinfo=UTC)
+    assert filled.side is Side.BUY and filled.order_type == "MARKET" and filled.price is None
+    assert working.side is Side.SELL and working.order_type == "LIMIT"
+    assert working.price == Decimal("410.50") and working.status is OrderStatus.WORKING
+
+
+@respx.mock
+def test_get_orders_empty_list(tmp_path: Path) -> None:
+    respx.get(ORDERS_URL).mock(return_value=httpx.Response(200, json=[]))
+    with httpx.Client() as c:
+        orders = _client(tmp_path, c).get_orders(ACCT, from_entered=NOW, to_entered=NOW)
+    assert orders == ()
+
+
+@respx.mock
+def test_get_orders_non_list_payload_raises(tmp_path: Path) -> None:
+    respx.get(ORDERS_URL).mock(return_value=httpx.Response(200, json={"orderId": "1"}))
+    with httpx.Client() as c, pytest.raises(SchwabBadResponseError, match="array"):
+        _client(tmp_path, c).get_orders(ACCT, from_entered=NOW, to_entered=NOW)
+
+
+def test_get_orders_rejects_naive_or_inverted_bounds(tmp_path: Path) -> None:
+    with httpx.Client() as c:
+        client = _client(tmp_path, c)
+        with pytest.raises(ValueError, match="timezone-aware"):
+            client.get_orders(ACCT, from_entered=datetime(2026, 6, 29), to_entered=NOW)
+        with pytest.raises(ValueError, match="on or after"):
+            client.get_orders(ACCT, from_entered=NOW, to_entered=NOW - timedelta(seconds=1))
+
+
+def test_parse_order_status_intent_fields() -> None:
+    base = {"orderId": "1", "status": "WORKING"}
+    legs = lambda instr: [{"instruction": instr, "instrument": {"symbol": "X"}}]  # noqa: E731
+    assert parse_order_status({**base, "orderLegCollection": legs("SELL_SHORT")}).side is Side.SELL
+    assert parse_order_status({**base, "orderLegCollection": legs("BUY_TO_COVER")}).side is Side.BUY
+    assert parse_order_status({**base, "orderLegCollection": legs("EXCHANGE")}).side is None
+    assert parse_order_status(base).entered_time is None  # absent -> None, not a guess
+    assert parse_order_status({**base, "enteredTime": "2026-06-29T14:30:05Z"}).entered_time == (
+        datetime(2026, 6, 29, 14, 30, 5, tzinfo=UTC)
+    )
+    with pytest.raises(SchwabBadResponseError, match="enteredTime"):
+        parse_order_status({**base, "enteredTime": "yesterday"})  # fail loud, never drop
+
+
+def test_parse_order_list_rejects_malformed_item() -> None:
+    with pytest.raises(SchwabBadResponseError, match="status"):
+        parse_order_list([{"orderId": "1"}])  # missing status
 
 
 # --- cancel ----------------------------------------------------------------- #

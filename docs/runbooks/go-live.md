@@ -19,10 +19,12 @@ path end to end, then run live under docker compose.
    `max_gross_exposure_usd` ≤ 5,000, a non-empty allowlist, at least one alert channel, the
    kill switch released, and a valid Schwab token.
 5. **The trading lease**: one process per state database may send orders or settle order
-   rows. `trader run` holds it for its lifetime; `trader reconcile` needs it.
+   rows. `trader run` holds it for its lifetime; `trader reconcile` needs it. Never delete the
+   `<db>.lease` file, and run one live config (and state database) per Schwab account.
 6. **The startup reconciliation gate**, after connecting: every open order settled and the
-   positions trued to the broker. Anything unresolved, or a *new* unexplained position change,
-   refuses the start and raises a `reconcile_mismatch` alert.
+   positions matching the acknowledged baseline (holdings that aren't the strategies' and that
+   you have accepted). Anything unresolved, or any unexplained position difference, refuses
+   the start, raises a `reconcile_mismatch` alert and engages the kill switch.
 7. **On every order**: the risk gate (price sanity, notional/position/gross caps, daily loss,
    trades per day, pattern-day-trader, allowlist, kill switch); at-most-once placement (one
    send per `client_order_id`; an order whose outcome is unknown is never re-sent); bounded
@@ -93,6 +95,18 @@ During market hours, after the canary's slot time:
 
 ```sh
 trader reconcile --config config/live.yaml         # must end with: result: CLEAN
+```
+
+The first time, `trader reconcile` reports any holdings in the account that no strategy owns
+as unexplained (exit 2). Review them; if they are yours, acknowledge them once:
+
+```sh
+trader reconcile --config config/live.yaml --accept-positions    # prints old -> new, re-checks
+```
+
+Then:
+
+```sh
 trader kill --off --config config/live.yaml        # the preflight requires it released
 TRADER_CONFIRM_LIVE=I_UNDERSTAND trader run --config config/live.yaml --once
 ```
@@ -143,8 +157,9 @@ spans two sessions, so it is not a day-trade.
   (default 5 minutes), then `trader reconcile`: it adopts the order if it landed, or marks it
   not placed once that is proven. If it stays unresolved (e.g. an identical manual order was
   entered at the same time), check the Schwab order history and settle it by hand:
-  `trader reconcile --adopt CID=SCHWAB_ORDER_ID` or `--mark-not-placed CID`. Then
-  `trader kill --off`.
+  `trader reconcile --adopt CID=SCHWAB_ORDER_ID` (refused unless that Schwab order matches the
+  order exactly and was entered in its window) or `--mark-not-placed CID`. An order bound to
+  the wrong Schwab order: `--unbind CID`, and it is resolved afresh. Then `trader kill --off`.
 - **A daily-loss breach** engages the kill switch (source `auto`), once per session. Review,
   then `trader kill --off` lets exits through; the daily-loss rule keeps refusing new entries
   for the rest of the session, and the switch does not re-trip that session.
@@ -155,12 +170,15 @@ spans two sessions, so it is not a day-trade.
 - **Orders refused with "PDT: …"**: the account is at the pattern-day-trader limit while
   under the equity threshold. New entries and same-session exits are refused until the
   rolling window moves on; an exit of a position held overnight still goes through.
-- **Start refused: "startup reconciliation is not clean".** Run `trader reconcile` to see why:
-  unresolved orders (above), or a new unexplained position change. Holdings that are yours and
-  unchanged are reported as *standing* and do not block; after your own manual trade, re-run
-  `trader reconcile` once to confirm the new state.
+- **Start refused: "startup reconciliation is not clean"** (or "failed", e.g. Schwab
+  unreachable). The refusal engages the kill switch, so a restart loop stays quiet. Run
+  `trader reconcile` to see why: unresolved orders (above), or an unexplained position
+  difference. If the difference is yours (a manual trade), `trader reconcile
+  --accept-positions`. When it reports CLEAN, `trader kill --off` and start again.
 - **Refresh token dead**: the client enters read-only safe mode (no orders); re-authenticate.
-- **`trader reconcile` exits 3**: the daemon holds the trading lease — stop it first.
+- **`trader reconcile` exit codes**: 0 clean; 1 config, credentials, account or state-database
+  error; 2 not clean, or an override refused; 3 the daemon holds the trading lease (stop it
+  first); 4 Schwab unreachable or returned an error.
 
 ---
 
@@ -192,7 +210,8 @@ against the live config once more to leave its books settled.
    alert, the heartbeat, and `healthy` in `docker compose ps`.
 4. The container restarts after a crash (`restart: unless-stopped`); every start passes the
    preflight and the startup reconciliation gate (waiting out an open consistency window
-   once), and refuses — with an alert — if the account is not clean.
+   once). If the account is not clean it refuses with one alert and engages the kill switch;
+   later restarts fail the preflight quietly until you reconcile and release it (§7).
 5. `trader reconcile` needs the lease, so stop the daemon first:
 
    ```sh

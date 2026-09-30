@@ -184,3 +184,40 @@ def test_cli_kill_on_off(tmp_path: Path) -> None:
     off = runner.invoke(app, ["kill", "--off", "--config", str(cfg)])
     assert off.exit_code == 0 and "released" in off.output
     assert KillSwitch(connect(db)).is_engaged() is False
+
+
+# --- auto-trip on a daily-loss breach (LR7) --------------------------------------- #
+
+
+def _tripping(tmp_path: Path, loss: str, *, killed: bool = False):  # type: ignore[no-untyped-def]
+    from trader.risk.kill_switch import tripping_day_state
+
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn)
+    alerter = _RecAlerter()
+    switch = KillSwitch(conn, alerter=alerter)  # type: ignore[arg-type]
+    source = tripping_day_state(
+        lambda account, now, engaged: _day(loss=loss, killed=killed),
+        switch,
+        RiskConfig(daily_loss_limit_pct=2),
+    )
+    return source(ACCOUNT, NOW, killed), switch, alerter
+
+
+def test_a_daily_loss_breach_auto_engages_the_kill_switch(tmp_path: Path) -> None:
+    state, switch, alerter = _tripping(tmp_path, loss="2500")  # 2.5% > 2%
+    assert state.kill_switch_engaged is True  # this very order is halted by the gate
+    assert switch.is_engaged() and switch.state().source == "auto"  # and it persists
+    assert [e.kind for e in alerter.events] == [AlertKind.KILL_SWITCH]
+
+
+def test_no_breach_no_trip(tmp_path: Path) -> None:
+    state, switch, alerter = _tripping(tmp_path, loss="500")
+    assert state.kill_switch_engaged is False and not switch.is_engaged()
+    assert alerter.events == []
+
+
+def test_an_already_engaged_state_does_not_re_trip(tmp_path: Path) -> None:
+    state, switch, alerter = _tripping(tmp_path, loss="2500", killed=True)
+    assert state.kill_switch_engaged is True
+    assert not switch.is_engaged() and alerter.events == []  # no duplicate engage/alert

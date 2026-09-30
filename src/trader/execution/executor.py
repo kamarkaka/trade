@@ -29,6 +29,7 @@ from typing import Protocol
 from trader.core import Fill, Order
 from trader.core.protocols import Broker
 from trader.execution.idempotency import (
+    OrderOutcomeUnknownError,
     OrderRecord,
     OrderRepository,
     Reconciler,
@@ -93,6 +94,7 @@ class DurableOrderExecutor:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         retryable: tuple[type[BaseException], ...] = DEFAULT_RETRYABLE,
+        on_uncertain: Callable[[str], object] | None = None,
     ) -> None:
         if attribution.connection is not repo.connection:
             # Completion must update orders, fills and attribution in ONE transaction.
@@ -105,8 +107,22 @@ class DurableOrderExecutor:
         self._monotonic = monotonic
         self._sleep = sleep
         self._retryable = retryable
+        # Called with a reason when an order's fate is uncertain (the daemon engages the kill
+        # switch): no further order may be sent until a human has reconciled it.
+        self._on_uncertain = on_uncertain
 
     def execute(self, order: Order) -> Fill:
+        try:
+            return self._execute(order)
+        except (OrderOutcomeUnknownError, OrderUnresolvedError) as exc:
+            if self._on_uncertain is not None:
+                try:
+                    self._on_uncertain(str(exc))
+                except Exception as hook_exc:  # never mask the original failure
+                    _log.error("on_uncertain hook failed", error=type(hook_exc).__name__)
+            raise
+
+    def _execute(self, order: Order) -> Fill:
         cid = order.client_order_id
         broker_order_id = place_idempotent(
             self._broker, self._repo, order, reconcile=self._reconcile

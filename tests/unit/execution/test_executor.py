@@ -335,3 +335,71 @@ def test_an_unresolved_error_reports_whether_the_cancel_went_through(tmp_path: P
     with pytest.raises(OrderUnresolvedError) as ei:
         executor.execute(_order())
     assert ei.value.cancel_attempted and ei.value.cancel_accepted
+
+
+# --- the uncertainty hook (LR7) --------------------------------------------------- #
+
+
+def _hooked(tmp_path: Path, broker: FakeBroker):  # type: ignore[no-untyped-def]
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn)
+    calls: list[str] = []
+    executor = DurableOrderExecutor(
+        broker=broker,
+        repo=OrderRepository(conn),
+        attribution=AttributionLedger(conn),
+        reconcile=_inconclusive,
+        poll_policy=PollPolicy(timeout_seconds=0, post_cancel_polls=1),
+        sleep=lambda _s: None,
+        on_uncertain=calls.append,
+    )
+    return executor, calls
+
+
+def test_an_unknown_outcome_calls_the_uncertainty_hook(tmp_path: Path) -> None:
+    broker = _CancellableBroker()
+    broker.fail_next_submit = True
+    executor, calls = _hooked(tmp_path, broker)
+    with pytest.raises(OrderOutcomeUnknownError):
+        executor.execute(_order())
+    assert len(calls) == 1 and "outcome unknown" in calls[0]
+
+
+def test_an_unresolved_order_calls_the_uncertainty_hook(tmp_path: Path) -> None:
+    broker = FakeBroker()  # cancel is a no-op: a partial fill stays non-terminal
+    broker.fill_quantity = 4
+    executor, calls = _hooked(tmp_path, broker)
+    with pytest.raises(OrderUnresolvedError):
+        executor.execute(_order())
+    assert len(calls) == 1 and "unresolved" in calls[0]
+
+
+def test_a_definite_rejection_or_a_fill_does_not_call_the_hook(tmp_path: Path) -> None:
+    broker = _CancellableBroker()
+    broker.reject_next_submit = True
+    executor, calls = _hooked(tmp_path, broker)
+    with pytest.raises(OrderNotPlacedError):
+        executor.execute(_order("c1"))
+    executor.execute(_order("c2"))  # filled normally
+    assert calls == []
+
+
+def test_a_failing_hook_never_masks_the_original_error(tmp_path: Path) -> None:
+    broker = _CancellableBroker()
+    broker.fail_next_submit = True
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn)
+
+    def boom(reason: str) -> None:
+        raise RuntimeError("alert channel down")
+
+    executor = DurableOrderExecutor(
+        broker=broker,
+        repo=OrderRepository(conn),
+        attribution=AttributionLedger(conn),
+        reconcile=_inconclusive,
+        poll_policy=PollPolicy(timeout_seconds=0),
+        on_uncertain=boom,
+    )
+    with pytest.raises(OrderOutcomeUnknownError):
+        executor.execute(_order())

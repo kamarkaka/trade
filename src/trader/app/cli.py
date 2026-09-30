@@ -186,7 +186,7 @@ def run(
     from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
     from trader.orchestrator.lock import GlobalCycleLock
     from trader.risk.gate import RiskManager
-    from trader.risk.kill_switch import KillSwitch
+    from trader.risk.kill_switch import KillSwitch, tripping_day_state
     from trader.scheduler.calendar import TradingCalendar
     from trader.scheduler.daemon import SchedulerDaemon
     from trader.sizing.sizer import size_decision
@@ -329,6 +329,10 @@ def run(
             reconcile = in_memory_reconciler(sim.find_by_client_id)
             poll_policy = PollPolicy(timeout_seconds=0)
             retryable = DEFAULT_RETRYABLE
+        # Read the persisted kill switch fresh each cycle: an engage (CLI or auto-trip) halts
+        # the daemon at the next cycle start AND pre-submit (gate). Its own connection so the
+        # worker thread never shares one cross-thread.
+        kill_switch = KillSwitch(connect(Path(cfg.observability.db_path)), alerter=alerter)
         # Durable execution for paper AND live: write-ahead order rows, at most one send per
         # client_order_id, bounded polling, and atomic completion (orders + fills +
         # attribution) — so the paper soak exercises the live order path.
@@ -339,11 +343,9 @@ def run(
             reconcile=reconcile,
             poll_policy=poll_policy,
             retryable=retryable,
+            # An order of unknown/unresolved fate halts all trading until reconciled.
+            on_uncertain=lambda reason: kill_switch.engage(reason, source="auto"),
         )
-        # Read the persisted kill switch fresh each cycle: an engage (CLI or auto-trip) halts
-        # the daemon at the next cycle start AND pre-submit (gate). Its own connection so the
-        # worker thread never shares one cross-thread.
-        kill_switch = KillSwitch(connect(Path(cfg.observability.db_path)), alerter=alerter)
         orchestrator = Orchestrator(
             broker=broker,
             data=data,
@@ -356,9 +358,14 @@ def run(
             kill_switch=kill_switch.is_engaged,
             executor=executor,
             # Real daily rails: persisted start-of-day equity + today's orders (exchange tz).
-            day_state_provider=DailyCounters(
-                state, tz=ZoneInfo(schedule.timezone), scope=counters_scope
-            ).day_state,
+            # A daily-loss breach auto-engages the kill switch as soon as a cycle sees it.
+            day_state_provider=tripping_day_state(
+                DailyCounters(
+                    state, tz=ZoneInfo(schedule.timezone), scope=counters_scope
+                ).day_state,
+                kill_switch,
+                cfg.risk,
+            ),
         )
         # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
         # only for a broker whose positions survive a restart; SimBroker is in-memory (always

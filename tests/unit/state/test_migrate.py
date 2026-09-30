@@ -41,6 +41,7 @@ def test_rerun_is_noop(tmp_path: Path) -> None:
 def test_wal_and_pragmas(tmp_path: Path) -> None:
     conn = connect(tmp_path / "s.sqlite")
     assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+    assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL: durable commits
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 5000
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 

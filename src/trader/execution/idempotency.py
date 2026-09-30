@@ -172,6 +172,12 @@ class ResolveResult:
     outcome: ResolveOutcome
     broker_order_id: str | None = None
     detail: str = ""
+    # Why an UNRESOLVED row is unresolved: "re_anchored" / the reconciler's "window_open" mean
+    # "retry after the consistency window"; anything else needs a later listing or a human.
+    code: str = ""
+
+
+RETRY_LATER_CODES = frozenset({"re_anchored", "window_open"})
 
 
 _COLUMNS = (
@@ -233,6 +239,39 @@ class OrderRepository:
             (_iso(start), _iso(end)),
         ).fetchall()
         return {str(r[0]): _parse_ts(r[1]) for r in rows}
+
+    def open_orders(self) -> list[OrderRecord]:
+        """Every order not yet settled: pending/unknown (no broker id) or placed but not
+        completed (WORKING). Reconciliation drives each to a terminal state."""
+        rows = self._conn.execute(
+            "SELECT client_order_id FROM orders WHERE status IN (?, ?, ?) "
+            "ORDER BY created_at, rowid",
+            (PENDING, UNKNOWN, PLACED),
+        ).fetchall()
+        records = (self.get(str(r[0])) for r in rows)
+        return [r for r in records if r is not None]
+
+    # -- operator overrides (``trader reconcile``; only after checking the broker's records) - #
+
+    def force_not_placed(self, client_order_id: str) -> bool:
+        """Operator: this unsettled order is not at the broker (verified by hand)."""
+        cur = self._conn.execute(
+            "UPDATE orders SET status = ?, updated_at = ?, version = version + 1 "
+            "WHERE client_order_id = ? AND broker_order_id IS NULL AND status IN (?, ?)",
+            (NOT_PLACED, _iso(self._now()), client_order_id, PENDING, UNKNOWN),
+        )
+        return cur.rowcount == 1
+
+    def force_adopt(self, client_order_id: str, broker_order_id: str) -> bool:
+        """Operator: this unsettled order is the broker's ``broker_order_id`` (verified by
+        hand). Raises ``sqlite3.IntegrityError`` if that id is bound to another order."""
+        cur = self._conn.execute(
+            "UPDATE orders SET status = ?, broker_order_id = ?, updated_at = ?, "
+            "version = version + 1 "
+            "WHERE client_order_id = ? AND broker_order_id IS NULL AND status IN (?, ?)",
+            (PLACED, broker_order_id, _iso(self._now()), client_order_id, PENDING, UNKNOWN),
+        )
+        return cur.rowcount == 1
 
     def awaiting_resolution(self) -> list[OrderRecord]:
         """Rows whose placement outcome is not settled: pending/unknown with no broker id."""
@@ -439,7 +478,9 @@ def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler
         return ResolveResult(ResolveOutcome.NOT_PLACED)
     if record.status not in (PENDING, UNKNOWN):
         return ResolveResult(
-            ResolveOutcome.UNRESOLVED, detail=f"status {record.status!r} without a broker id"
+            ResolveOutcome.UNRESOLVED,
+            detail=f"status {record.status!r} without a broker id",
+            code="invalid_state",
         )
 
     result = _safe_reconcile(reconcile, record)
@@ -449,16 +490,22 @@ def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler
         except sqlite3.IntegrityError:
             _log.error("reconciled broker id already belongs to another order", cid=cid)
             return ResolveResult(
-                ResolveOutcome.UNRESOLVED, detail="broker id already bound to another order"
+                ResolveOutcome.UNRESOLVED,
+                detail="broker id already bound to another order",
+                code="conflict",
             )
         if not adopted:
-            return ResolveResult(ResolveOutcome.UNRESOLVED, detail="row changed concurrently")
+            return ResolveResult(
+                ResolveOutcome.UNRESOLVED, detail="row changed concurrently", code="conflict"
+            )
         _log.info("adopted already-placed order", cid=cid, broker_order_id=result.broker_order_id)
         return ResolveResult(ResolveOutcome.PLACED, result.broker_order_id)
 
     if result.outcome is ReconcileOutcome.ABSENT and record.status == UNKNOWN:
         if not repo.transition(record, NOT_PLACED):
-            return ResolveResult(ResolveOutcome.UNRESOLVED, detail="row changed concurrently")
+            return ResolveResult(
+                ResolveOutcome.UNRESOLVED, detail="row changed concurrently", code="conflict"
+            )
         _log.warning("order confirmed absent at the broker", cid=cid, detail=result.detail)
         return ResolveResult(ResolveOutcome.NOT_PLACED)
 
@@ -467,10 +514,11 @@ def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler
         # "absent" can't be trusted yet. Re-anchor at now — after the crash — so the
         # consistency window starts after any send the dead process could have made.
         repo.transition(record, UNKNOWN)
-        detail = "pending row re-anchored after an interrupted send"
+        detail, code = "pending row re-anchored after an interrupted send", "re_anchored"
     else:  # an unknown row keeps its anchor: a refusal must not push the window forward
         detail = f"reconcile {result.outcome.value}: {result.detail}"
-    return ResolveResult(ResolveOutcome.UNRESOLVED, detail=detail)
+        code = result.code or result.outcome.value
+    return ResolveResult(ResolveOutcome.UNRESOLVED, detail=detail, code=code)
 
 
 def _best_effort(action: Callable[[str], object], cid: str) -> object:
@@ -577,6 +625,7 @@ __all__ = [
     "NOT_PLACED",
     "PENDING",
     "PLACED",
+    "RETRY_LATER_CODES",
     "TERMINAL",
     "UNKNOWN",
     "OrderOutcomeUnknownError",

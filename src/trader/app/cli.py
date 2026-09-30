@@ -10,6 +10,7 @@ out by later milestones: ``backtest`` (M2), ``run`` (M3/M4), ``reconcile`` (M4),
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,11 +18,15 @@ from typing import Annotated
 
 import typer
 
+from trader.broker import FeesModel, SchwabBroker
 from trader.clock import RealClock
 from trader.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
+from trader.execution.idempotency import OrderRepository
+from trader.execution.schwab_reconciler import SchwabOrderReconciler
 from trader.observability.logging import configure_logging
 from trader.schwab.config import SchwabClientConfig, schwab_config_from_env
 from trader.schwab.errors import SchwabAuthError, SchwabError
+from trader.schwab.http import SchwabHttp
 
 # Default backtest starting capital until a config-driven account balance exists.
 _BACKTEST_STARTING_CASH = "100000"
@@ -116,6 +121,55 @@ def _schwab_config(cfg: AppConfig, *, require_credentials: bool = False) -> Schw
     )
 
 
+@dataclass(frozen=True)
+class _LiveAccount:
+    """The live Schwab account's order path: broker adapter + order reconciler."""
+
+    broker: SchwabBroker
+    reconciler: SchwabOrderReconciler
+    account_hash: str
+
+
+def _live_account(
+    cfg: AppConfig,
+    http: SchwabHttp,
+    repo: OrderRepository,
+    *,
+    clock: RealClock,
+    fees: FeesModel | None,
+    command: str,
+) -> _LiveAccount:
+    """Resolve the (single) hashed account and build its broker + reconciler. Refuses on
+    ambiguity rather than act on the wrong account with real money."""
+    from trader.schwab.endpoints import SchwabClient
+    from trader.schwab.orders import SchwabTradingClient
+
+    # The raw account number is PII and never used directly; only its hash.
+    mappings = SchwabClient(http).get_account_numbers()
+    if len(mappings) != 1:
+        typer.echo(
+            f"{command} error: expected exactly 1 Schwab account, found {len(mappings)}; "
+            "explicit multi-account selection is required before live",
+            err=True,
+        )
+        raise typer.Exit(1)
+    trading = SchwabTradingClient(http)
+    account_hash = mappings[0].hash_value
+    broker = SchwabBroker(
+        trading, account_hash, clock=clock, fees=fees, client_id_for=repo.client_id_for
+    )
+    reconciler = SchwabOrderReconciler(
+        trading,
+        account_hash,
+        clock=clock,
+        bound_broker_ids=repo.bound_broker_ids,
+        bound_orders_created_between=repo.bound_orders_created_between,
+        awaiting_resolution=repo.awaiting_resolution,
+        consistency_window=timedelta(seconds=cfg.execution.reconcile_window_seconds),
+    )
+    return _LiveAccount(broker, reconciler, account_hash)
+
+
 def _auth_status_line(cfg: AppConfig) -> str:
     """One-line Schwab auth/token-age summary for ``status`` (no network)."""
     from trader.auth.token_store import TokenStore
@@ -179,7 +233,6 @@ def run(
     from trader.execution.executor import DurableOrderExecutor, in_memory_reconciler
     from trader.execution.idempotency import OrderRepository, Reconciler
     from trader.execution.poller import DEFAULT_RETRYABLE, PollPolicy
-    from trader.execution.schwab_reconciler import SchwabOrderReconciler
     from trader.observability.alerting import build_alerter
     from trader.observability.heartbeat import Heartbeat
     from trader.observability.logging import get_logger
@@ -193,6 +246,7 @@ def run(
     from trader.state.attribution import AttributionLedger
     from trader.state.daily import DailyCounters
     from trader.state.db import connect
+    from trader.state.lease import TradingLease
     from trader.state.ledger import FiredSlotLedger
     from trader.state.migrate import run_migrations
     from trader.strategy import load_bindings
@@ -234,6 +288,15 @@ def run(
 
     clock = RealClock()
     calendar = TradingCalendar(code=schedule.market_calendar, tz=schedule.timezone)
+    # One sender per state DB: the daemon holds the trading lease for its whole life (the
+    # kernel frees it if the process dies), and `trader reconcile` refuses while it's held.
+    lease = TradingLease(Path(cfg.observability.db_path))
+    if not lease.try_acquire():
+        typer.echo(
+            "run error: another trader process holds the trading lease for this database",
+            err=True,
+        )
+        raise typer.Exit(3)
     state = connect(Path(cfg.observability.db_path))
     run_migrations(state)
     cash = Decimal(_BACKTEST_STARTING_CASH)
@@ -281,35 +344,11 @@ def run(
         attribution = AttributionLedger(state)  # same connection: atomic completion
         broker: Broker
         if is_live:
-            from trader.broker import SchwabBroker
-            from trader.schwab.orders import SchwabTradingClient
-
-            # Resolve the hashed account id (the raw number is PII and never used directly).
-            # Refuse on ambiguity rather than silently trade the wrong account with real money.
-            mappings = SchwabClient(http).get_account_numbers()
-            if len(mappings) != 1:
-                typer.echo(
-                    f"run error: expected exactly 1 Schwab account, found {len(mappings)}; "
-                    "explicit multi-account selection is required before live",
-                    err=True,
-                )
-                raise typer.Exit(1)
-            trading = SchwabTradingClient(http)
-            account_hash = mappings[0].hash_value
+            live = _live_account(cfg, http, repo, clock=clock, fees=fees, command="run")
             # Live counters persist across restarts; the live state database serves one account.
             counters_scope = "live"
-            broker = SchwabBroker(
-                trading, account_hash, clock=clock, fees=fees, client_id_for=repo.client_id_for
-            )
-            reconcile: Reconciler = SchwabOrderReconciler(
-                trading,
-                account_hash,
-                clock=clock,
-                bound_broker_ids=repo.bound_broker_ids,
-                bound_orders_created_between=repo.bound_orders_created_between,
-                awaiting_resolution=repo.awaiting_resolution,
-                consistency_window=timedelta(seconds=cfg.execution.reconcile_window_seconds),
-            )
+            broker = live.broker
+            reconciler: Reconciler = live.reconciler
             poll_policy = PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds)
             retryable = TRANSIENT_READ_ERRORS
             # Live state is NEVER silent: log it loud and alert at startup (design §10).
@@ -326,7 +365,7 @@ def run(
             sim = SimBroker(data, clock, starting_cash=cash, fees=fees, id_prefix=f"SIM-{run_id}")
             counters_scope = f"paper:{run_id}"
             broker = sim
-            reconcile = in_memory_reconciler(sim.find_by_client_id)
+            reconciler = in_memory_reconciler(sim.find_by_client_id)
             poll_policy = PollPolicy(timeout_seconds=0)
             retryable = DEFAULT_RETRYABLE
         # Read the persisted kill switch fresh each cycle: an engage (CLI or auto-trip) halts
@@ -340,7 +379,7 @@ def run(
             broker=broker,
             repo=repo,
             attribution=attribution,
-            reconcile=reconcile,
+            reconcile=reconciler,
             poll_policy=poll_policy,
             retryable=retryable,
             # An order of unknown/unresolved fate halts all trading until reconciled.
@@ -639,10 +678,114 @@ def kill(
 
 
 @app.command()
-def reconcile(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
-    """Reconcile local state with the broker (implemented in M4)."""
-    _load(config)
-    typer.echo("reconcile: not implemented yet (reconciliation arrives in M4)")
+def reconcile(
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+    mark_not_placed: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--mark-not-placed",
+            help="Operator override: CLIENT_ORDER_ID verified (in Schwab's records) NOT placed.",
+        ),
+    ] = None,
+    adopt: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--adopt",
+            help="Operator override: CLIENT_ORDER_ID=BROKER_ORDER_ID verified at Schwab.",
+        ),
+    ] = None,
+) -> None:
+    """Settle open orders against the LIVE Schwab account, then true positions.
+
+    Never places an order (an unfinished order's remainder may be cancelled). Requires the
+    trading lease, so the daemon must be stopped. Exit codes: 0 clean, 2 unresolved or
+    divergent, 3 another trader process holds the lease."""
+    import httpx
+
+    from trader.auth.token_store import TokenStore
+    from trader.broker.schwab_broker import TRANSIENT_READ_ERRORS
+    from trader.core.enums import Mode
+    from trader.execution.account_reconcile import reconcile_account, summary_lines
+    from trader.execution.poller import PollPolicy
+    from trader.schwab.http import SchwabHttp
+    from trader.state.attribution import AttributionLedger
+    from trader.state.db import connect
+    from trader.state.lease import TradingLease
+    from trader.state.migrate import run_migrations
+
+    cfg = _load(config)
+    if cfg.mode is not Mode.LIVE:
+        typer.echo(
+            "reconcile: paper mode has no broker account to reconcile (SimBroker is in-memory)"
+        )
+        return
+    state_path = Path(cfg.observability.db_path)
+    lease = TradingLease(state_path)
+    if not lease.try_acquire():
+        typer.echo(
+            "reconcile error: another trader process (the daemon?) holds the trading lease "
+            "for this database; stop it first",
+            err=True,
+        )
+        raise typer.Exit(3)
+    try:
+        conn = connect(state_path)
+        run_migrations(conn)
+        repo = OrderRepository(conn)
+        _apply_overrides(repo, mark_not_placed or [], adopt or [])
+        try:
+            schwab_cfg = _schwab_config(cfg, require_credentials=True)
+        except SchwabAuthError as exc:
+            typer.echo(f"reconcile error: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        clock = RealClock()
+        with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
+            http = SchwabHttp(
+                schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock
+            )
+            live = _live_account(cfg, http, repo, clock=clock, fees=None, command="reconcile")
+            report = reconcile_account(
+                broker=live.broker,
+                repo=repo,
+                attribution=AttributionLedger(conn),
+                reconcile_order=live.reconciler,
+                poll_policy=PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds),
+                retryable=TRANSIENT_READ_ERRORS,
+            )
+        for line in summary_lines(report):
+            typer.echo(line)
+        if not report.is_clean:
+            raise typer.Exit(2)
+    finally:
+        lease.release()
+
+
+def _apply_overrides(repo: OrderRepository, not_placed: list[str], adopt: list[str]) -> None:
+    """Operator overrides for rows reconciliation cannot settle on its own (e.g. beyond the
+    listing look-back, or ambiguous with a manual trade). Verify against Schwab first."""
+    import sqlite3
+
+    for cid in not_placed:
+        if not repo.force_not_placed(cid):
+            typer.echo(f"reconcile error: {cid} is not an unsettled order without an id", err=True)
+            raise typer.Exit(2)
+        typer.echo(f"override: {cid} marked not placed")
+    for spec in adopt:
+        cid, sep, broker_order_id = spec.partition("=")
+        if not sep or not cid or not broker_order_id.strip():
+            typer.echo(
+                f"reconcile error: --adopt expects CID=BROKER_ORDER_ID, got {spec!r}", err=True
+            )
+            raise typer.Exit(2)
+        try:
+            adopted = repo.force_adopt(cid, broker_order_id.strip())
+        except sqlite3.IntegrityError as exc:
+            typer.echo(f"reconcile error: {broker_order_id} is bound to another order", err=True)
+            raise typer.Exit(2) from exc
+        if not adopted:
+            typer.echo(f"reconcile error: {cid} is not an unsettled order without an id", err=True)
+            raise typer.Exit(2)
+        typer.echo(f"override: {cid} adopted as {broker_order_id.strip()}")
 
 
 data_app = typer.Typer(help="Historical data cache management.", no_args_is_help=True)

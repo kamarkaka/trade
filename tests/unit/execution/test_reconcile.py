@@ -75,8 +75,33 @@ def test_reconcile_is_idempotent(tmp_path: Path) -> None:
     broker.set_position(_position("AAPL", 10))
     first = reconcile(broker, attribution)
     second = reconcile(broker, attribution)  # unchanged broker -> same residual, no compounding
-    assert first.discrepancies == second.discrepancies
+    assert first.discrepancies == second.standing  # reported once, then standing
+    assert second.discrepancies == [] and second.is_clean
     assert attribution.get_attributed(UNKNOWN)[0].quantity == 4  # not doubled to 8
+
+
+def test_standing_holdings_do_not_block_but_any_change_does(tmp_path: Path) -> None:
+    # The owner's own long-term holdings live in the same account: once parked and unchanged
+    # they are standing (clean); a fill nobody recorded changes the bucket (not clean).
+    attribution = _attribution(tmp_path)
+    broker = FakeBroker()
+    broker.set_position(_position("VTI", 100))
+    assert not reconcile(broker, attribution).is_clean  # first sight: confirm once
+    confirmed = reconcile(broker, attribution)
+    assert confirmed.is_clean and [d.symbol for d in confirmed.standing] == ["VTI"]
+    broker.set_position(_position("VTI", 101))  # one untracked share appeared
+    changed = reconcile(broker, attribution)
+    assert not changed.is_clean and changed.discrepancies[0].parked_qty == 101
+
+
+def test_a_parked_holding_that_disappears_is_a_change(tmp_path: Path) -> None:
+    attribution = _attribution(tmp_path)
+    broker = FakeBroker()
+    broker.set_position(_position("VTI", 100))
+    reconcile(broker, attribution)
+    broker._positions.clear()  # sold elsewhere
+    report = reconcile(broker, attribution)
+    assert not report.is_clean and report.discrepancies[0].parked_qty == 0
 
 
 def test_multi_symbol_reports_all_divergent(tmp_path: Path) -> None:

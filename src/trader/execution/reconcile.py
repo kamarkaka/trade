@@ -2,10 +2,12 @@
 
 The broker is the source of truth for positions; local attribution is the source of
 truth for *intent*. ``reconcile`` diffs the broker's positions against the per-strategy
-attributed sums, parks any unattributed delta under the ``'unknown'`` strategy (so the
-books tie out), and returns a discrepancy report. Any non-clean result flags
-``requires_attention`` — the hook the kill switch (M5) escalates on unexplained
-divergence. Runs on startup (before acting), after submits, and at EOD.
+attributed sums and parks any unattributed delta under the ``'unknown'`` strategy (so the
+books tie out). Only a CHANGE in that parked bucket is a discrepancy (new unexplained
+divergence — e.g. a fill nobody recorded); holdings already parked and unchanged since the
+last run (e.g. the owner's own long-term positions in the same account) are reported as
+``standing`` and do not make the report unclean. The first run on an account with such
+holdings therefore reports them once; re-running confirms them.
 
 Scope (M4.1): position/attribution reconciliation only. Open-order vs broker-fill
 reconciliation (idempotent re-submit recovery) is M5.3; account-total (cash/equity)
@@ -17,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from trader.core.protocols import Broker
-from trader.state.attribution import AttributionLedger
+from trader.state.attribution import UNKNOWN, AttributionLedger
 
 
 @dataclass(frozen=True)
@@ -32,7 +34,8 @@ class Discrepancy:
 
 @dataclass(frozen=True)
 class ReconcileReport:
-    discrepancies: list[Discrepancy] = field(default_factory=list)
+    discrepancies: list[Discrepancy] = field(default_factory=list)  # changed since last run
+    standing: list[Discrepancy] = field(default_factory=list)  # parked earlier, unchanged
 
     @property
     def is_clean(self) -> bool:
@@ -45,17 +48,21 @@ class ReconcileReport:
 
 
 def reconcile(broker: Broker, attribution: AttributionLedger) -> ReconcileReport:
-    """True attribution to broker positions; park deltas in 'unknown'; report divergence."""
+    """True attribution to broker positions; park deltas in 'unknown'; report what changed."""
     broker_positions = list(broker.get_positions())
     broker_qty = {p.symbol: p.quantity for p in broker_positions}
-    parked = attribution.reconcile_total(broker_positions)  # mutates 'unknown' to the residual
-    discrepancies = [
-        Discrepancy(
-            symbol=ap.symbol,
-            broker_qty=broker_qty.get(ap.symbol, 0),
-            attributed_qty=broker_qty.get(ap.symbol, 0) - ap.quantity,  # real = broker - delta
-            parked_qty=ap.quantity,
+    before = {p.symbol: p.quantity for p in attribution.get_attributed(UNKNOWN)}
+    # reconcile_total mutates 'unknown' to the residual and returns the non-zero residuals.
+    parked = {ap.symbol: ap.quantity for ap in attribution.reconcile_total(broker_positions)}
+    changed: list[Discrepancy] = []
+    standing: list[Discrepancy] = []
+    for symbol in sorted(set(before) | set(parked)):
+        now_parked = parked.get(symbol, 0)
+        entry = Discrepancy(
+            symbol=symbol,
+            broker_qty=broker_qty.get(symbol, 0),
+            attributed_qty=broker_qty.get(symbol, 0) - now_parked,  # real = broker - delta
+            parked_qty=now_parked,
         )
-        for ap in parked
-    ]
-    return ReconcileReport(discrepancies=discrepancies)
+        (standing if before.get(symbol, 0) == now_parked else changed).append(entry)
+    return ReconcileReport(discrepancies=changed, standing=standing)

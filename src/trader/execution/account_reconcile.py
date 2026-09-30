@@ -241,14 +241,23 @@ def summary_lines(report: AccountReconcileReport) -> list[str]:
     ]
     lines += [f"  {o.client_order_id}: unresolved [{o.code}] {o.detail}" for o in report.unresolved]
     discrepancies = report.positions.discrepancies
+    standing = report.positions.standing
+    if standing:
+        lines.append(
+            f"positions: {len(standing)} standing unattributed holding(s), unchanged: "
+            + ", ".join(f"{d.symbol} {d.parked_qty}" for d in standing)
+        )
     if discrepancies:
-        lines.append(f"positions: {len(discrepancies)} discrepancy(ies), parked under 'unknown'")
+        lines.append(
+            f"positions: {len(discrepancies)} new unexplained change(s), parked under "
+            "'unknown' (if they are your own trades, re-run to confirm)"
+        )
         lines += [
             f"  {d.symbol}: broker {d.broker_qty}, attributed {d.attributed_qty}, "
             f"parked {d.parked_qty}"
             for d in discrepancies
         ]
-    else:
+    elif not standing:
         lines.append("positions: clean")
     if report.is_clean:
         verdict = "CLEAN"

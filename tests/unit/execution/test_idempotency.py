@@ -134,7 +134,7 @@ def test_refuses_to_send_inside_an_open_transaction(tmp_path: Path) -> None:
 def test_record_round_trips_the_full_intent(tmp_path: Path) -> None:
     repo, _ = _repo(tmp_path)
     order = Order("c9", "s1", "MSFT", Side.SELL, 3, OrderType.LIMIT, Decimal("410.50"))
-    repo.write_pending(order)
+    repo._write_pending(order)
     record = _row(repo, "c9")
     assert record.to_order() == order
     assert record.status == PENDING and record.broker_order_id is None
@@ -298,7 +298,7 @@ def test_absent_is_not_trusted_for_an_interrupted_send(tmp_path: Path) -> None:
     # not mark it not_placed; the row is re-anchored to 'unknown' at NOW (after the crash).
     clock = _Clock()
     repo, _ = _repo(tmp_path, clock)
-    repo.write_pending(_order())
+    repo._write_pending(_order())
     clock.advance(60)  # restart a minute later
     result = resolve(repo, _row(repo), reconcile=_absent)
     assert result.outcome is ResolveOutcome.UNRESOLVED and "re-anchored" in result.detail
@@ -312,7 +312,7 @@ def test_absent_is_not_trusted_for_an_interrupted_send(tmp_path: Path) -> None:
 def test_interrupted_send_that_landed_is_adopted(tmp_path: Path) -> None:
     repo, _ = _repo(tmp_path)
     broker = FakeBroker()
-    repo.write_pending(_order())
+    repo._write_pending(_order())
     broker.submit_order(_order())  # landed; the process died before recording anything
     result = resolve(repo, _row(repo), reconcile=_perfect(broker))
     assert result.outcome is ResolveOutcome.PLACED and result.broker_order_id == "b-1"
@@ -322,8 +322,9 @@ def test_interrupted_send_that_landed_is_adopted(tmp_path: Path) -> None:
 def test_resolution_is_compare_and_swap(tmp_path: Path) -> None:
     repo, conn, broker = _unknown_row(tmp_path, landed=True)
     stale = _row(repo)
-    conn.execute(  # another process resolved the row after we read it
-        "UPDATE orders SET status = ?, updated_at = ? WHERE client_order_id = 'c1'",
+    conn.execute(  # another process resolved the row after we read it (bumping its version)
+        "UPDATE orders SET status = ?, updated_at = ?, version = version + 1 "
+        "WHERE client_order_id = 'c1'",
         (NOT_PLACED, (NOW + timedelta(seconds=1)).isoformat()),
     )
     result = resolve(repo, stale, reconcile=_perfect(broker))
@@ -335,7 +336,7 @@ def test_a_broker_id_can_belong_to_only_one_order(tmp_path: Path) -> None:
     repo, _ = _repo(tmp_path)
     broker = FakeBroker()
     place_idempotent(broker, repo, _order("c-other"), reconcile=_perfect(broker))  # binds b-1
-    repo.write_pending(_order("c1"))
+    repo._write_pending(_order("c1"))
     repo.mark_unknown_after_send("c1")
 
     def _wrong(record: OrderRecord) -> ReconcileResult:
@@ -348,7 +349,7 @@ def test_a_broker_id_can_belong_to_only_one_order(tmp_path: Path) -> None:
 
 def test_not_placed_resolves_without_reconciling(tmp_path: Path) -> None:
     repo, _ = _repo(tmp_path)
-    repo.write_pending(_order())
+    repo._write_pending(_order())
     repo.mark_not_placed_after_send("c1")
 
     def _never(record: OrderRecord) -> ReconcileResult:
@@ -363,3 +364,81 @@ def test_reconcile_result_validation() -> None:
         ReconcileResult(ReconcileOutcome.FOUND)
     with pytest.raises(ValueError, match="broker_order_id"):
         ReconcileResult(ReconcileOutcome.ABSENT, "b-1")
+
+
+# --- review follow-ups ------------------------------------------------------------ #
+
+
+def test_resolution_compare_and_swap_uses_the_row_version(tmp_path: Path) -> None:
+    # Another writer changed the row without changing its status (e.g. a re-anchor that kept
+    # 'unknown'): a resolver holding the stale read must not act on it.
+    repo, conn, broker = _unknown_row(tmp_path, landed=True)
+    stale = _row(repo)
+    conn.execute("UPDATE orders SET version = version + 1 WHERE client_order_id = 'c1'")
+    result = resolve(repo, stale, reconcile=_perfect(broker))
+    assert result.outcome is ResolveOutcome.UNRESOLVED and "concurrently" in result.detail
+    assert _row(repo).broker_order_id is None
+
+
+def test_every_state_write_bumps_the_version(tmp_path: Path) -> None:
+    repo, _, broker = _unknown_row(tmp_path, landed=True)  # pending -> unknown
+    assert _row(repo).version == 1
+    resolve(repo, _row(repo), reconcile=_perfect(broker))  # unknown -> WORKING (adopt)
+    assert (_row(repo).status, _row(repo).version) == (PLACED, 2)
+
+
+def test_sender_accepts_a_row_already_bound_to_the_same_id(tmp_path: Path) -> None:
+    # A resolver adopted the order (same broker id) before the sender recorded it: that is a
+    # correctly recorded placement, not an unknown outcome.
+    repo, conn = _repo(tmp_path)
+
+    class _AdoptedFirst(FakeBroker):
+        def submit_order(self, order: Order) -> str:
+            broker_order_id = super().submit_order(order)
+            conn.execute(
+                "UPDATE orders SET status = ?, broker_order_id = ? WHERE client_order_id = ?",
+                (PLACED, broker_order_id, order.client_order_id),
+            )
+            return broker_order_id
+
+    broker = _AdoptedFirst()
+    assert place_idempotent(broker, repo, _order(), reconcile=_perfect(broker)) == "b-1"
+
+
+def test_unknown_outcome_overrides_a_premature_not_placed(tmp_path: Path) -> None:
+    # A resolver (wrongly) marked the row not_placed while the send was in flight, then the
+    # send timed out: the order may be live, so the row must go back to 'unknown'.
+    repo, conn = _repo(tmp_path)
+
+    class _RacyTimeout(FakeBroker):
+        def submit_order(self, order: Order) -> str:
+            conn.execute(
+                "UPDATE orders SET status = ? WHERE client_order_id = ?",
+                (NOT_PLACED, order.client_order_id),
+            )
+            return super().submit_order(order)
+
+    broker = _RacyTimeout()
+    broker.fail_next_submit = True
+    broker.record_on_timeout = True
+    with pytest.raises(OrderOutcomeUnknownError):
+        place_idempotent(broker, repo, _order(), reconcile=_perfect(broker))
+    assert _row(repo).status == UNKNOWN
+
+
+def test_stored_timestamps_parse_robustly(tmp_path: Path) -> None:
+    # An operator's SQL fix may store 'Z' or naive timestamps: reads must not break, and a
+    # naive value is taken as UTC.
+    repo, conn = _repo(tmp_path)
+    repo._write_pending(_order())
+    conn.execute(
+        "UPDATE orders SET created_at = '2026-06-29T15:00:00Z', "
+        "updated_at = '2026-06-29 15:00:00' WHERE client_order_id = 'c1'"
+    )
+    record = _row(repo)
+    assert record.created_at == NOW and record.updated_at == NOW
+
+
+def test_blank_broker_ids_are_rejected() -> None:
+    with pytest.raises(ValueError, match="broker_order_id"):
+        ReconcileResult.found("   ")

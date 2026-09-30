@@ -5,25 +5,34 @@ whose outcome is unknown (timeout / lost response / crash mid-submit) can place 
 real order and double a real position. This layer guarantees **at-most-once** placement:
 
 1. **One send per client_order_id, ever.** Only the caller whose write-ahead INSERT created
-   the ``orders`` row sends the order. Any later call for the same id NEVER sends: it
-   *resolves* the row (below). Re-trying an intent means a new ``client_order_id`` — the
-   orchestrator makes a fresh decision (and id) every slot anyway.
+   the ``orders`` row calls ``Broker.submit_order`` for it (the transport may itself re-POST
+   a request the server rejected with a 401 — never one it may have processed). Any later
+   call for the same id NEVER sends: it *resolves* the row (below). Re-trying an intent means
+   a new ``client_order_id`` — the orchestrator makes a fresh decision (and id) every slot.
 2. **Durable write-ahead.** The row is committed as ``pending`` BEFORE the network call
    (refused inside an open transaction, where the row could still be rolled back).
 3. **Capture the broker id at submit.** The id the broker returns (Schwab: the 201
    ``Location`` header) is recorded immediately, before any status poll. Failing to record
    it is itself an unknown outcome (logged with the id). A successful placement always wins:
-   it overwrites a premature ``not_placed``.
+   it overwrites a premature ``not_placed``; so does an unknown outcome (a possibly-live order
+   must never stay recorded as not placed).
 4. **Classify the outcome.** ``OrderNotPlacedError`` from the broker → terminal
    ``not_placed``. Anything else — including a missing id — → ``unknown`` (stamped AFTER the
    send returned) and ``OrderOutcomeUnknownError``.
 5. **Resolve, never re-send.** ``resolve`` settles a row without a broker id using an
    injected reconciler: FOUND → adopt the broker's id; ABSENT → ``not_placed``, but only for
    an ``unknown`` row; INCONCLUSIVE (or a raising reconciler) → unresolved. A ``pending`` row
-   means the process died mid-send at an unknown moment (its ``updated_at`` predates the
+   means the sender died mid-send at an unknown moment (its ``updated_at`` predates the
    send), so ABSENT is not trusted for it: it is re-anchored to ``unknown`` with
-   ``updated_at = now`` (after the crash) and resolved on a later pass. Every state change is
-   a compare-and-swap on (status, updated_at), and a broker id can belong to only one row.
+   ``updated_at = now`` (after the crash) and resolved on a later pass. Every state change
+   bumps the row's ``version`` and resolution is a compare-and-swap on it; a broker id can
+   belong to only one row.
+
+**Single-sender precondition.** ``resolve`` treats a ``pending`` row as orphaned, so it must
+never run while another process may be sending orders from the same database — e.g. an
+operator's ``trader reconcile`` during a slow POST could otherwise re-anchor a live send and
+later mark it ``not_placed``. Callers enforce this with the trading lease (the daemon holds
+it for its lifetime; the reconcile command refuses while it is held).
 
 The transport also refuses to auto-retry the order POST (M5.1), so a duplicate can't be
 created beneath this layer either.
@@ -81,7 +90,8 @@ class ReconcileResult:
     detail: str = ""  # human-readable; must never contain account identifiers
 
     def __post_init__(self) -> None:
-        if (self.outcome is ReconcileOutcome.FOUND) != bool(self.broker_order_id):
+        has_id = bool((self.broker_order_id or "").strip())
+        if (self.outcome is ReconcileOutcome.FOUND) != has_id:
             raise ValueError("broker_order_id is required for FOUND and forbidden otherwise")
 
     @classmethod
@@ -113,6 +123,7 @@ class OrderRecord:
     broker_order_id: str | None
     created_at: datetime
     updated_at: datetime
+    version: int = 0  # bumped by every state write (compare-and-swap token)
 
     def to_order(self) -> Order:
         return Order(
@@ -129,13 +140,15 @@ class OrderRecord:
 
 # Looks up whether an order for this intent exists at the broker. Contract — ABSENT marks an
 # order not_placed, so a false ABSENT leaves a real order untracked. An implementation must:
-# - list the broker's orders over [record.created_at - clock skew, listing snapshot time];
+# - list the broker's orders (every status) over [record.created_at - clock skew, snapshot],
+#   the snapshot being the local time the listing was requested;
 # - return FOUND only for a unique match of the intent (symbol, side, quantity, type, limit
-#   price) whose broker id is not already bound to another local order;
+#   price) whose broker id is not already bound to another local order, and only when no
+#   OTHER unresolved local order has the same intent (else it can't tell whose order it is);
 # - return ABSENT only when the listing is complete (not truncated; every unparseable item
-#   provably not a match) AND snapshot time - record.updated_at >= a consistency window that
+#   provably not a match) AND snapshot - record.updated_at >= a consistency window that
 #   covers the broker's listing lag, server-side processing after a lost response, and clock
-#   skew between us and the broker;
+#   skew between us and the broker (a forward jump of the local clock shortens it);
 # - otherwise return INCONCLUSIVE.
 Reconciler = Callable[[OrderRecord], ReconcileResult]
 
@@ -155,12 +168,18 @@ class ResolveResult:
 
 _COLUMNS = (
     "client_order_id, strategy_id, symbol, side, quantity, order_type, limit_price, tif, "
-    "status, broker_order_id, created_at, updated_at"
+    "status, broker_order_id, created_at, updated_at, version"
 )
 
 
 def _iso(ts: datetime) -> str:
     return ts.astimezone(UTC).isoformat()
+
+
+def _parse_ts(text: str) -> datetime:
+    """Parse a stored timestamp; a naive value is taken as UTC (as it is written)."""
+    ts = datetime.fromisoformat(text)
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
 
 
 class OrderRepository:
@@ -191,18 +210,20 @@ class OrderRepository:
             tif=TimeInForce(row[7]),
             status=row[8],
             broker_order_id=row[9],
-            created_at=datetime.fromisoformat(row[10]),
-            updated_at=datetime.fromisoformat(row[11]),
+            created_at=_parse_ts(row[10]),
+            updated_at=_parse_ts(row[11]),
+            version=int(row[12]),
         )
 
-    def write_pending(self, order: Order) -> bool:
-        """Persist the order as ``pending`` BEFORE submit. Returns True only for the call
-        that created the row — that caller alone may send the order."""
+    def _write_pending(self, order: Order) -> bool:
+        """Persist the order as ``pending``. Returns True only for the call that created the
+        row — that caller alone may send the order. Private to ``place_idempotent``: a row
+        written any other way can never be sent."""
         ts = _iso(self._now())
         limit = format(order.limit_price, "f") if order.limit_price is not None else None
         cur = self._conn.execute(
             f"INSERT OR IGNORE INTO orders ({_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0)",
             (
                 order.client_order_id,
                 order.strategy_id,
@@ -222,35 +243,44 @@ class OrderRepository:
     # -- after the one send (the sender owns the row) --------------------------------- #
 
     def record_placed(self, client_order_id: str, broker_order_id: str) -> str | None:
-        """Record the id of an order the broker accepted. Returns the previous status, or
-        None if the row already carries a broker id. Overwrites ``not_placed`` — a successful
-        placement is ground truth. Raises ``sqlite3.IntegrityError`` if the id is already
-        bound to another order."""
+        """Record the id of an order the broker accepted. Returns the row's previous status,
+        or None if the row is bound to a DIFFERENT broker id. Already bound to this same id
+        (e.g. adopted by a resolver first) is success. Overwrites ``not_placed`` — a
+        successful placement is ground truth. Raises ``sqlite3.IntegrityError`` if the id is
+        already bound to another order."""
         row = self._conn.execute(
-            "SELECT status FROM orders WHERE client_order_id = ? AND broker_order_id IS NULL",
+            "SELECT status, broker_order_id FROM orders WHERE client_order_id = ?",
             (client_order_id,),
         ).fetchone()
         if row is None:
             return None
+        if row[1] is not None:
+            return str(row[0]) if row[1] == broker_order_id else None
         cur = self._conn.execute(
-            "UPDATE orders SET status = ?, broker_order_id = ?, updated_at = ? "
-            "WHERE client_order_id = ? AND broker_order_id IS NULL",
+            "UPDATE orders SET status = ?, broker_order_id = ?, updated_at = ?, "
+            "version = version + 1 WHERE client_order_id = ? AND broker_order_id IS NULL",
             (PLACED, broker_order_id, _iso(self._now()), client_order_id),
         )
         return str(row[0]) if cur.rowcount == 1 else None
 
-    def mark_unknown_after_send(self, client_order_id: str) -> None:
+    def mark_unknown_after_send(self, client_order_id: str) -> str | None:
         """The send returned without a usable answer: ``unknown``, stamped NOW (after the
-        send), which anchors a reconciler's consistency window after any landing."""
+        send), which anchors a reconciler's consistency window after any landing. Overrides
+        a premature ``not_placed`` (the order may be live). Returns the previous status."""
+        row = self._conn.execute(
+            "SELECT status FROM orders WHERE client_order_id = ? AND broker_order_id IS NULL",
+            (client_order_id,),
+        ).fetchone()
         self._conn.execute(
-            "UPDATE orders SET status = ?, updated_at = ? "
-            "WHERE client_order_id = ? AND broker_order_id IS NULL AND status IN (?, ?)",
-            (UNKNOWN, _iso(self._now()), client_order_id, PENDING, UNKNOWN),
+            "UPDATE orders SET status = ?, updated_at = ?, version = version + 1 "
+            "WHERE client_order_id = ? AND broker_order_id IS NULL AND status IN (?, ?, ?)",
+            (UNKNOWN, _iso(self._now()), client_order_id, PENDING, UNKNOWN, NOT_PLACED),
         )
+        return str(row[0]) if row is not None else None
 
     def mark_not_placed_after_send(self, client_order_id: str) -> None:
         self._conn.execute(
-            "UPDATE orders SET status = ?, updated_at = ? "
+            "UPDATE orders SET status = ?, updated_at = ?, version = version + 1 "
             "WHERE client_order_id = ? AND broker_order_id IS NULL AND status IN (?, ?)",
             (NOT_PLACED, _iso(self._now()), client_order_id, PENDING, UNKNOWN),
         )
@@ -261,33 +291,19 @@ class OrderRepository:
         """Bind a reconciled broker id to ``record`` iff the row is unchanged since read.
         Raises ``sqlite3.IntegrityError`` if the id is already bound to another order."""
         cur = self._conn.execute(
-            "UPDATE orders SET status = ?, broker_order_id = ?, updated_at = ? "
-            "WHERE client_order_id = ? AND broker_order_id IS NULL "
-            "AND status = ? AND updated_at = ?",
-            (
-                PLACED,
-                broker_order_id,
-                _iso(self._now()),
-                record.client_order_id,
-                record.status,
-                _iso(record.updated_at),
-            ),
+            "UPDATE orders SET status = ?, broker_order_id = ?, updated_at = ?, "
+            "version = version + 1 "
+            "WHERE client_order_id = ? AND broker_order_id IS NULL AND version = ?",
+            (PLACED, broker_order_id, _iso(self._now()), record.client_order_id, record.version),
         )
         return cur.rowcount == 1
 
     def transition(self, record: OrderRecord, to_status: str) -> bool:
         """Move ``record`` to ``to_status`` (stamping updated_at) iff unchanged since read."""
         cur = self._conn.execute(
-            "UPDATE orders SET status = ?, updated_at = ? "
-            "WHERE client_order_id = ? AND broker_order_id IS NULL "
-            "AND status = ? AND updated_at = ?",
-            (
-                to_status,
-                _iso(self._now()),
-                record.client_order_id,
-                record.status,
-                _iso(record.updated_at),
-            ),
+            "UPDATE orders SET status = ?, updated_at = ?, version = version + 1 "
+            "WHERE client_order_id = ? AND broker_order_id IS NULL AND version = ?",
+            (to_status, _iso(self._now()), record.client_order_id, record.version),
         )
         return cur.rowcount == 1
 
@@ -302,7 +318,8 @@ def _safe_reconcile(reconcile: Reconciler, record: OrderRecord) -> ReconcileResu
 
 def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler) -> ResolveResult:
     """Settle an order row without ever sending anything (used by retries and by startup
-    reconciliation)."""
+    reconciliation). Precondition: no other process is sending orders from this database
+    (see the module docstring's single-sender note)."""
     cid = record.client_order_id
     if record.broker_order_id:
         return ResolveResult(ResolveOutcome.PLACED, record.broker_order_id)
@@ -334,7 +351,7 @@ def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler
         return ResolveResult(ResolveOutcome.NOT_PLACED)
 
     if record.status == PENDING:
-        # The process died mid-send at an unknown moment (updated_at predates the send), so
+        # The sender died mid-send at an unknown moment (updated_at predates the send), so
         # "absent" can't be trusted yet. Re-anchor at now — after the crash — so the
         # consistency window starts after any send the dead process could have made.
         repo.transition(record, UNKNOWN)
@@ -344,11 +361,12 @@ def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler
     return ResolveResult(ResolveOutcome.UNRESOLVED, detail=detail)
 
 
-def _best_effort(action: Callable[[str], None], cid: str) -> None:
+def _best_effort(action: Callable[[str], object], cid: str) -> object:
     try:
-        action(cid)
+        return action(cid)
     except Exception as exc:  # the classification below still reaches the caller
         _log.error("could not record order outcome", cid=cid, error=type(exc).__name__)
+        return None
 
 
 def _send_once(broker: Broker, repo: OrderRepository, order: Order) -> str:
@@ -360,10 +378,12 @@ def _send_once(broker: Broker, repo: OrderRepository, order: Order) -> str:
         _log.warning("order definitely not placed", cid=cid)
         raise
     except Exception as exc:
-        _best_effort(repo.mark_unknown_after_send, cid)
+        previous = _best_effort(repo.mark_unknown_after_send, cid)
+        if previous == NOT_PLACED:
+            _log.error("a possibly-live order had been marked not placed; now unknown", cid=cid)
         _log.error("submit outcome unknown; not re-sent", cid=cid, error=type(exc).__name__)
         raise OrderOutcomeUnknownError(cid, type(exc).__name__) from exc
-    if not broker_order_id:
+    if not broker_order_id or not broker_order_id.strip():
         _best_effort(repo.mark_unknown_after_send, cid)
         raise OrderOutcomeUnknownError(cid, "broker returned no order id")
     try:
@@ -380,9 +400,11 @@ def _send_once(broker: Broker, repo: OrderRepository, order: Order) -> str:
         ) from exc
     if previous is None:
         _log.error(
-            "order placed but its row is already bound", cid=cid, broker_order_id=broker_order_id
+            "order placed but its row is bound to another broker id",
+            cid=cid,
+            broker_order_id=broker_order_id,
         )
-        raise OrderOutcomeUnknownError(cid, f"placed as {broker_order_id}; row already bound")
+        raise OrderOutcomeUnknownError(cid, f"placed as {broker_order_id}; row bound elsewhere")
     if previous == NOT_PLACED:
         _log.error(
             "order was marked not placed but the broker accepted it; the reconcile window is "
@@ -412,7 +434,7 @@ def place_idempotent(
             "refusing to send an order inside an open transaction: the write-ahead row must "
             "be committed before the network call"
         )
-    if repo.write_pending(order):  # this call created the row: it owns the one send
+    if repo._write_pending(order):  # this call created the row: it owns the one send
         return _send_once(broker, repo, order)
     record = repo.get(cid)
     if record is None:  # pragma: no cover - the INSERT OR IGNORE just saw the row

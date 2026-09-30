@@ -283,3 +283,27 @@ def test_account_start_of_day_equity_is_optional_and_validated() -> None:
     assert acct.start_of_day_equity == D("2")
     with pytest.raises(TypeError):
         Account(D("1"), D("1"), D("1"), start_of_day_equity=2.0)  # type: ignore[arg-type]
+
+
+def test_day_state_pdt_inputs_are_validated_and_normalized() -> None:
+    from datetime import timedelta, timezone
+
+    from trader.core.enums import Side
+
+    local = datetime(2026, 6, 29, 10, 0, tzinfo=timezone(timedelta(hours=-4)))
+    state = DayState(
+        date(2026, 6, 29), Decimal("1"), Decimal(0), Decimal(0), 0, Decimal(0),
+        executions=(("AAPL", "BUY", local),), pdt_window_start=date(2026, 6, 23),
+    )  # fmt: skip
+    ((symbol, side, ts),) = state.executions
+    assert (symbol, side, ts.tzinfo) == ("AAPL", Side.BUY, UTC)
+    with pytest.raises(TypeError, match="pdt_window_start"):
+        DayState(
+            date(2026, 6, 29), Decimal("1"), Decimal(0), Decimal(0), 0, Decimal(0),
+            pdt_window_start=datetime(2026, 6, 23, tzinfo=UTC),  # type: ignore[arg-type]
+        )  # fmt: skip
+    with pytest.raises(ValueError):
+        DayState(
+            date(2026, 6, 29), Decimal("1"), Decimal(0), Decimal(0), 0, Decimal(0),
+            executions=(("AAPL", "BUY", datetime(2026, 6, 29)),),  # naive: rejected
+        )  # fmt: skip

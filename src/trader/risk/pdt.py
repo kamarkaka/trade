@@ -8,10 +8,9 @@ threshold. **Configurable, not hardcoded** — the thresholds live in ``RiskConf
 faith rules apply instead).
 
 ``Fill`` carries no side, so the rule operates on explicit ``TradeEvent`` (symbol + side +
-timestamp) — the caller builds these from the persisted orders/fills. PDT only bites on a
-real margin account, so the gate wiring (supplying the trade history + the calendar-derived
-window start) is assembled on the live order path at go-live (M5.6/M5.7); paper never
-day-trades a real account.
+timestamp). The daemon's day-state provider supplies the history (durable fills joined with
+their orders) and the calendar-derived window start on ``DayState``; the gate's
+``rules.pattern_day_trader`` evaluates it.
 """
 
 from __future__ import annotations
@@ -99,7 +98,7 @@ class PDTRule:
             return RuleResult(
                 ok=False,
                 reason=(
-                    f"PDT: {count} day-trades in window; a 4th is blocked while equity "
+                    f"PDT: {count} day-trades in window; another is blocked while equity "
                     f"< {self._cfg.pdt_equity_threshold_usd}"
                 ),
             )

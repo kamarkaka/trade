@@ -381,6 +381,11 @@ class DayState:
     trades_today: int
     loss_today: Decimal
     kill_switch_engaged: bool = False
+    # Pattern-day-trader inputs (design §10): executed (symbol, side, time) over the rolling
+    # window starting at ``pdt_window_start`` (an exchange session date). None => not
+    # supplied (backtests) and the PDT rule is not evaluated.
+    executions: tuple[tuple[str, Side, datetime], ...] = ()
+    pdt_window_start: date | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.trading_date, date) or isinstance(self.trading_date, datetime):
@@ -402,6 +407,19 @@ class DayState:
         object.__setattr__(self, "loss_today", _require_decimal(self.loss_today, "loss_today"))
         if not isinstance(self.kill_switch_engaged, bool):
             raise TypeError("kill_switch_engaged must be a bool")
+        if self.pdt_window_start is not None and (
+            not isinstance(self.pdt_window_start, date)
+            or isinstance(self.pdt_window_start, datetime)
+        ):
+            raise TypeError("pdt_window_start must be a datetime.date or None")
+        object.__setattr__(
+            self,
+            "executions",
+            tuple(
+                (sym, Side(side), _require_utc(ts, "execution ts"))
+                for sym, side, ts in self.executions
+            ),
+        )
 
 
 __all__ = [

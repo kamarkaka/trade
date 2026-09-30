@@ -157,3 +157,59 @@ def test_configurable_max_day_trades() -> None:
         ).ok
         is True
     )  # only AAPL opened, count 0 < 1
+
+
+# --- the gate's pure rule over DayState (LR8) -------------------------------------- #
+
+
+def _day_state(executions, window_start, equity="10000"):  # type: ignore[no-untyped-def]
+    from trader.core import DayState
+
+    return DayState(
+        date(2026, 6, 29), Decimal(equity), Decimal(0), Decimal(0), 0, Decimal(0),
+        executions=tuple(executions), pdt_window_start=window_start,
+    )  # fmt: skip
+
+
+def _rule_ctx(state, equity: str = "10000", enforce: bool = True):  # type: ignore[no-untyped-def]
+    from trader.core import Account, Quote
+    from trader.risk.rules import RuleContext
+
+    e = Decimal(equity)
+    now = datetime(2026, 6, 29, 18, 0, tzinfo=UTC)  # 14:00 EDT
+    quote = Quote("AAPL", now, Decimal("100"), Decimal("100"), Decimal("100"), 1000)
+    return RuleContext(RiskConfig(enforce_pdt=enforce), (), Account(e, e, e), quote, state, now)
+
+
+def _round_trips(n: int, day: datetime) -> list[tuple[str, Side, datetime]]:
+    out: list[tuple[str, Side, datetime]] = []
+    for i in range(n):
+        out += [(f"S{i}", Side.BUY, day), (f"S{i}", Side.SELL, day + timedelta(minutes=5))]
+    return out
+
+
+def test_gate_rule_blocks_one_day_trade_too_many() -> None:
+    from trader.risk import rules
+
+    today = datetime(2026, 6, 29, 14, 0, tzinfo=UTC)  # 10:00 EDT
+    history = [*_round_trips(3, today), ("AAPL", Side.BUY, today)]
+    state = _day_state(history, date(2026, 6, 23))
+    closing = Order("c1", "s1", "AAPL", Side.SELL, 1, OrderType.MARKET)  # completes a 4th
+    result = rules.pattern_day_trader(closing, _rule_ctx(state))
+    assert not result.ok and "PDT" in result.reason
+    opening = Order("c2", "s1", "MSFT", Side.BUY, 1, OrderType.MARKET)  # not a day trade
+    assert rules.pattern_day_trader(opening, _rule_ctx(state)).ok
+
+
+def test_gate_rule_respects_threshold_flag_window_and_missing_inputs() -> None:
+    from trader.risk import rules
+
+    today = datetime(2026, 6, 29, 14, 0, tzinfo=UTC)
+    history = [*_round_trips(3, today), ("AAPL", Side.BUY, today)]
+    closing = Order("c1", "s1", "AAPL", Side.SELL, 1, OrderType.MARKET)
+    state = _day_state(history, date(2026, 6, 23))
+    assert rules.pattern_day_trader(closing, _rule_ctx(state, equity="30000")).ok  # >= 25k
+    assert rules.pattern_day_trader(closing, _rule_ctx(state, enforce=False)).ok
+    old = [*_round_trips(3, today - timedelta(days=10)), ("AAPL", Side.BUY, today)]
+    assert rules.pattern_day_trader(closing, _rule_ctx(_day_state(old, date(2026, 6, 23)))).ok
+    assert rules.pattern_day_trader(closing, _rule_ctx(_day_state(history, None))).ok  # no inputs

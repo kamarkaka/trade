@@ -361,7 +361,11 @@ def run(
             # A daily-loss breach auto-engages the kill switch as soon as a cycle sees it.
             day_state_provider=tripping_day_state(
                 DailyCounters(
-                    state, tz=ZoneInfo(schedule.timezone), scope=counters_scope
+                    state,
+                    tz=ZoneInfo(schedule.timezone),
+                    scope=counters_scope,
+                    sessions=calendar.sessions,  # PDT: rolling window of exchange sessions
+                    pdt_window_days=cfg.risk.pdt_window_days,
                 ).day_state,
                 kill_switch,
                 cfg.risk,

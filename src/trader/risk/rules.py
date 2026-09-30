@@ -213,6 +213,25 @@ def max_trades_per_day(order: Order, ctx: RuleContext) -> RuleResult:
     return RuleResult(ok=True)
 
 
+def pattern_day_trader(order: Order, ctx: RuleContext) -> RuleResult:
+    """Block the order that would be one day-trade too many under the equity threshold
+    (``risk.pdt``). Evaluated only when the day state carries the trade history (the daemon
+    supplies it; backtests don't). A regulatory limit: exits are not exempt."""
+    state = ctx.day_state
+    if state.pdt_window_start is None:
+        return RuleResult(ok=True)
+    from trader.risk.pdt import PDTRule, TradeEvent  # local: pdt imports this module
+
+    events = [TradeEvent(symbol, side, ts) for symbol, side, ts in state.executions]
+    return PDTRule(ctx.config).check(
+        order,
+        events=events,
+        equity=ctx.account.equity,
+        asof=ctx.now,
+        window_start=state.pdt_window_start,
+    )
+
+
 # Ordered for the gate (M4.3): the kill switch first (hardest stop), then cheap gates, then
 # price-dependent caps.
 ALL_RULES = (
@@ -221,6 +240,7 @@ ALL_RULES = (
     duplicate_order_guard,
     daily_loss_limit,
     max_trades_per_day,
+    pattern_day_trader,
     price_sanity,
     max_order_notional,
     max_position_size,

@@ -22,18 +22,23 @@ reading is refused (fail closed: the cycle errors and alerts, and no order is se
 than recorded or compared — it would otherwise disable the loss rail for the day or trip it
 spuriously. A non-positive broker start-of-day figure is ignored (the capture is used).
 
+It also supplies the pattern-day-trader inputs: the executions (durable fills joined with
+their orders' side) over the rolling window of ``pdt_window_days`` exchange sessions ending
+today, whose first session comes from the injected exchange calendar.
+
 Every read refreshes the ``daily_counters`` row so the read-only web UI shows current values.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from trader.core import Account, DayState
+from trader.core.enums import Side
 
 # execution.idempotency.NOT_PLACED (kept local so state/ doesn't import execution/; a test
 # pins the two together).
@@ -54,13 +59,19 @@ class DailyCounters:
         tz: ZoneInfo,
         scope: str,
         now: Callable[[], datetime] = _utcnow,
+        sessions: Callable[[date, date], Sequence[date]] | None = None,
+        pdt_window_days: int = 5,
     ) -> None:
         if not scope:
             raise ValueError("a counters scope (the equity source) is required")
+        if pdt_window_days < 1:
+            raise ValueError("pdt_window_days must be at least 1")
         self._conn = conn
         self._tz = tz
         self._scope = scope
         self._now = now
+        self._sessions = sessions  # None => no PDT inputs (the rule is not evaluated)
+        self._pdt_window_days = pdt_window_days
 
     def session_of(self, at: datetime) -> date:
         return at.astimezone(self._tz).date()
@@ -77,6 +88,8 @@ class DailyCounters:
         start_equity = self._start_of_day_equity(session, account)
         trades = self.trades_on(session)
         loss = max(Decimal(0), start_equity - account.equity)
+        window_start = self.pdt_window_start(session)
+        executions = self.executions_since(window_start) if window_start is not None else ()
         self._conn.execute(
             "UPDATE daily_counters SET trades_today = ?, loss_today = ?, updated_at = ? "
             "WHERE trading_date = ? AND scope = ?",
@@ -90,6 +103,33 @@ class DailyCounters:
             trades_today=trades,
             loss_today=loss,
             kill_switch_engaged=kill_switch_engaged,
+            executions=executions,
+            pdt_window_start=window_start,
+        )
+
+    def pdt_window_start(self, session: date) -> date | None:
+        """First exchange session of the rolling PDT window ending at ``session``."""
+        if self._sessions is None:
+            return None
+        lookback = session - timedelta(days=self._pdt_window_days * 2 + 10)  # covers holidays
+        recent = [d for d in self._sessions(lookback, session) if d <= session]
+        if not recent:
+            return session
+        return recent[-self._pdt_window_days] if len(recent) >= self._pdt_window_days else recent[0]
+
+    def executions_since(self, window_start: date) -> tuple[tuple[str, Side, datetime], ...]:
+        """(symbol, side, time) of every order that filled anything since the window start —
+        durable fills (one row per completed order) joined with their order's side."""
+        start = datetime.combine(window_start, time(0), tzinfo=self._tz)
+        rows = self._conn.execute(
+            "SELECT f.symbol, o.side, f.ts FROM fills f "
+            "JOIN orders o ON o.client_order_id = f.client_order_id "
+            "WHERE f.quantity > 0 AND julianday(f.ts) >= julianday(?) ORDER BY f.id",
+            (start.isoformat(),),
+        ).fetchall()
+        return tuple(
+            (str(sym), Side(side), datetime.fromisoformat(ts).astimezone(UTC))
+            for sym, side, ts in rows
         )
 
     def trades_on(self, session: date) -> int:

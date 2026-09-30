@@ -235,3 +235,59 @@ def test_migration_006_keeps_existing_counters_under_an_empty_scope(tmp_path: Pa
         _account("10000"), datetime(2026, 6, 26, 15, tzinfo=UTC)
     )
     assert conn.execute("SELECT COUNT(*) FROM daily_counters").fetchone()[0] == 2
+
+
+# --- pattern-day-trader inputs (LR8) ---------------------------------------------- #
+
+
+def _sessions(start, end):  # type: ignore[no-untyped-def]
+    """Weekday 'sessions' (no holidays) for tests."""
+    out, d = [], start
+    while d <= end:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def _fill(conn: sqlite3.Connection, cid: str, side: str, ts: str, qty: int = 1) -> None:
+    conn.execute(
+        "INSERT INTO orders (client_order_id, strategy_id, symbol, side, quantity, order_type, "
+        "limit_price, tif, status, broker_order_id, created_at, updated_at) "
+        "VALUES (?, 's1', 'AAPL', ?, 1, 'MARKET', NULL, 'DAY', 'FILLED', ?, ?, ?)",
+        (cid, side, f"b-{cid}", ts, ts),
+    )
+    conn.execute(
+        "INSERT INTO fills (client_order_id, broker_order_id, symbol, quantity, price, fees, "
+        "ts, status) VALUES (?, ?, 'AAPL', ?, '100', '0', ?, 'FILLED')",
+        (cid, f"b-{cid}", qty, ts),
+    )
+
+
+def test_pdt_window_is_the_last_n_exchange_sessions(tmp_path: Path) -> None:
+    from datetime import date
+
+    conn = _conn(tmp_path)
+    counters = DailyCounters(conn, tz=NY, scope="live:x", sessions=_sessions)
+    # Mon 2026-06-29: the last 5 weekday sessions are Tue 6/23 .. Mon 6/29
+    assert counters.pdt_window_start(date(2026, 6, 29)) == date(2026, 6, 23)
+    no_calendar = DailyCounters(conn, tz=NY, scope="live:x")
+    assert no_calendar.pdt_window_start(date(2026, 6, 29)) is None
+
+
+def test_day_state_carries_executions_since_the_window_start(tmp_path: Path) -> None:
+    from trader.core.enums import Side
+
+    conn = _conn(tmp_path)
+    _fill(conn, "old", "BUY", "2026-06-22T15:00:00+00:00")  # before the window
+    _fill(conn, "buy", "BUY", "2026-06-29T14:00:00+00:00")
+    _fill(conn, "sell", "SELL", "2026-06-29T15:00:00+00:00")
+    _fill(conn, "none", "BUY", "2026-06-29T15:30:00+00:00", qty=0)  # nothing filled
+    state = DailyCounters(conn, tz=NY, scope="live:x", sessions=_sessions).day_state(
+        _account("10000"), MORNING
+    )
+    assert state.pdt_window_start is not None and state.pdt_window_start.isoformat() == "2026-06-23"
+    assert [(s, side) for s, side, _ in state.executions] == [
+        ("AAPL", Side.BUY),
+        ("AAPL", Side.SELL),
+    ]

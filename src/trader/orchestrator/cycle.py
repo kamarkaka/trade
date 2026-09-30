@@ -240,11 +240,16 @@ class Orchestrator:
                 snapshot = MarketSnapshot(asof=now, quotes=quotes)
                 positions = self._broker.get_positions()
                 account = self._broker.get_account()
+                day_state_for = self._day_state_source(day_state, now, engaged)
+                if day_state is None and self._day_state_provider is not None:
+                    # Every cycle checks in, orders or not: the session's start-of-day equity
+                    # is captured at its first cycle, and implausible equity fails the cycle
+                    # closed before the strategy even runs.
+                    day_state_for(account)
                 decisions = list(
                     strategy.decide(snapshot, positions, account, self._data, self._clock)
                 )
                 result.decisions = decisions
-                day_state_for = self._day_state_source(day_state, now, engaged)
                 # Reconcile same-ticker conflicts across the cycle's decisions BEFORE sizing
                 # (net default), then route each resulting order through the chokepoint.
                 resolved = self._risk.resolve_conflicts([(strategy_id, d) for d in decisions])
@@ -421,8 +426,13 @@ class Orchestrator:
             return lambda _account: explicit
         provider = self._day_state_provider
         if provider is not None:
-            return lambda account: provider(account, now, engaged)
+            # Re-read the kill switch per order: an auto-trip earlier in this cycle (or an
+            # operator's engage) must reach the gate before the next order.
+            return lambda account: provider(account, now, self._kill_switch_now())
         return lambda account: self._default_day_state(account, now, kill_switch_engaged=engaged)
+
+    def _kill_switch_now(self) -> bool:
+        return bool(self._kill_switch()) if self._kill_switch is not None else False
 
     @staticmethod
     def _default_day_state(

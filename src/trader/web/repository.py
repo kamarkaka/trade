@@ -191,7 +191,7 @@ class MonitoringRepo:
         )
         counters = self._db.query_one(
             "SELECT trading_date, trades_today, loss_today, start_of_day_equity, updated_at "
-            "FROM daily_counters ORDER BY trading_date DESC LIMIT 1"
+            "FROM daily_counters ORDER BY trading_date DESC, updated_at DESC LIMIT 1"
         )
         return {"latest_equity": _row(snapshot), "today": _row(counters)}
 

@@ -167,6 +167,7 @@ def run(
 ) -> None:
     """Run the trading daemon. PAPER (default) uses SimBroker against live quotes (no real
     orders). LIVE places REAL orders and requires mode=live PLUS a second confirmation."""
+    import hashlib
     import time as _time
     import uuid
     from zoneinfo import ZoneInfo
@@ -296,6 +297,8 @@ def run(
                 raise typer.Exit(1)
             trading = SchwabTradingClient(http)
             account_hash = mappings[0].hash_value
+            # Live counters persist per account (a short digest, never the identifier itself).
+            counters_scope = "live:" + hashlib.sha256(account_hash.encode()).hexdigest()[:12]
             broker = SchwabBroker(
                 trading, account_hash, clock=clock, fees=fees, client_id_for=repo.client_id_for
             )
@@ -316,11 +319,13 @@ def run(
         else:
             # PAPER: SimBroker, never real. It can't change state while we poll, so read once
             # and cancel any remainder (a resting limit order is never left WORKING).
-            # Each process gets its own order-id namespace: durable order rows outlive this
-            # in-memory broker, and a broker id may belong to only one order row.
-            sim = SimBroker(
-                data, clock, starting_cash=cash, fees=fees, id_prefix=f"SIM-{uuid.uuid4().hex[:8]}"
-            )
+            # A paper process starts from a fresh, in-memory SimBroker while the order rows and
+            # counters are durable, so both are namespaced per process: a broker id may belong
+            # to only one order row, and a persisted paper start-of-day equity would read a
+            # restart as a loss.
+            run_id = uuid.uuid4().hex[:8]
+            sim = SimBroker(data, clock, starting_cash=cash, fees=fees, id_prefix=f"SIM-{run_id}")
+            counters_scope = f"paper:{run_id}"
             broker = sim
             reconcile = in_memory_reconciler(sim.find_by_client_id)
             poll_policy = PollPolicy(timeout_seconds=0)
@@ -352,7 +357,9 @@ def run(
             kill_switch=kill_switch.is_engaged,
             executor=executor,
             # Real daily rails: persisted start-of-day equity + today's orders (exchange tz).
-            day_state_provider=DailyCounters(state, tz=ZoneInfo(schedule.timezone)).day_state,
+            day_state_provider=DailyCounters(
+                state, tz=ZoneInfo(schedule.timezone), scope=counters_scope
+            ).day_state,
         )
         # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
         # only for a broker whose positions survive a restart; SimBroker is in-memory (always

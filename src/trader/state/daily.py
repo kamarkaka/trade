@@ -1,16 +1,23 @@
 """Persisted per-session counters -> the risk gate's real DayState (design §10/§12).
 
-The account-wide daily rails (daily-loss limit, max trades per day) need facts that
-survive restarts, measured per EXCHANGE session (the exchange-tz calendar date, not UTC):
+The account-wide daily rails (daily-loss limit, max trades per day) need facts measured per
+EXCHANGE session (the exchange-tz calendar date, not UTC):
 
-- **start-of-day equity** — captured at the first observation of each session and persisted
-  in ``daily_counters``, so a restart mid-session keeps the morning's value;
+- **start-of-day equity** — captured at the first cycle of each session (every cycle calls
+  in, orders or not) and persisted in ``daily_counters``;
 - **trades today** — orders sent this session, counted from the durable ``orders`` table:
   every write-ahead row except the definitely-not-placed ones (an order whose outcome is
   unknown counts — conservative);
 - **loss today** — start-of-day equity minus current equity, floored at zero. It is
   mark-to-market, so it includes realized and unrealized P&L; the split is not tracked
   per session (``DayState.realized_pnl`` / ``unrealized_pnl`` stay 0).
+
+Counters are keyed by (session, **scope**) — the equity source they measure. Live uses one
+scope per account, so the start-of-day equity survives restarts; paper uses one scope per
+process, because its SimBroker restarts flat (a persisted paper start-of-day equity would read
+a restart as a loss). A non-positive equity reading is refused (fail closed, the cycle errors
+and alerts) rather than recorded or compared: it would otherwise disable the loss rail for
+the day or trip it spuriously.
 
 Every read refreshes the ``daily_counters`` row so the read-only web UI shows current values.
 """
@@ -25,7 +32,9 @@ from zoneinfo import ZoneInfo
 
 from trader.core import Account, DayState
 
-_NOT_PLACED = "not_placed"  # execution.idempotency.NOT_PLACED (kept local: no import cycle)
+# execution.idempotency.NOT_PLACED (kept local so state/ doesn't import execution/; a test
+# pins the two together).
+_NOT_PLACED = "not_placed"
 
 
 def _utcnow() -> datetime:
@@ -40,10 +49,14 @@ class DailyCounters:
         conn: sqlite3.Connection,
         *,
         tz: ZoneInfo,
+        scope: str,
         now: Callable[[], datetime] = _utcnow,
     ) -> None:
+        if not scope:
+            raise ValueError("a counters scope (the equity source) is required")
         self._conn = conn
         self._tz = tz
+        self._scope = scope
         self._now = now
 
     def session_of(self, at: datetime) -> date:
@@ -52,14 +65,19 @@ class DailyCounters:
     def day_state(
         self, account: Account, at: datetime, kill_switch_engaged: bool = False
     ) -> DayState:
+        if account.equity <= 0:
+            raise ValueError(
+                f"implausible account equity {account.equity}; refusing to evaluate the "
+                "daily rails (fail closed)"
+            )
         session = self.session_of(at)
         start_equity = self._start_of_day_equity(session, account.equity)
         trades = self.trades_on(session)
         loss = max(Decimal(0), start_equity - account.equity)
         self._conn.execute(
             "UPDATE daily_counters SET trades_today = ?, loss_today = ?, updated_at = ? "
-            "WHERE trading_date = ?",
-            (trades, str(loss), self._now().astimezone(UTC).isoformat(), session.isoformat()),
+            "WHERE trading_date = ? AND scope = ?",
+            (trades, str(loss), self._stamp(), session.isoformat(), self._scope),
         )
         return DayState(
             trading_date=session,
@@ -72,34 +90,39 @@ class DailyCounters:
         )
 
     def trades_on(self, session: date) -> int:
-        """Orders written this session (exchange tz), excluding definitely-not-placed."""
-        start = datetime.combine(session, time(0), tzinfo=self._tz).astimezone(UTC)
+        """Orders written this session (exchange tz), excluding definitely-not-placed.
+        Compared as instants (julianday), so any stored UTC offset buckets correctly."""
+        start = datetime.combine(session, time(0), tzinfo=self._tz)
         end = datetime.combine(session + timedelta(days=1), time(0), tzinfo=self._tz)
         row = self._conn.execute(
-            "SELECT COUNT(*) FROM orders WHERE created_at >= ? AND created_at < ? AND status != ?",
-            (start.isoformat(), end.astimezone(UTC).isoformat(), _NOT_PLACED),
+            "SELECT COUNT(*) FROM orders WHERE julianday(created_at) >= julianday(?) "
+            "AND julianday(created_at) < julianday(?) AND status != ?",
+            (start.isoformat(), end.isoformat(), _NOT_PLACED),
         ).fetchone()
         return int(row[0])
 
     def _start_of_day_equity(self, session: date, equity: Decimal) -> Decimal:
-        key = session.isoformat()
-        ts = self._now().astimezone(UTC).isoformat()
+        key = (session.isoformat(), self._scope)
         # First observation of the session wins; later ones (and restarts) keep it.
         self._conn.execute(
             "INSERT OR IGNORE INTO daily_counters "
-            "(trading_date, trades_today, loss_today, start_of_day_equity, updated_at) "
-            "VALUES (?, 0, '0', ?, ?)",
-            (key, str(equity), ts),
+            "(trading_date, scope, trades_today, loss_today, start_of_day_equity, updated_at) "
+            "VALUES (?, ?, 0, '0', ?, ?)",
+            (*key, str(equity), self._stamp()),
         )
         self._conn.execute(
             "UPDATE daily_counters SET start_of_day_equity = ? "
-            "WHERE trading_date = ? AND start_of_day_equity IS NULL",
-            (str(equity), key),
+            "WHERE trading_date = ? AND scope = ? AND start_of_day_equity IS NULL",
+            (str(equity), *key),
         )
         row = self._conn.execute(
-            "SELECT start_of_day_equity FROM daily_counters WHERE trading_date = ?", (key,)
+            "SELECT start_of_day_equity FROM daily_counters WHERE trading_date = ? AND scope = ?",
+            key,
         ).fetchone()
         return Decimal(row[0])
+
+    def _stamp(self) -> str:
+        return self._now().astimezone(UTC).isoformat()
 
 
 __all__ = ["DailyCounters"]

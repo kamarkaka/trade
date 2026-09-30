@@ -4,15 +4,18 @@
 
 1. a row without a broker id (``pending``/``unknown``) goes through ``resolve`` — adopted
    (FOUND), marked ``not_placed`` (ABSENT), or left unresolved with a reason code;
-2. a placed row (``WORKING``, id known) is polled to a terminal status — a remainder is
-   cancelled, since nothing may rest untracked — and completed atomically (terminal status
-   + fill row + attribution, exactly once);
+2. a placed row (``WORKING``, id known) is read once first: an order that cannot be this
+   row's (another symbol, more shares filled than ordered — e.g. a wrong id bound by hand) or
+   whose status can't be read is left untouched (unresolved) rather than polled, which could
+   cancel it. Otherwise it is polled to a terminal status — a remainder is cancelled, since
+   nothing may rest untracked — and completed atomically (terminal status + fill row +
+   attribution, exactly once); a fill the repository refuses leaves it unresolved;
 3. only then are positions trued to the broker (``execution.reconcile``): fills settled above
    are attributed to their strategy before any residual is parked under ``unknown``.
 
-It never places an order. Callers must hold the trading lease (``state.lease``): ``resolve``
-treats a ``pending`` row as orphaned, which is only true when no other process can be
-sending it.
+It never places an order. Callers must hold the trading lease (``state.lease``) — checked:
+``resolve`` treats a ``pending`` row as orphaned, which is only true when no other process
+can be sending it.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from functools import partial
 from trader.core.protocols import Broker
 from trader.execution.idempotency import (
     RETRY_LATER_CODES,
+    OrderRecord,
     OrderRepository,
     Reconciler,
     ResolveOutcome,
@@ -40,8 +44,11 @@ from trader.execution.poller import (
 from trader.execution.reconcile import ReconcileReport, reconcile
 from trader.observability.logging import get_logger
 from trader.state.attribution import AttributionLedger
+from trader.state.lease import TradingLease
 
 _log = get_logger("execution.account_reconcile")
+
+_PRECHECK_READS = 3  # transient failures reading a bound order before it is polled
 
 
 class Settlement(StrEnum):
@@ -84,11 +91,14 @@ def reconcile_account(
     attribution: AttributionLedger,
     reconcile_order: Reconciler,
     poll_policy: PollPolicy,
+    lease: TradingLease,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     retryable: tuple[type[BaseException], ...] = DEFAULT_RETRYABLE,
 ) -> AccountReconcileReport:
-    """Settle every open order row, then true positions. Hold the trading lease."""
+    """Settle every open order row, then true positions. ``lease`` must be held."""
+    if not lease.held:
+        raise RuntimeError("reconcile_account needs the trading lease held (state.lease)")
     settlements: list[OrderSettlement] = []
     for record in repo.open_orders():
         cid = record.client_order_id
@@ -107,43 +117,119 @@ def reconcile_account(
                 settlements.append(OrderSettlement(cid, Settlement.UNRESOLVED, "row vanished"))
                 continue
             record = adopted
-        broker_order_id = record.broker_order_id
-        if broker_order_id is None:  # pragma: no cover - adopted or placed rows carry an id
-            continue
-        try:
-            polled = poll_until_terminal(
+        settlements.append(
+            _settle_placed(
                 broker,
-                broker_order_id,
+                repo,
+                attribution,
+                record,
                 poll_policy,
                 monotonic=monotonic,
                 sleep=sleep,
                 retryable=retryable,
             )
-        except OrderStatusUnavailableError as exc:
-            settlements.append(
-                OrderSettlement(cid, Settlement.UNRESOLVED, str(exc), "status_unavailable")
-            )
-            continue
-        if not polled.terminal:
-            settlements.append(
-                OrderSettlement(
-                    cid,
-                    Settlement.UNRESOLVED,
-                    f"still {polled.fill.status.value} after polling",
-                    "not_terminal",
-                )
-            )
-            continue
-        fill = replace(polled.fill, client_order_id=cid)
-        repo.complete(
-            record, fill, partial(attribution.apply, fill, record.strategy_id, record.side)
         )
-        settlements.append(
-            OrderSettlement(cid, Settlement.COMPLETED, f"{fill.status.value} {fill.quantity}")
-        )
-        _log.info("reconciled order", cid=cid, status=fill.status.value, filled=fill.quantity)
     positions = reconcile(broker, attribution)
     return AccountReconcileReport(tuple(settlements), positions)
+
+
+def _settle_placed(
+    broker: Broker,
+    repo: OrderRepository,
+    attribution: AttributionLedger,
+    record: OrderRecord,
+    poll_policy: PollPolicy,
+    *,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+    retryable: tuple[type[BaseException], ...],
+) -> OrderSettlement:
+    """Poll a bound row to a terminal status and complete it (see the module docstring)."""
+    cid, broker_order_id = record.client_order_id, record.broker_order_id
+    if broker_order_id is None:  # pragma: no cover - callers pass bound rows only
+        return OrderSettlement(cid, Settlement.UNRESOLVED, "no broker id", "invalid_state")
+    refused = _precheck(broker, record, broker_order_id, poll_policy, sleep, retryable)
+    if refused is not None:
+        return refused
+    try:
+        polled = poll_until_terminal(
+            broker,
+            broker_order_id,
+            poll_policy,
+            monotonic=monotonic,
+            sleep=sleep,
+            retryable=retryable,
+        )
+    except OrderStatusUnavailableError as exc:
+        return OrderSettlement(cid, Settlement.UNRESOLVED, str(exc), "status_unavailable")
+    if not polled.terminal:
+        return OrderSettlement(
+            cid,
+            Settlement.UNRESOLVED,
+            f"still {polled.fill.status.value} after polling",
+            "not_terminal",
+        )
+    fill = replace(polled.fill, client_order_id=cid)
+    try:
+        newly = repo.complete(
+            record, fill, partial(attribution.apply, fill, record.strategy_id, record.side)
+        )
+    except (ValueError, LookupError) as exc:  # the fill contradicts the row: never attribute
+        _log.error("terminal fill refused; not recorded", cid=cid, error=str(exc))
+        return OrderSettlement(cid, Settlement.UNRESOLVED, f"fill refused: {exc}", "fill_refused")
+    if not newly:
+        _log.info("order was already completed", cid=cid)
+        return OrderSettlement(cid, Settlement.COMPLETED, "already completed")
+    _log.info("reconciled order", cid=cid, status=fill.status.value, filled=fill.quantity)
+    return OrderSettlement(cid, Settlement.COMPLETED, f"{fill.status.value} {fill.quantity}")
+
+
+def _precheck(
+    broker: Broker,
+    record: OrderRecord,
+    broker_order_id: str,
+    poll_policy: PollPolicy,
+    sleep: Callable[[float], None],
+    retryable: tuple[type[BaseException], ...],
+) -> OrderSettlement | None:
+    """Read the bound order once before polling it (polling may cancel it). Returns the
+    UNRESOLVED settlement when it can't be this row's order or can't be read; None to go on."""
+    cid = record.client_order_id
+    reads = 0
+    while True:
+        reads += 1
+        try:
+            fill = broker.get_order(broker_order_id)
+        except retryable as exc:
+            if reads < _PRECHECK_READS:
+                sleep(poll_policy.interval_seconds)
+                continue
+            return _unreadable(cid, exc)
+        except Exception as exc:  # won't clear by waiting
+            return _unreadable(cid, exc)
+        break
+    problems = []
+    if fill.broker_order_id != broker_order_id:
+        problems.append(f"the broker answered for {fill.broker_order_id}")
+    if _canon(fill.symbol) != _canon(record.symbol):
+        problems.append(f"symbol {fill.symbol!r}, ordered {record.symbol!r}")
+    if fill.quantity > record.quantity:
+        problems.append(f"filled {fill.quantity}, ordered {record.quantity}")
+    if not problems:
+        return None
+    _log.error("bound order does not match its row; left untouched", cid=cid)
+    detail = f"bound order {broker_order_id} does not match: " + "; ".join(problems)
+    return OrderSettlement(cid, Settlement.UNRESOLVED, detail, "bound_order_mismatch")
+
+
+def _unreadable(cid: str, exc: BaseException) -> OrderSettlement:
+    _log.warning("bound order unreadable; left untouched", cid=cid, error=type(exc).__name__)
+    detail = f"status read failed ({type(exc).__name__})"
+    return OrderSettlement(cid, Settlement.UNRESOLVED, detail, "status_unavailable")
+
+
+def _canon(symbol: str) -> str:
+    return symbol.strip().upper().replace("/", ".")
 
 
 def summary_lines(report: AccountReconcileReport) -> list[str]:

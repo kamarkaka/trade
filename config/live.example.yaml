@@ -69,5 +69,8 @@ observability:
   # Live state gets its OWN database: paper history (orders, attribution, fired slots,
   # daily counters) must never mix into live reconciliation or risk counters. The Schwab
   # token store (next to it, /state/schwab_token.sqlite) and the bar cache are shared.
+  # ONE live config and ONE state database per Schwab account: the trading lease (one order
+  # sender at a time) guards this database file, not the account — never run a second
+  # config, or a copy of this database, against the same account.
   db_path: /state/live.sqlite
   data_cache: /data/

@@ -71,16 +71,18 @@ def test_reconcile_refuses_while_another_process_holds_the_lease(tmp_path: Path)
     assert result.exit_code == 3 and "trading lease" in result.output
 
 
-def test_reconcile_operator_overrides_settle_rows_before_touching_the_broker(
+def test_reconcile_overrides_wait_for_the_broker_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Overrides are applied only once the broker is reachable (each --adopt is verified
+    # against the broker's order first); without credentials nothing is changed.
     from trader.core import Order
     from trader.core.enums import OrderType, Side
     from trader.execution.idempotency import OrderRepository
     from trader.state.db import connect
     from trader.state.migrate import run_migrations
 
-    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)  # stop right after the overrides
+    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)
     monkeypatch.delenv("SCHWAB_APP_SECRET", raising=False)
     conn = connect(tmp_path / "state.sqlite")
     run_migrations(conn)
@@ -102,12 +104,10 @@ def test_reconcile_operator_overrides_settle_rows_before_touching_the_broker(
             "c-found=SCH-7",
         ],
     )
-    assert "override: c-gone marked not placed" in result.output
-    assert "override: c-found adopted as SCH-7" in result.output
+    assert result.exit_code == 1  # no credentials to reach the broker
     gone, found = repo.get("c-gone"), repo.get("c-found")
-    assert gone is not None and gone.status == "not_placed"
-    assert found is not None and (found.status, found.broker_order_id) == ("WORKING", "SCH-7")
-    assert result.exit_code == 1  # then stops: no credentials to reach the broker
+    assert gone is not None and gone.status == "unknown"
+    assert found is not None and found.broker_order_id is None
 
 
 def test_reconcile_rejects_a_malformed_override(tmp_path: Path) -> None:

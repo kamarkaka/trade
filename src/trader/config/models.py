@@ -186,7 +186,7 @@ class ExecutionConfig(_Base):
     rate_limit_per_min: int = Field(default=100, gt=0, le=120)
     # How long after an unknown-outcome send the order listing must stay empty before the
     # order is trusted to be absent (covers listing lag + post-response processing + skew).
-    reconcile_window_seconds: int = Field(default=300, gt=0)
+    reconcile_window_seconds: int = Field(default=300, gt=0, le=3600)
     # Fee estimate applied to paper (SimBroker) and live (SchwabBroker) fills so their P&L
     # tracks real economics; the backtest has its own ``backtest.fees_model``.
     fees_model: FeesModelConfig = Field(default_factory=FeesModelConfig)

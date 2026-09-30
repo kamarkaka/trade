@@ -21,7 +21,7 @@ import typer
 from trader.broker import FeesModel, SchwabBroker
 from trader.clock import RealClock
 from trader.config import DEFAULT_CONFIG_PATH, AppConfig, load_config
-from trader.execution.idempotency import OrderRepository
+from trader.execution.idempotency import OrderRecord, OrderRepository
 from trader.execution.schwab_reconciler import SchwabOrderReconciler
 from trader.observability.logging import configure_logging
 from trader.schwab.config import SchwabClientConfig, schwab_config_from_env
@@ -691,15 +691,32 @@ def reconcile(
         list[str] | None,
         typer.Option(
             "--adopt",
-            help="Operator override: CLIENT_ORDER_ID=BROKER_ORDER_ID verified at Schwab.",
+            help="Operator override: CLIENT_ORDER_ID=BROKER_ORDER_ID verified at Schwab (the "
+            "Schwab order must match the order exactly, or nothing is changed).",
+        ),
+    ] = None,
+    unbind: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--unbind",
+            help="Operator override: CLIENT_ORDER_ID is bound to the wrong Schwab order; drop "
+            "that id so the order is resolved afresh.",
         ),
     ] = None,
 ) -> None:
     """Settle open orders against the LIVE Schwab account, then true positions.
 
     Never places an order (an unfinished order's remainder may be cancelled). Requires the
-    trading lease, so the daemon must be stopped. Exit codes: 0 clean, 2 unresolved or
-    divergent, 3 another trader process holds the lease."""
+    trading lease, so the daemon must be stopped. Overrides are all checked before anything
+    changes — each ``--adopt`` id against the Schwab order itself — and applied together or
+    not at all.
+
+    Exit codes: 0 clean; 1 configuration, credentials, account selection or state database
+    error; 2 not clean (unresolved orders or position divergence) or an override refused;
+    3 another trader process holds the trading lease; 4 the broker could not be reached or
+    returned an error."""
+    import sqlite3
+
     import httpx
 
     from trader.auth.token_store import TokenStore
@@ -719,6 +736,7 @@ def reconcile(
             "reconcile: paper mode has no broker account to reconcile (SimBroker is in-memory)"
         )
         return
+    requests = _parse_overrides(mark_not_placed or [], adopt or [], unbind or [])
     state_path = Path(cfg.observability.db_path)
     lease = TradingLease(state_path)
     if not lease.try_acquire():
@@ -732,60 +750,161 @@ def reconcile(
         conn = connect(state_path)
         run_migrations(conn)
         repo = OrderRepository(conn)
-        _apply_overrides(repo, mark_not_placed or [], adopt or [])
+        plan = _check_overrides(repo, requests)  # before touching the broker
         try:
             schwab_cfg = _schwab_config(cfg, require_credentials=True)
         except SchwabAuthError as exc:
             typer.echo(f"reconcile error: {exc}", err=True)
             raise typer.Exit(1) from exc
         clock = RealClock()
-        with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
-            http = SchwabHttp(
-                schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock
+        fees = FeesModel.from_config(cfg.execution.fees_model)  # as `run` records fills
+        try:
+            with httpx.Client(timeout=schwab_cfg.request_timeout_seconds) as client:
+                http = SchwabHttp(
+                    schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock
+                )
+                live = _live_account(cfg, http, repo, clock=clock, fees=fees, command="reconcile")
+                _verify_adoptions(live.reconciler, plan)
+                _apply_overrides(repo, plan)
+                report = reconcile_account(
+                    broker=live.broker,
+                    repo=repo,
+                    attribution=AttributionLedger(conn),
+                    reconcile_order=live.reconciler,
+                    poll_policy=PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds),
+                    lease=lease,
+                    retryable=TRANSIENT_READ_ERRORS,
+                )
+        except (SchwabError, httpx.HTTPError, OSError) as exc:
+            # The type only: a broker error's text can carry the account hash.
+            typer.echo(
+                "reconcile error: the broker could not be reached or returned an error "
+                f"({type(exc).__name__}); nothing more was settled",
+                err=True,
             )
-            live = _live_account(cfg, http, repo, clock=clock, fees=None, command="reconcile")
-            report = reconcile_account(
-                broker=live.broker,
-                repo=repo,
-                attribution=AttributionLedger(conn),
-                reconcile_order=live.reconciler,
-                poll_policy=PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds),
-                retryable=TRANSIENT_READ_ERRORS,
-            )
+            raise typer.Exit(4) from exc
         for line in summary_lines(report):
             typer.echo(line)
         if not report.is_clean:
             raise typer.Exit(2)
+    except sqlite3.Error as exc:
+        typer.echo(f"reconcile error: state database error ({type(exc).__name__})", err=True)
+        raise typer.Exit(1) from exc
     finally:
         lease.release()
 
 
-def _apply_overrides(repo: OrderRepository, not_placed: list[str], adopt: list[str]) -> None:
-    """Operator overrides for rows reconciliation cannot settle on its own (e.g. beyond the
-    listing look-back, or ambiguous with a manual trade). Verify against Schwab first."""
-    import sqlite3
+@dataclass(frozen=True)
+class _OverrideRequests:
+    not_placed: tuple[str, ...] = ()
+    adopt: tuple[tuple[str, str], ...] = ()  # (client_order_id, broker_order_id)
+    unbind: tuple[str, ...] = ()
 
-    for cid in not_placed:
-        if not repo.force_not_placed(cid):
-            typer.echo(f"reconcile error: {cid} is not an unsettled order without an id", err=True)
-            raise typer.Exit(2)
-        typer.echo(f"override: {cid} marked not placed")
+
+@dataclass(frozen=True)
+class _OverridePlan:
+    not_placed: tuple[OrderRecord, ...] = ()
+    adopt: tuple[tuple[OrderRecord, str], ...] = ()
+    unbind: tuple[OrderRecord, ...] = ()
+
+
+def _refuse_override(message: str) -> typer.Exit:
+    typer.echo(f"reconcile error: {message}; nothing was changed", err=True)
+    return typer.Exit(2)
+
+
+def _parse_overrides(
+    not_placed: list[str], adopt: list[str], unbind: list[str]
+) -> _OverrideRequests:
+    """Syntax only (exit 2): ids non-empty, ``--adopt`` as CID=ID, no order named twice."""
+    adoptions: list[tuple[str, str]] = []
     for spec in adopt:
         cid, sep, broker_order_id = spec.partition("=")
-        if not sep or not cid or not broker_order_id.strip():
-            typer.echo(
-                f"reconcile error: --adopt expects CID=BROKER_ORDER_ID, got {spec!r}", err=True
+        if not sep or not cid.strip() or not broker_order_id.strip():
+            raise _refuse_override(f"--adopt expects CID=BROKER_ORDER_ID, got {spec!r}")
+        adoptions.append((cid.strip(), broker_order_id.strip()))
+    requests = _OverrideRequests(
+        tuple(c.strip() for c in not_placed), tuple(adoptions), tuple(c.strip() for c in unbind)
+    )
+    cids = [*requests.not_placed, *(c for c, _ in requests.adopt), *requests.unbind]
+    if not all(cids):
+        raise _refuse_override("an override names an empty CLIENT_ORDER_ID")
+    twice = sorted({c for c in cids if cids.count(c) > 1})
+    if twice:
+        raise _refuse_override(f"{twice[0]} is named by more than one override")
+    broker_ids = [b for _, b in requests.adopt]
+    shared = sorted({b for b in broker_ids if broker_ids.count(b) > 1})
+    if shared:
+        raise _refuse_override(f"{shared[0]} is adopted by more than one order")
+    return requests
+
+
+def _check_overrides(repo: OrderRepository, requests: _OverrideRequests) -> _OverridePlan:
+    """Every overridden row exists and is eligible, read once — the override applies only if
+    the row is unchanged since (exit 2 otherwise)."""
+    from trader.execution.idempotency import placed_uncompleted, unsettled_without_id
+
+    def read(cid: str) -> OrderRecord:
+        record = repo.get(cid)
+        if record is None:
+            raise _refuse_override(f"no order {cid}")
+        return record
+
+    def unsettled(cid: str) -> OrderRecord:
+        record = read(cid)
+        if not unsettled_without_id(record):
+            raise _refuse_override(
+                f"{cid} is {record.status}"
+                + (f" as {record.broker_order_id}" if record.broker_order_id else "")
+                + ", not an unsettled order without a broker id"
             )
-            raise typer.Exit(2)
-        try:
-            adopted = repo.force_adopt(cid, broker_order_id.strip())
-        except sqlite3.IntegrityError as exc:
-            typer.echo(f"reconcile error: {broker_order_id} is bound to another order", err=True)
-            raise typer.Exit(2) from exc
-        if not adopted:
-            typer.echo(f"reconcile error: {cid} is not an unsettled order without an id", err=True)
-            raise typer.Exit(2)
-        typer.echo(f"override: {cid} adopted as {broker_order_id.strip()}")
+        return record
+
+    adoptions: list[tuple[OrderRecord, str]] = []
+    for cid, broker_order_id in requests.adopt:
+        owner = repo.client_id_for(broker_order_id)
+        if owner is not None:
+            raise _refuse_override(f"{broker_order_id} is already bound to order {owner}")
+        adoptions.append((unsettled(cid), broker_order_id))
+    unbinds: list[OrderRecord] = []
+    for cid in requests.unbind:
+        record = read(cid)
+        if not placed_uncompleted(record):
+            raise _refuse_override(f"{cid} is {record.status}, not a placed, uncompleted order")
+        unbinds.append(record)
+    return _OverridePlan(
+        tuple(unsettled(cid) for cid in requests.not_placed), tuple(adoptions), tuple(unbinds)
+    )
+
+
+def _verify_adoptions(reconciler: SchwabOrderReconciler, plan: _OverridePlan) -> None:
+    """Each ``--adopt`` id must be a Schwab order that matches the row's intent exactly and
+    was entered after its write-ahead (exit 2 otherwise, nothing bound)."""
+    for record, broker_order_id in plan.adopt:
+        reason = reconciler.verify_binding(record, broker_order_id)
+        if reason is not None:
+            raise _refuse_override(
+                f"{broker_order_id} cannot be order {record.client_order_id}: {reason}"
+            )
+
+
+def _apply_overrides(repo: OrderRepository, plan: _OverridePlan) -> None:
+    """All or nothing (exit 2 if a row changed since it was checked)."""
+    from trader.execution.idempotency import OverrideRefusedError
+
+    try:
+        repo.apply_overrides(not_placed=plan.not_placed, adopt=plan.adopt, unbind=plan.unbind)
+    except OverrideRefusedError as exc:
+        raise _refuse_override(str(exc)) from exc
+    for record in plan.not_placed:
+        typer.echo(f"override: {record.client_order_id} marked not placed")
+    for record, broker_order_id in plan.adopt:
+        typer.echo(f"override: {record.client_order_id} adopted as {broker_order_id}")
+    for record in plan.unbind:
+        typer.echo(
+            f"override: {record.client_order_id} unbound from {record.broker_order_id}; "
+            "it is resolved afresh after the consistency window"
+        )
 
 
 data_app = typer.Typer(help="Historical data cache management.", no_args_is_help=True)

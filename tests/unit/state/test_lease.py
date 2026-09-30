@@ -41,3 +41,41 @@ def test_lease_file_is_private_and_next_to_the_database(tmp_path: Path) -> None:
     assert lease.path == tmp_path / "s.sqlite.lease"
     assert stat.S_IMODE(os.stat(lease.path).st_mode) & 0o077 == 0
     lease.release()
+
+
+def test_every_path_to_the_database_shares_one_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "s.sqlite"
+    db.touch()
+    link = tmp_path / "link.sqlite"
+    link.symlink_to(db)
+    monkeypatch.chdir(tmp_path)
+    with TradingLease(db):
+        assert not TradingLease(link).try_acquire()  # a symlink to the same database
+        assert not TradingLease("s.sqlite").try_acquire()  # a relative path
+    assert TradingLease(link).path == TradingLease(db).path
+
+
+def test_a_lease_file_replaced_while_locking_is_not_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl
+
+    real_flock = fcntl.flock
+    lease = TradingLease(tmp_path / "s.sqlite")
+    replaced = {"times": 0}
+
+    def replace_then_lock(fd: int, op: int) -> None:
+        if op & fcntl.LOCK_EX and replaced["times"] < replaced.get("limit", 1):
+            replaced["times"] += 1
+            lease.path.unlink()  # someone swaps the file between our open and our lock
+            lease.path.touch()
+        real_flock(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", replace_then_lock)
+    assert lease.try_acquire()  # the orphaned lock is dropped; the retry locks the real file
+    assert replaced["times"] == 1 and os.stat(lease.path).st_ino == os.fstat(lease._fd).st_ino  # type: ignore[arg-type]
+    lease.release()
+    replaced.update(times=0, limit=2)  # replaced on every attempt: refuse, never hold an orphan
+    assert not lease.try_acquire() and not lease.held

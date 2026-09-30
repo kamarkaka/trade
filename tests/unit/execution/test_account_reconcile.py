@@ -23,6 +23,7 @@ from trader.execution.idempotency import (
 from trader.execution.poller import PollPolicy
 from trader.state.attribution import AttributionLedger
 from trader.state.db import connect
+from trader.state.lease import TradingLease
 from trader.state.migrate import run_migrations
 
 NOW = datetime(2026, 6, 29, 15, 0, tzinfo=UTC)
@@ -48,6 +49,12 @@ def _order(cid: str, symbol: str = "AAPL", qty: int = 10) -> Order:
     return Order(cid, "s1", symbol, Side.BUY, qty, OrderType.MARKET)
 
 
+class _HeldLease:
+    """Stands in for the trading lease the caller holds (see test_lease.py)."""
+
+    held = True
+
+
 def _run(broker: FakeBroker, repo: OrderRepository, attribution: AttributionLedger, reconcile=None):  # type: ignore[no-untyped-def]
     return reconcile_account(
         broker=broker,
@@ -55,6 +62,7 @@ def _run(broker: FakeBroker, repo: OrderRepository, attribution: AttributionLedg
         attribution=attribution,
         reconcile_order=reconcile or in_memory_reconciler(broker.find_by_client_id),
         poll_policy=PollPolicy(timeout_seconds=0, post_cancel_polls=1),
+        lease=_HeldLease(),  # type: ignore[arg-type]
         sleep=lambda _s: None,
     )
 
@@ -141,6 +149,7 @@ def test_an_unreadable_status_leaves_the_order_unresolved(tmp_path: Path) -> Non
     report = _run(broker, repo, attribution)
     assert report.orders[0].code == "status_unavailable"
     assert conn.execute("SELECT status FROM orders").fetchone()[0] == "WORKING"
+    assert broker.cancelled == []  # nothing known about it: never cancelled blind
 
 
 def test_position_divergence_is_reported_and_parked(tmp_path: Path) -> None:
@@ -160,3 +169,138 @@ def test_a_clean_account_reports_clean(tmp_path: Path) -> None:
     report = _run(broker, repo, attribution)
     assert report.is_clean and summary_lines(report)[-1] == "result: CLEAN"
     _ = (sqlite3, timedelta)
+
+
+# --- review follow-ups ------------------------------------------------------------- #
+
+
+def _bound(repo: OrderRepository, broker: FakeBroker, fill: Fill, cid: str = "c1") -> None:
+    """A row bound (e.g. by hand) to the broker order ``fill`` describes."""
+    repo._write_pending(_order(cid))
+    repo.record_placed(cid, fill.broker_order_id)
+    broker._fills[fill.broker_order_id] = fill
+
+
+def _working(broker_order_id: str, symbol: str = "AAPL", qty: int = 0) -> Fill:
+    return Fill("", broker_order_id, symbol, qty, Decimal("100"), Decimal("0"), NOW,
+                OrderStatus.WORKING)  # fmt: skip
+
+
+def test_reconciliation_needs_the_trading_lease_held(tmp_path: Path) -> None:
+    broker = _Cancellable()
+    repo, attribution, _ = _setup(tmp_path, broker)
+    with pytest.raises(RuntimeError, match="trading lease"):
+        reconcile_account(
+            broker=broker,
+            repo=repo,
+            attribution=attribution,
+            reconcile_order=in_memory_reconciler(broker.find_by_client_id),
+            poll_policy=PollPolicy(timeout_seconds=0),
+            lease=TradingLease(tmp_path / "s.sqlite"),  # not acquired
+        )
+
+
+@pytest.mark.parametrize(
+    ("fill", "problem"),
+    [
+        (_working("b-9", symbol="TSLA"), "symbol 'TSLA', ordered 'AAPL'"),  # someone else's
+        (_working("b-9", qty=25), "filled 25, ordered 10"),
+    ],
+    ids=["other-symbol", "over-filled"],
+)
+def test_a_bound_order_that_cannot_be_the_rows_is_left_untouched(
+    tmp_path: Path, fill: Fill, problem: str
+) -> None:
+    broker = _Cancellable()
+    repo, attribution, conn = _setup(tmp_path, broker)
+    _bound(repo, broker, fill)
+    report = _run(broker, repo, attribution)
+    (settlement,) = report.orders
+    assert settlement.code == "bound_order_mismatch" and problem in settlement.detail
+    assert broker.cancelled == []  # never polled, so never cancelled
+    assert conn.execute("SELECT status FROM orders").fetchone()[0] == "WORKING"
+    assert attribution.get_attributed("s1") == []
+
+
+def test_transient_failures_reading_a_bound_order_are_retried(tmp_path: Path) -> None:
+    class _Flaky(_Cancellable):
+        failures = 2
+
+        def get_order(self, broker_order_id: str) -> Fill:
+            if self.failures:
+                self.failures -= 1
+                raise TimeoutError("slow")
+            return super().get_order(broker_order_id)
+
+    broker = _Flaky()
+    repo, attribution, _ = _setup(tmp_path, broker)
+    place_idempotent(
+        broker, repo, _order("c1"), reconcile=in_memory_reconciler(broker.find_by_client_id)
+    )
+    broker.set_position(Position("AAPL", 10, Decimal("100"), Decimal("1000")))
+    assert _outcomes(_run(broker, repo, attribution)) == {"c1": Settlement.COMPLETED}
+    broker.failures = 3  # every read fails: unresolved, untouched
+    _bound(repo, broker, _working("b-9"), cid="c2")
+    report = _run(broker, repo, attribution)
+    assert report.orders[0].code == "status_unavailable" and broker.cancelled == []
+
+
+def test_a_fill_the_repository_refuses_leaves_the_order_unresolved(tmp_path: Path) -> None:
+    broker = _Cancellable()
+    repo, attribution, _ = _setup(tmp_path, broker)
+    place_idempotent(
+        broker, repo, _order("c1"), reconcile=in_memory_reconciler(broker.find_by_client_id)
+    )
+
+    def refuse(*args: object) -> bool:
+        raise ValueError("fill symbol 'TSLA' != order symbol 'AAPL'")
+
+    repo.complete = refuse  # type: ignore[method-assign]
+    (settlement,) = _run(broker, repo, attribution).orders
+    assert settlement.code == "fill_refused" and "TSLA" in settlement.detail
+    assert attribution.get_attributed("s1") == []
+
+
+def test_an_order_completed_meanwhile_is_reported_as_already_completed(tmp_path: Path) -> None:
+    broker = _Cancellable()
+    repo, attribution, _ = _setup(tmp_path, broker)
+    place_idempotent(
+        broker, repo, _order("c1"), reconcile=in_memory_reconciler(broker.find_by_client_id)
+    )
+    repo.complete = lambda *args: False  # type: ignore[method-assign]
+    (settlement,) = _run(broker, repo, attribution).orders
+    assert (settlement.outcome, settlement.detail) == (Settlement.COMPLETED, "already completed")
+
+
+def test_an_interrupted_send_is_re_anchored_then_adopted_after_the_window(tmp_path: Path) -> None:
+    # The daemon died mid-send, but the order landed. Schwab's reconciler answers NOT_SETTLED
+    # for the pending row (resolve re-anchors it), WINDOW_OPEN until the consistency window
+    # has passed, then FOUND — and the order is adopted, polled and completed.
+    broker = _Cancellable()
+    repo, attribution, _ = _setup(tmp_path, broker)
+    order = _order("c1")
+    repo._write_pending(order)
+    broker_order_id = broker.submit_order(order)
+    broker.set_position(Position("AAPL", 10, Decimal("100"), Decimal("1000")))
+    answers = iter(
+        [
+            ReconcileResult.inconclusive("inside the consistency window", "window_open"),
+            ReconcileResult.found(broker_order_id, "unique intent match"),
+        ]
+    )
+    seen: list[str] = []
+
+    def schwab_like(record: OrderRecord) -> ReconcileResult:
+        seen.append(record.status)
+        if record.status != "unknown":
+            return ReconcileResult.inconclusive("no settled send window yet", "not_settled")
+        return next(answers)
+
+    first = _run(broker, repo, attribution, schwab_like)
+    assert first.orders[0].code == "re_anchored" and first.retry_later
+    second = _run(broker, repo, attribution, schwab_like)
+    assert second.orders[0].code == "window_open" and second.retry_later
+    third = _run(broker, repo, attribution, schwab_like)
+    assert _outcomes(third) == {"c1": Settlement.COMPLETED} and third.is_clean
+    assert seen == ["pending", "unknown", "unknown"]
+    assert {p.symbol: p.quantity for p in attribution.get_attributed("s1")} == {"AAPL": 10}

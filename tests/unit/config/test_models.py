@@ -252,3 +252,6 @@ def test_execution_poll_timeout_is_bounded_and_reconcile_window_defaults() -> No
         ExecutionConfig(poll_timeout_seconds=601)  # the cycle lock must never wait unbounded
     with pytest.raises(ValueError):
         ExecutionConfig(reconcile_window_seconds=0)
+    assert ExecutionConfig(reconcile_window_seconds=3600).reconcile_window_seconds == 3600
+    with pytest.raises(ValueError):
+        ExecutionConfig(reconcile_window_seconds=3601)  # the startup gate waits it out once

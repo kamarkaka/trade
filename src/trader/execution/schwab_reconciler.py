@@ -208,6 +208,26 @@ class SchwabOrderReconciler:
                 )
         return ReconcileResult.found(only.order_id, "unique intent match in the found window")
 
+    def verify_binding(self, record: OrderRecord, broker_order_id: str) -> str | None:
+        """Why the broker's order ``broker_order_id`` cannot be ``record``'s order, or None
+        when it can — the check behind the operator's ``trader reconcile --adopt``. The order
+        must match the intent exactly (as for FOUND) and have been entered no earlier than
+        the write-ahead (less the clock-skew allowance) and no later than the order could
+        have landed (the end of its doubt window). Read-only."""
+        try:
+            status = self._client.get_order(self._account, broker_order_id)
+        except (SchwabError, httpx.HTTPError, OSError) as exc:  # e.g. a 404 for a typo
+            return f"the broker order could not be read ({type(exc).__name__})"
+        if status.order_id != broker_order_id:
+            return f"the broker answered for a different order ({status.order_id})"
+        if status.raw_status.upper() == "REPLACED":
+            return "it is a replaced original"
+        _, latest = self.doubt_window(record)
+        mismatches = _intent_mismatches(status, record, record.created_at - self._skew, latest)
+        if mismatches:
+            return "it differs from the order in: " + ", ".join(mismatches)
+        return None
+
 
 def _canon(symbol: str) -> str:
     """Comparable form of a ticker: trimmed, upper-case, share-class separator unified."""
@@ -219,22 +239,30 @@ def _entered_within(o: SchwabOrderStatus, lo: datetime, hi: datetime) -> bool:
     return o.entered_time is None or lo <= o.entered_time <= hi
 
 
+def _intent_mismatches(
+    o: SchwabOrderStatus, record: OrderRecord, lo: datetime, hi: datetime
+) -> list[str]:
+    """The fields in which ``o`` differs from the intent (or from the order shape we always
+    send), and its entry time when not inside [lo, hi]; empty for an exact match. A field the
+    broker left empty counts as different."""
+    checks = {
+        "symbol": _canon(o.symbol) == _canon(record.symbol),
+        "instruction": o.instruction == record.side.value,
+        "quantity": o.quantity == record.quantity and o.leg_quantity in (0, record.quantity),
+        "order type": o.order_type == record.order_type.value,
+        "limit price": record.order_type is not OrderType.LIMIT or o.price == record.limit_price,
+        "duration": o.duration == record.tif.value == _SENT_DURATION,
+        "session": o.session == _SENT_SESSION,
+        "strategy type": o.strategy_type == _SENT_STRATEGY,
+        "entry time": o.entered_time is not None and lo <= o.entered_time <= hi,
+    }
+    return [field for field, ok in checks.items() if not ok]
+
+
 def _exact_match(o: SchwabOrderStatus, record: OrderRecord, lo: datetime, hi: datetime) -> bool:
     """Every field known and equal to the intent (and to the order shape we always send),
-    entered inside the found window."""
-    return (
-        _canon(o.symbol) == _canon(record.symbol)
-        and o.instruction == record.side.value
-        and o.quantity == record.quantity
-        and o.leg_quantity in (0, record.quantity)
-        and o.order_type == record.order_type.value
-        and (record.order_type is not OrderType.LIMIT or o.price == record.limit_price)
-        and o.duration == record.tif.value == _SENT_DURATION
-        and o.session == _SENT_SESSION
-        and o.strategy_type == _SENT_STRATEGY
-        and o.entered_time is not None
-        and lo <= o.entered_time <= hi
-    )
+    entered inside [lo, hi]."""
+    return not _intent_mismatches(o, record, lo, hi)
 
 
 def _could_be(o: SchwabOrderStatus, record: OrderRecord) -> bool:

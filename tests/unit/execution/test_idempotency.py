@@ -2,6 +2,7 @@
 write-ahead, broker-id capture at submit, outcome classification (placed / not placed /
 unknown), and resolution that never re-sends — with compare-and-swap state transitions."""
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -11,7 +12,7 @@ import pytest
 
 from fakes import FakeBroker
 from trader.core import Fill, Order, OrderNotPlacedError
-from trader.core.enums import OrderType, Side
+from trader.core.enums import OrderStatus, OrderType, Side
 from trader.execution.idempotency import (
     NOT_PLACED,
     PENDING,
@@ -20,6 +21,7 @@ from trader.execution.idempotency import (
     OrderOutcomeUnknownError,
     OrderRecord,
     OrderRepository,
+    OverrideRefusedError,
     ReconcileOutcome,
     ReconcileResult,
     ResolveOutcome,
@@ -494,3 +496,118 @@ def test_a_raising_reconciler_is_logged_and_inconclusive(tmp_path: Path) -> None
     result = resolve(repo, _row(repo), reconcile=broken)
     assert result.outcome is ResolveOutcome.UNRESOLVED and "KeyError" in result.detail
     assert "reconciler raised" in buf.getvalue() and "Traceback" in buf.getvalue()
+
+
+# --- LR9: open orders and operator overrides ------------------------------------------ #
+
+
+def _completed(repo: OrderRepository, cid: str, broker_order_id: str) -> None:
+    repo._write_pending(_order(cid))
+    repo.record_placed(cid, broker_order_id)
+    fill = Fill(cid, broker_order_id, "AAPL", 10, Decimal("100"), Decimal("0"), NOW,
+                OrderStatus.FILLED)  # fmt: skip
+    assert repo.complete(_row(repo, cid), fill, lambda: None)
+
+
+def _unknown(repo: OrderRepository, cid: str) -> None:
+    repo._write_pending(_order(cid))
+    repo.mark_unknown_after_send(cid)
+
+
+def _overrides_audited(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        "SELECT payload FROM audit_log WHERE kind = 'operator_override' ORDER BY id"
+    ).fetchall()
+    return [(json.loads(p)["action"], json.loads(p)["cid"]) for (p,) in rows]
+
+
+def test_open_orders_are_the_unsettled_rows_in_write_order(tmp_path: Path) -> None:
+    clock = _Clock()
+    repo, _ = _repo(tmp_path, clock)
+    repo._write_pending(_order("pending"))
+    clock.advance(1)
+    _unknown(repo, "unknown")
+    clock.advance(1)
+    repo._write_pending(_order("working"))
+    repo.record_placed("working", "b-1")
+    clock.advance(1)
+    repo._write_pending(_order("gone"))
+    repo.mark_not_placed_after_send("gone")
+    clock.advance(1)
+    _completed(repo, "done", "b-2")
+    assert [r.client_order_id for r in repo.open_orders()] == ["pending", "unknown", "working"]
+
+
+def test_overrides_apply_together_with_an_audit_row_each(tmp_path: Path) -> None:
+    repo, conn = _repo(tmp_path)
+    _unknown(repo, "gone")
+    _unknown(repo, "found")
+    repo._write_pending(_order("wrong"))
+    repo.record_placed("wrong", "b-9")
+    repo.apply_overrides(
+        not_placed=[_row(repo, "gone")],
+        adopt=[(_row(repo, "found"), "b-7")],
+        unbind=[_row(repo, "wrong")],
+    )
+    assert (_row(repo, "gone").status, _row(repo, "gone").broker_order_id) == (NOT_PLACED, None)
+    assert (_row(repo, "found").status, _row(repo, "found").broker_order_id) == (PLACED, "b-7")
+    assert (_row(repo, "wrong").status, _row(repo, "wrong").broker_order_id) == (UNKNOWN, None)
+    assert _overrides_audited(conn) == [
+        ("not_placed", "gone"),
+        ("adopt", "found"),
+        ("unbind", "wrong"),
+    ]
+
+
+@pytest.mark.parametrize("action", ["not_placed", "adopt"])
+def test_mark_and_adopt_refuse_rows_that_are_bound_or_settled(tmp_path: Path, action: str) -> None:
+    repo, conn = _repo(tmp_path)
+    repo._write_pending(_order("working"))
+    repo.record_placed("working", "b-1")
+    _completed(repo, "done", "b-2")
+    repo._write_pending(_order("gone"))
+    repo.mark_not_placed_after_send("gone")
+    for cid in ("working", "done", "gone"):
+        record = _row(repo, cid)
+        with pytest.raises(OverrideRefusedError, match="not eligible"):
+            if action == "adopt":
+                repo.apply_overrides(adopt=[(record, "b-new")])
+            else:
+                repo.apply_overrides(not_placed=[record])
+        assert _row(repo, cid) == record  # untouched
+    assert _overrides_audited(conn) == []
+
+
+def test_unbind_refuses_rows_without_an_id_or_already_completed(tmp_path: Path) -> None:
+    repo, _ = _repo(tmp_path)
+    _unknown(repo, "unknown")
+    _completed(repo, "done", "b-2")
+    for cid in ("unknown", "done"):
+        record = _row(repo, cid)
+        with pytest.raises(OverrideRefusedError, match="not eligible"):
+            repo.apply_overrides(unbind=[record])
+        assert _row(repo, cid) == record
+
+
+def test_an_override_refuses_a_row_changed_since_it_was_read(tmp_path: Path) -> None:
+    repo, _ = _repo(tmp_path)
+    _unknown(repo, "c1")
+    stale = _row(repo, "c1")
+    repo.mark_unknown_after_send("c1")  # the row moved on after the operator's read
+    with pytest.raises(OverrideRefusedError, match="changed since it was read"):
+        repo.apply_overrides(not_placed=[stale])
+    assert _row(repo, "c1").status == UNKNOWN
+
+
+def test_overrides_are_all_or_nothing(tmp_path: Path) -> None:
+    # The adoption fails (its broker id belongs to another order), so the valid
+    # mark-not-placed before it must not be applied either.
+    repo, conn = _repo(tmp_path)
+    _unknown(repo, "gone")
+    _unknown(repo, "found")
+    repo._write_pending(_order("other"))
+    repo.record_placed("other", "b-1")
+    with pytest.raises(OverrideRefusedError, match="b-1 is already bound"):
+        repo.apply_overrides(not_placed=[_row(repo, "gone")], adopt=[(_row(repo, "found"), "b-1")])
+    assert _row(repo, "gone").status == UNKNOWN and _row(repo, "found").broker_order_id is None
+    assert _overrides_audited(conn) == [] and not conn.in_transaction

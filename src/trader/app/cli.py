@@ -301,7 +301,7 @@ def run(
                 account_hash,
                 clock=clock,
                 bound_broker_ids=repo.bound_broker_ids,
-                bound_broker_ids_created_between=repo.bound_broker_ids_created_between,
+                bound_orders_created_between=repo.bound_orders_created_between,
                 awaiting_resolution=repo.awaiting_resolution,
                 consistency_window=timedelta(seconds=cfg.execution.reconcile_window_seconds),
             )

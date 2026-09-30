@@ -221,3 +221,83 @@ def test_an_already_engaged_state_does_not_re_trip(tmp_path: Path) -> None:
     state, switch, alerter = _tripping(tmp_path, loss="2500", killed=True)
     assert state.kill_switch_engaged is True
     assert not switch.is_engaged() and alerter.events == []  # no duplicate engage/alert
+
+
+# --- once per session (LR7 review) --------------------------------------------------- #
+
+
+def test_a_daily_loss_trip_happens_once_per_session(tmp_path: Path) -> None:
+    alerter = _RecAlerter()
+    switch, _ = _switch(tmp_path, alerter)
+    cfg = RiskConfig(daily_loss_limit_pct=2.0)
+    assert switch.maybe_trip_on_daily_loss(_day(loss="2500"), cfg) is True
+    switch.disengage()  # the operator reviews and releases it so exits can go through
+    assert switch.maybe_trip_on_daily_loss(_day(loss="2600"), cfg) is False  # release sticks
+    assert not switch.is_engaged() and len(alerter.events) == 1
+    next_session = DayState(
+        date(2026, 6, 30), Decimal("100000"), Decimal("0"), Decimal("0"), 0, Decimal("2500")
+    )
+    assert switch.maybe_trip_on_daily_loss(next_session, cfg) is True  # a new session re-arms
+    assert switch.is_engaged() and len(alerter.events) == 2
+
+
+def test_a_manual_engage_during_a_breach_still_counts_as_this_sessions_trip(
+    tmp_path: Path,
+) -> None:
+    switch, _ = _switch(tmp_path)
+    cfg = RiskConfig(daily_loss_limit_pct=2.0)
+    switch.engage("operator", source="manual")
+    assert switch.maybe_trip_on_daily_loss(_day(loss="2500"), cfg) is False  # already engaged
+    switch.disengage()
+    assert switch.maybe_trip_on_daily_loss(_day(loss="2500"), cfg) is False  # release sticks
+
+
+def test_the_day_state_says_engaged_when_someone_else_engaged_it_meanwhile(
+    tmp_path: Path,
+) -> None:
+    from trader.risk.kill_switch import tripping_day_state
+
+    switch, _ = _switch(tmp_path)
+    switch.engage("operator", source="manual")  # after the caller read the switch as off
+    source = tripping_day_state(
+        lambda account, now, engaged: _day(loss="2500", killed=engaged),
+        switch,
+        RiskConfig(daily_loss_limit_pct=2),
+    )
+    assert source(ACCOUNT, NOW, False).kill_switch_engaged is True
+
+
+def test_a_released_switch_is_not_reported_engaged_on_a_continuing_breach(
+    tmp_path: Path,
+) -> None:
+    from trader.risk.kill_switch import tripping_day_state
+
+    switch, _ = _switch(tmp_path)
+    source = tripping_day_state(
+        lambda account, now, engaged: _day(loss="2500", killed=engaged),
+        switch,
+        RiskConfig(daily_loss_limit_pct=2),
+    )
+    assert source(ACCOUNT, NOW, False).kill_switch_engaged is True  # trips
+    switch.disengage()
+    assert source(ACCOUNT, NOW, False).kill_switch_engaged is False  # exits may go through
+
+
+def test_migration_007_adds_the_trip_session_and_keeps_the_switch(tmp_path: Path) -> None:
+    import shutil
+
+    from trader.state.migrate import MIGRATIONS_DIR
+
+    before = tmp_path / "before_007"
+    before.mkdir()
+    for path in sorted(Path(MIGRATIONS_DIR).glob("*.sql")):
+        if path.name < "007":
+            shutil.copy(path, before / path.name)
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn, before)
+    KillSwitch(conn, now=lambda: NOW).engage("pre-upgrade", source="manual")
+    run_migrations(conn)
+    state = KillSwitch(conn, now=lambda: NOW).state()
+    assert state.engaged and state.reason == "pre-upgrade"
+    row = conn.execute("SELECT loss_trip_session FROM kill_switch WHERE id = 1").fetchone()
+    assert row[0] is None

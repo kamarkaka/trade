@@ -149,6 +149,12 @@ class SimBroker:
         except KeyError as exc:
             raise KeyError(f"unknown broker_order_id {broker_order_id!r}") from exc
 
+    def find_by_client_id(self, client_order_id: str) -> Fill | None:
+        """The order placed under ``client_order_id`` in this process, if any (the paper
+        reconciler; authoritative for this in-memory broker)."""
+        broker_order_id = self._by_client.get(client_order_id)
+        return self._fills.get(broker_order_id) if broker_order_id is not None else None
+
     def cancel_order(self, broker_order_id: str) -> None:
         if broker_order_id not in self._fills:
             raise KeyError(f"unknown broker_order_id {broker_order_id!r}")

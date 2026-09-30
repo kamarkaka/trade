@@ -210,6 +210,12 @@ class SchedulerDaemon:
             )
             return None
 
+        if result.not_placed:
+            symbols = ", ".join(o.symbol for o in result.not_placed)
+            self._emit(
+                AlertKind.BROKER_ERROR,
+                f"{binding.strategy_id}/{slot.slot_id}: broker refused order(s) for {symbols}",
+            )
         if result.errors:
             self._ledger.mark_failed(
                 today, binding.strategy_id, slot.slot_id, "; ".join(result.errors)

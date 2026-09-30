@@ -88,6 +88,7 @@ class ReconcileResult:
     outcome: ReconcileOutcome
     broker_order_id: str | None = None
     detail: str = ""  # human-readable; must never contain account identifiers
+    code: str = ""  # machine-readable reason (e.g. the reconciler's "window_open" = wait)
 
     def __post_init__(self) -> None:
         has_id = bool((self.broker_order_id or "").strip())
@@ -95,16 +96,16 @@ class ReconcileResult:
             raise ValueError("broker_order_id is required for FOUND and forbidden otherwise")
 
     @classmethod
-    def found(cls, broker_order_id: str, detail: str = "") -> ReconcileResult:
-        return cls(ReconcileOutcome.FOUND, broker_order_id, detail)
+    def found(cls, broker_order_id: str, detail: str = "", code: str = "") -> ReconcileResult:
+        return cls(ReconcileOutcome.FOUND, broker_order_id, detail, code)
 
     @classmethod
-    def absent(cls, detail: str = "") -> ReconcileResult:
-        return cls(ReconcileOutcome.ABSENT, None, detail)
+    def absent(cls, detail: str = "", code: str = "") -> ReconcileResult:
+        return cls(ReconcileOutcome.ABSENT, None, detail, code)
 
     @classmethod
-    def inconclusive(cls, detail: str = "") -> ReconcileResult:
-        return cls(ReconcileOutcome.INCONCLUSIVE, None, detail)
+    def inconclusive(cls, detail: str = "", code: str = "") -> ReconcileResult:
+        return cls(ReconcileOutcome.INCONCLUSIVE, None, detail, code)
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,16 @@ class OrderRepository:
         """Every broker order id already bound to a local order."""
         rows = self._conn.execute(
             "SELECT broker_order_id FROM orders WHERE broker_order_id IS NOT NULL"
+        ).fetchall()
+        return {str(r[0]) for r in rows}
+
+    def bound_broker_ids_created_between(self, start: datetime, end: datetime) -> set[str]:
+        """Broker ids of local orders written within [start, end] — the broker's listing of
+        that span must include them (a coverage self-check for reconciliation)."""
+        rows = self._conn.execute(
+            "SELECT broker_order_id FROM orders WHERE broker_order_id IS NOT NULL "
+            "AND julianday(created_at) >= julianday(?) AND julianday(created_at) <= julianday(?)",
+            (_iso(start), _iso(end)),
         ).fetchall()
         return {str(r[0]) for r in rows}
 
@@ -330,7 +341,11 @@ def _safe_reconcile(reconcile: Reconciler, record: OrderRecord) -> ReconcileResu
     try:
         return reconcile(record)
     except Exception as exc:
-        return ReconcileResult.inconclusive(f"reconciler raised {type(exc).__name__}")
+        # Logged with its traceback: a local bug must not hide behind "inconclusive" forever.
+        _log.error(
+            "reconciler raised", cid=record.client_order_id, error=type(exc).__name__, exc_info=True
+        )
+        return ReconcileResult.inconclusive(f"reconciler raised {type(exc).__name__}", "error")
 
 
 def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler) -> ResolveResult:

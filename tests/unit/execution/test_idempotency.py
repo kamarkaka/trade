@@ -457,3 +457,21 @@ def test_repository_reconciliation_queries(tmp_path: Path) -> None:
         place_idempotent(broker, repo, _order("c-rejected"), reconcile=_perfect(broker))
     assert repo.bound_broker_ids() == {"b-1"}
     assert [r.client_order_id for r in repo.awaiting_resolution()] == ["c-pending", "c-unknown"]
+
+
+def test_reconciliation_coverage_query_and_awaiting_excludes_bound_rows(tmp_path: Path) -> None:
+    clock = _Clock()
+    repo, conn = _repo(tmp_path, clock)
+    broker = FakeBroker()
+    place_idempotent(broker, repo, _order("c-early"), reconcile=_perfect(broker))  # b-1 @ NOW
+    clock.advance(3600)
+    place_idempotent(broker, repo, _order("c-late"), reconcile=_perfect(broker))  # b-2 @ +1h
+    window_lo, window_hi = NOW - timedelta(minutes=5), NOW + timedelta(minutes=5)
+    assert repo.bound_broker_ids_created_between(window_lo, window_hi) == {"b-1"}
+    # A row that somehow carries a broker id is settled, never "awaiting resolution".
+    repo._write_pending(_order("c-odd"))
+    conn.execute(
+        "UPDATE orders SET status = 'unknown', broker_order_id = 'b-9' "
+        "WHERE client_order_id = 'c-odd'"
+    )
+    assert [r.client_order_id for r in repo.awaiting_resolution()] == []

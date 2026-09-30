@@ -379,3 +379,13 @@ def test_get_account_fields_positions(tmp_path: Path) -> None:
         snap = _client(tmp_path, c).get_account(ACCT)
     assert route.calls.last.request.url.params["fields"] == "positions"
     assert len(snap.positions) == 2
+
+
+def test_leg_quantity_is_parsed_and_lenient_when_polling() -> None:
+    base = {"orderId": "1", "status": "WORKING", "quantity": 5}
+    legs = [{"instruction": "BUY", "quantity": 10, "instrument": {"symbol": "X"}}]
+    assert parse_order_status({**base, "orderLegCollection": legs}).leg_quantity == 10
+    bad = [{"instruction": "BUY", "quantity": 0.5, "instrument": {"symbol": "X"}}]
+    assert parse_order_status({**base, "orderLegCollection": bad}).leg_quantity == 0
+    with pytest.raises(SchwabBadResponseError, match="leg quantity"):
+        parse_order_status({**base, "orderLegCollection": bad}, strict_intent=True)

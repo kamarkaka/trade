@@ -131,6 +131,36 @@ def test_429_honors_retry_after(tmp_path: Path) -> None:
 
 
 @respx.mock
+def test_retry_after_is_capped(tmp_path: Path) -> None:
+    # A huge (or hostile) Retry-After must not stall the daemon and its cycle lock for hours.
+    respx.get(DATA_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "86400"}),
+            httpx.Response(200, json={"ok": 1}),
+        ]
+    )
+    with httpx.Client() as client:
+        http, _store, sleeps, _ = _build(tmp_path, client)
+        http.request("GET", DATA_URL)
+    assert sleeps == [60.0]  # SchwabClientConfig.max_retry_after_seconds default
+
+
+@pytest.mark.parametrize("header", ["nan", "inf", "-5"])
+@respx.mock
+def test_unusable_retry_after_falls_back_to_backoff(tmp_path: Path, header: str) -> None:
+    respx.get(DATA_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": header}),
+            httpx.Response(200, json={"ok": 1}),
+        ]
+    )
+    with httpx.Client() as client:
+        http, _store, sleeps, _ = _build(tmp_path, client)
+        http.request("GET", DATA_URL)
+    assert len(sleeps) == 1 and 0 < sleeps[0] <= 30.0  # finite exponential backoff
+
+
+@respx.mock
 def test_5xx_exhausts_retries(tmp_path: Path) -> None:
     data = respx.get(DATA_URL).mock(return_value=httpx.Response(503))
     with httpx.Client() as client:

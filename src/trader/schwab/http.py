@@ -15,6 +15,7 @@ Token values never reach logs (scrubbed centrally + the bearer is only in header
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping
 from decimal import Decimal
 from typing import Any
@@ -58,9 +59,12 @@ def _parse_retry_after(resp: httpx.Response) -> float | None:
     if raw is None:
         return None
     try:
-        return float(raw)
+        seconds = float(raw)
     except ValueError:
         return None  # HTTP-date form not modeled; fall back to exponential backoff
+    # "nan"/"inf"/negative parse as floats but are not usable waits (sleep would raise or
+    # never return): fall back to exponential backoff.
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 class SchwabHttp:

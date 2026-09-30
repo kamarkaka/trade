@@ -59,6 +59,12 @@ PENDING = "pending"  # write-ahead committed; the one send is in flight or died 
 UNKNOWN = "unknown"  # the send returned without a usable answer; stamped after the send
 NOT_PLACED = "not_placed"  # terminal: definitely not placed
 PLACED = OrderStatus.WORKING.value
+# Broker statuses after which nothing more can fill; set only by ``OrderRepository.complete``
+# (together with the fill row and attribution), so a terminal row is always fully recorded.
+TERMINAL = frozenset(
+    s.value
+    for s in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
+)
 
 _log = get_logger("execution.idempotency")
 
@@ -194,6 +200,17 @@ class OrderRepository:
     @property
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._conn
+
+    def client_id_for(self, broker_order_id: str) -> str | None:
+        """The local client_order_id bound to a broker order id (durable, survives restarts)."""
+        row = self._conn.execute(
+            "SELECT client_order_id FROM orders WHERE broker_order_id = ?", (broker_order_id,)
+        ).fetchone()
+        return str(row[0]) if row is not None else None
 
     def bound_broker_ids(self) -> set[str]:
         """Every broker order id already bound to a local order."""
@@ -336,6 +353,59 @@ class OrderRepository:
             (to_status, _iso(self._now()), record.client_order_id, record.version),
         )
         return cur.rowcount == 1
+
+    # -- completion ---------------------------------------------------------------- #
+
+    def complete(self, record: OrderRecord, fill: Fill, apply: Callable[[], None]) -> bool:
+        """Atomically record an order's terminal status, its fill row (when anything filled)
+        and ``apply`` (the attribution update, on this same connection) — exactly once.
+        Returns False if the order was already completed. Any failure rolls everything back,
+        so a crash can neither lose nor double-attribute a fill."""
+        if fill.status.value not in TERMINAL:
+            raise ValueError(f"cannot complete a {fill.status.value} order")
+        self._conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            row = self._conn.execute(
+                "SELECT status, broker_order_id FROM orders WHERE client_order_id = ?",
+                (record.client_order_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"order {record.client_order_id} has no row")
+            if row[0] in TERMINAL:
+                return False  # already completed (idempotent)
+            if row[1] != fill.broker_order_id:
+                raise ValueError(
+                    f"fill for {fill.broker_order_id} does not belong to order "
+                    f"{record.client_order_id} ({row[1]})"
+                )
+            if fill.quantity > 0:
+                self._conn.execute(
+                    "INSERT INTO fills (client_order_id, broker_order_id, symbol, quantity, "
+                    "price, fees, ts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        record.client_order_id,
+                        fill.broker_order_id,
+                        fill.symbol,
+                        fill.quantity,
+                        format(fill.price, "f"),
+                        format(fill.fees, "f"),
+                        _iso(fill.ts),
+                        fill.status.value,
+                    ),
+                )
+            self._conn.execute(
+                "UPDATE orders SET status = ?, updated_at = ?, version = version + 1 "
+                "WHERE client_order_id = ?",
+                (fill.status.value, _iso(self._now()), record.client_order_id),
+            )
+            apply()
+            self._conn.execute("COMMIT")
+            committed = True
+            return True
+        finally:
+            if not committed and self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
 
 
 def _safe_reconcile(reconcile: Reconciler, record: OrderRecord) -> ReconcileResult:
@@ -499,6 +569,7 @@ __all__ = [
     "NOT_PLACED",
     "PENDING",
     "PLACED",
+    "TERMINAL",
     "UNKNOWN",
     "OrderOutcomeUnknownError",
     "OrderRecord",

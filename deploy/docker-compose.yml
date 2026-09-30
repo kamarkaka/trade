@@ -2,6 +2,10 @@
 #   cd deploy && docker compose up -d
 # Named volumes make /state (SQLite + tokens) and /data (Parquet cache) survive recreate.
 # Real secrets live in ./secrets/.env (gitignored; copy from secrets/.env.example).
+# The mounted config defaults to ../config/default.yaml (paper). To run another config — e.g.
+# a live copy of config/live.example.yaml (docs/runbooks/go-live.md) — set TRADER_CONFIG_FILE
+# in the SHELL (compose interpolation does not read env_file):
+#   TRADER_CONFIG_FILE=../config/live.yaml docker compose up -d
 #
 # Network topology (§16.6): the trader is on the PRIVATE `internal` network only (no inbound).
 # The web UI is on `internal` (to read the shared state volume's DB) AND `edge` (to receive
@@ -22,7 +26,8 @@ services:
     networks:
       - internal
     volumes:
-      - ../config/default.yaml:/config/trader.yaml:ro  # config is read-only; never written
+      # config is read-only; never written (TRADER_CONFIG_FILE selects which file, above)
+      - ${TRADER_CONFIG_FILE:-../config/default.yaml}:/config/trader.yaml:ro
       - trader_state:/state  # SQLite state, token store, fired-slot ledger — durable
       - trader_data:/data  # Parquet bar cache — durable
     healthcheck:
@@ -66,7 +71,7 @@ services:
       - internal  # read the shared state volume's DB
       - edge      # receive requests from the proxy
     volumes:
-      - ../config/default.yaml:/config/trader.yaml:ro
+      - ${TRADER_CONFIG_FILE:-../config/default.yaml}:/config/trader.yaml:ro  # same as trader
       # State volume mounted RW so SQLite can touch -wal/-shm sidecars, BUT the web's
       # connection is mode=ro + PRAGMA query_only=ON (M7.1) — it can read, never write.
       - trader_state:/state

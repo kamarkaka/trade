@@ -180,6 +180,7 @@ class SchwabBroker:
             buying_power=snap.buying_power,
             equity=snap.equity,
             start_of_day_equity=snap.start_of_day_equity,
+            round_trips=snap.round_trips,
         )
 
 

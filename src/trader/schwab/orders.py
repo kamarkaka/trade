@@ -329,6 +329,7 @@ class SchwabAccountSnapshot:
     equity: Decimal
     positions: tuple[SchwabPositionRow, ...]
     start_of_day_equity: Decimal | None = None  # initialBalances.liquidationValue [VERIFY]
+    round_trips: int | None = None  # securitiesAccount.roundTrips: PDT day-trades [VERIFY]
 
 
 def parse_account(data: Any) -> SchwabAccountSnapshot:
@@ -359,6 +360,12 @@ def parse_account(data: Any) -> SchwabAccountSnapshot:
         positions=tuple(rows),
         start_of_day_equity=(
             _dec(sod, "initialBalances.liquidationValue") if sod is not None else None
+        ),
+        # [VERIFY: roundTrips is the day-trade count over the rolling PDT window]
+        round_trips=(
+            _int(account["roundTrips"], "roundTrips")
+            if account.get("roundTrips") is not None
+            else None
         ),
     )
 

@@ -22,9 +22,11 @@ reading is refused (fail closed: the cycle errors and alerts, and no order is se
 than recorded or compared — it would otherwise disable the loss rail for the day or trip it
 spuriously. A non-positive broker start-of-day figure is ignored (the capture is used).
 
-It also supplies the pattern-day-trader inputs: the executions (durable fills joined with
-their orders' side) over the rolling window of ``pdt_window_days`` exchange sessions ending
-today, whose first session comes from the injected exchange calendar.
+It also supplies the pattern-day-trader inputs over the rolling window of ``pdt_window_days``
+exchange sessions ending today (the first session comes from the injected exchange calendar):
+every order that may have executed — all but the definitely-not-placed and the terminal ones
+that filled nothing, so an order of unknown or unresolved fate counts — as (symbol, side,
+the session it was sent in), plus the broker's own day-trade count when it reports one.
 
 Every read refreshes the ``daily_counters`` row so the read-only web UI shows current values.
 """
@@ -40,9 +42,10 @@ from zoneinfo import ZoneInfo
 from trader.core import Account, DayState
 from trader.core.enums import Side
 
-# execution.idempotency.NOT_PLACED (kept local so state/ doesn't import execution/; a test
-# pins the two together).
+# execution.idempotency.NOT_PLACED / TERMINAL (kept local so state/ doesn't import
+# execution/; a test pins them together).
 _NOT_PLACED = "not_placed"
+_TERMINAL = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED"})
 
 
 def _utcnow() -> datetime:
@@ -105,6 +108,7 @@ class DailyCounters:
             kill_switch_engaged=kill_switch_engaged,
             executions=executions,
             pdt_window_start=window_start,
+            broker_day_trades=account.round_trips,
         )
 
     def pdt_window_start(self, session: date) -> date | None:
@@ -117,19 +121,24 @@ class DailyCounters:
             return session
         return recent[-self._pdt_window_days] if len(recent) >= self._pdt_window_days else recent[0]
 
-    def executions_since(self, window_start: date) -> tuple[tuple[str, Side, datetime], ...]:
-        """(symbol, side, time) of every order that filled anything since the window start —
-        durable fills (one row per completed order) joined with their order's side."""
+    def executions_since(self, window_start: date) -> tuple[tuple[str, Side, date], ...]:
+        """(symbol, side, session) of every order sent since the window start that may have
+        executed: all but the definitely-not-placed and the terminal ones with no fill row
+        (nothing filled). Bucketed by the session the order was sent in — a DAY order
+        executes in it — not by when its fill was recorded."""
         start = datetime.combine(window_start, time(0), tzinfo=self._tz)
+        terminal = sorted(_TERMINAL)
         rows = self._conn.execute(
-            "SELECT f.symbol, o.side, f.ts FROM fills f "
-            "JOIN orders o ON o.client_order_id = f.client_order_id "
-            "WHERE f.quantity > 0 AND julianday(f.ts) >= julianday(?) ORDER BY f.id",
-            (start.isoformat(),),
+            "SELECT o.symbol, o.side, o.created_at FROM orders o "
+            "WHERE julianday(o.created_at) >= julianday(?) AND o.status != ? "
+            f"AND (o.status NOT IN ({', '.join('?' * len(terminal))}) OR EXISTS ("
+            "SELECT 1 FROM fills f WHERE f.client_order_id = o.client_order_id "
+            "AND f.quantity > 0)) ORDER BY julianday(o.created_at)",
+            (start.isoformat(), _NOT_PLACED, *terminal),
         ).fetchall()
         return tuple(
-            (str(sym), Side(side), datetime.fromisoformat(ts).astimezone(UTC))
-            for sym, side, ts in rows
+            (str(sym), Side(side), self.session_of(datetime.fromisoformat(created)))
+            for sym, side, created in rows
         )
 
     def trades_on(self, session: date) -> int:

@@ -214,21 +214,26 @@ def max_trades_per_day(order: Order, ctx: RuleContext) -> RuleResult:
 
 
 def pattern_day_trader(order: Order, ctx: RuleContext) -> RuleResult:
-    """Block the order that would be one day-trade too many under the equity threshold
-    (``risk.pdt``). Evaluated only when the day state carries the trade history (the daemon
-    supplies it; backtests don't). A regulatory limit: exits are not exempt."""
+    """Block the order that would be one day-trade too many under the equity threshold, and at
+    the limit any new entry (``risk.pdt``). Evaluated only when the day state carries the
+    trade history (the daemon supplies it; backtests don't). A regulatory limit: exits that
+    complete a day-trade are not exempt."""
     state = ctx.day_state
     if state.pdt_window_start is None:
         return RuleResult(ok=True)
     from trader.risk.pdt import PDTRule, TradeEvent  # local: pdt imports this module
 
-    events = [TradeEvent(symbol, side, ts) for symbol, side, ts in state.executions]
+    events = [TradeEvent(symbol, side, session) for symbol, side, session in state.executions]
     return PDTRule(ctx.config).check(
         order,
         events=events,
-        equity=ctx.account.equity,
-        asof=ctx.now,
+        # FINRA measures the prior close: the lower of start-of-day and current equity, so an
+        # intraday gain never lifts the account over the threshold.
+        equity=min(state.start_of_day_equity, ctx.account.equity),
+        today=state.trading_date,
         window_start=state.pdt_window_start,
+        opens_position=not _reduces_or_holds_exposure(order, ctx),
+        broker_day_trades=state.broker_day_trades,
     )
 
 

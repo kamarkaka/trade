@@ -150,6 +150,8 @@ class Account:
     # The broker's own start-of-session equity, when it reports one (Schwab). None => the
     # daily counters capture it at the session's first cycle instead.
     start_of_day_equity: Decimal | None = None
+    # The broker's day-trade (round-trip) count for the PDT window, when it reports one.
+    round_trips: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cash", _require_decimal(self.cash, "cash"))
@@ -163,6 +165,12 @@ class Account:
                 "start_of_day_equity",
                 _require_decimal(self.start_of_day_equity, "start_of_day_equity"),
             )
+        if self.round_trips is not None and (
+            not isinstance(self.round_trips, int)
+            or isinstance(self.round_trips, bool)
+            or self.round_trips < 0
+        ):
+            raise ValueError("round_trips must be a non-negative int or None")
 
 
 # --------------------------------------------------------------------------- #
@@ -381,11 +389,13 @@ class DayState:
     trades_today: int
     loss_today: Decimal
     kill_switch_engaged: bool = False
-    # Pattern-day-trader inputs (design §10): executed (symbol, side, time) over the rolling
-    # window starting at ``pdt_window_start`` (an exchange session date). None => not
-    # supplied (backtests) and the PDT rule is not evaluated.
-    executions: tuple[tuple[str, Side, datetime], ...] = ()
+    # Pattern-day-trader inputs (design §10): (symbol, side, exchange session) of every order
+    # that may have executed in the rolling window starting at ``pdt_window_start`` (a session
+    # date). None => not supplied (backtests) and the PDT rule is not evaluated.
+    executions: tuple[tuple[str, Side, date], ...] = ()
     pdt_window_start: date | None = None
+    # The broker's own day-trade count for the window, when it reports one (a floor).
+    broker_day_trades: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.trading_date, date) or isinstance(self.trading_date, datetime):
@@ -407,19 +417,27 @@ class DayState:
         object.__setattr__(self, "loss_today", _require_decimal(self.loss_today, "loss_today"))
         if not isinstance(self.kill_switch_engaged, bool):
             raise TypeError("kill_switch_engaged must be a bool")
-        if self.pdt_window_start is not None and (
-            not isinstance(self.pdt_window_start, date)
-            or isinstance(self.pdt_window_start, datetime)
-        ):
-            raise TypeError("pdt_window_start must be a datetime.date or None")
+        if self.pdt_window_start is not None:
+            if not isinstance(self.pdt_window_start, date) or isinstance(
+                self.pdt_window_start, datetime
+            ):
+                raise TypeError("pdt_window_start must be a datetime.date or None")
+            if self.pdt_window_start > self.trading_date:
+                raise ValueError("pdt_window_start must not be after trading_date")
+        for _sym, _side, session in self.executions:
+            if not isinstance(session, date) or isinstance(session, datetime):
+                raise TypeError("an execution's session must be a datetime.date")
         object.__setattr__(
             self,
             "executions",
-            tuple(
-                (sym, Side(side), _require_utc(ts, "execution ts"))
-                for sym, side, ts in self.executions
-            ),
+            tuple((sym, Side(side), session) for sym, side, session in self.executions),
         )
+        if self.broker_day_trades is not None and (
+            not isinstance(self.broker_day_trades, int)
+            or isinstance(self.broker_day_trades, bool)
+            or self.broker_day_trades < 0
+        ):
+            raise ValueError("broker_day_trades must be a non-negative int or None")
 
 
 __all__ = [

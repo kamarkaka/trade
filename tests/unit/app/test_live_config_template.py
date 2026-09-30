@@ -48,3 +48,10 @@ def test_template_trades_one_long_only_canary_inside_its_allowlist() -> None:
     assert all(len(b.slots) == 1 for b in enabled)  # one slot per session: no day-trades
     universe = {s for b in enabled for s in b.universe}
     assert universe and universe <= set(cfg.risk.allowlist)
+
+
+def test_live_state_never_shares_the_paper_database() -> None:
+    live = load_config(TEMPLATE, environ={})
+    paper = load_config(TEMPLATE.parent / "default.yaml", environ={})
+    assert live.observability.db_path != paper.observability.db_path
+    assert live.observability.db_path.startswith("/state/")  # on the durable volume

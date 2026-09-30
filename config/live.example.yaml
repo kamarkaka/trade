@@ -66,5 +66,8 @@ alerting:
 
 observability:
   log_format: json
-  db_path: /state/trader.sqlite
+  # Live state gets its OWN database: paper history (orders, attribution, fired slots,
+  # daily counters) must never mix into live reconciliation or risk counters. The Schwab
+  # token store (next to it, /state/schwab_token.sqlite) and the bar cache are shared.
+  db_path: /state/live.sqlite
   data_cache: /data/

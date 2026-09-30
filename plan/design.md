@@ -162,7 +162,8 @@ docker engine ── keeps container alive (restart: unless-stopped) ──► d
    │        │         ── violation ─► REJECT (logged with full context)
    │        ├─ persist Order as 'pending' (write-ahead, tagged strategy_id) BEFORE network call
    │        ├─ Broker.submit_order(order)  ─► 201 + Location header order id
-   │        ├─ poll Broker.get_order(id) until FILLED/PARTIAL/REJECTED (bounded)
+   │        ├─ poll Broker.get_order(id) until terminal (FILLED/CANCELED/REJECTED/EXPIRED;
+   │        │   PARTIAL keeps polling), bounded; at the deadline cancel the remainder
    │        └─ persist fills (attributed to strategy_id), update positions, P&L, audit row
    │
    └─► Slot ledger: UPDATE status='done'; record realized drift + seed; emit metrics; RELEASE LOCK
@@ -513,7 +514,7 @@ Schwab provides **no developer sandbox / paper-trading API** — every authentic
 
 ### 8.6 Idempotency, rate limits, retries
 
-- **Idempotency:** generate `client_order_id` and persist the order as `pending` **before** the network call (write-ahead). On timeout/unknown response, **reconcile first** (query order status) before any re-send; reuse the same id. **[VERIFY whether Schwab accepts/echoes a client-supplied order id; if not, dedupe by capturing the `Location` order id at submit and querying status.]** This is the highest-severity correctness concern (a naive retry can double a real position).
+- **Idempotency:** generate `client_order_id` and persist the order as `pending` **before** the network call (write-ahead). Each `client_order_id` is sent **at most once, ever**; the `Location` order id is recorded at submit, before any poll. A definite rejection is terminal; any other failure leaves the outcome **unknown** and is **never re-sent** — reconciliation settles it (Schwab does not echo a client order id [VERIFY], so it matches the listed orders on intent and entry time) or an operator does. A retry of an intent uses a new id. This is the highest-severity correctness concern (a naive retry can double a real position). Implemented in `execution/idempotency.py` and `execution/schwab_reconciler.py`.
 - **Rate limits:** plan around ~120 req/min per app (returns 429 over) — **[VERIFY; treat as a planning ceiling, not a guarantee].** Implement a centralized token-bucket limiter + exponential backoff with jitter on 429/5xx; prefer streaming over polling.
 - **First-party client (no third-party broker SDK):** we own all the client code, so a Schwab API change is something we track and fix ourselves rather than waiting on an unofficial library; the whole client sits behind our `Broker` interface so changes stay contained. Security rationale & parity approach in §8.7.
 
@@ -592,7 +593,7 @@ The risk gate is a **single, non-bypassable, fail-closed** function: `Order in �
 **Default-safe posture**
 
 - **Default mode = `paper`/dry-run.** Going live requires **two** signals: `mode: live` in config **plus** an env var / CLI confirmation. Live state is logged and alerted at startup so it is never silent.
-- **Kill switch:** persisted flag (survives restarts), checked at the start of every cycle and immediately before every submit; manual CLI to flip; auto-trips on daily-loss breach, repeated broker errors, stale-data, or reconciliation mismatch. On trip: halt new orders + alert. **Auto-flatten is OFF by default** (flattening in disorderly markets is itself risky); it's an explicit opt-in.
+- **Kill switch:** persisted flag (survives restarts), checked at the start of every cycle and immediately before every submit; manual CLI to flip; auto-trips on a daily-loss breach — once per session, so an operator's release lets exits through while the daily-loss rule keeps refusing entries — and on any failure after an order is handed to the broker other than a definite rejection (an unknown or unresolved outcome, a fill that can't be recorded); if the switch itself can't be engaged, the process refuses every later order until restarted. A startup reconciliation that is not clean (or fails) refuses the live start and engages the switch, so a restart loop stays quiet; stale data is rejected per order by price sanity. On trip: halt new orders + alert. **Auto-flatten is OFF by default** (flattening in disorderly markets is itself risky); it's an explicit opt-in.
 
 **Per-order / per-day rails (all config-driven, evaluated on the *resulting* position, not the order in isolation)**
 
@@ -603,21 +604,21 @@ The risk gate is a **single, non-bypassable, fail-closed** function: `Order in �
 - `max_trades_per_day` (persisted counter, reset at session start)
 - **Allowlist** (default-deny: only trade listed symbols) and/or denylist
 - **Price sanity:** reject zero/negative/NaN; reject quotes older than `max_staleness_seconds`; reject if spread % exceeds a bound (illiquid/halted); optionally reject if price deviates from prev close beyond a band (bad ticks). Halted/locked symbols → no-trade.
-- **Duplicate-order guard** via the client-order-id idempotency pattern + pre-resend reconciliation.
+- **Duplicate-order guard** via the write-ahead order row, one send per `client_order_id`, and reconciliation of unknown outcomes (never a blind re-send).
 
 **Cross-strategy scope, attribution & conflicts (multi-strategy):**
 
 - **Two limit scopes.** *Account-wide* limits (`max_gross_exposure`, `daily_loss_limit`, `max_trades_per_day`, buying-power) are enforced across **all** strategies combined and are the hard guardrail. *Per-strategy* limits (via a binding's `risk_overrides`, e.g. `max_order_notional`, `max_position_size`, per-strategy trade count / loss budget) are checked first and merged over the global defaults. An order must pass **both** scopes. The global cycle lock (§7.5) guarantees these account-wide checks see a consistent, serialized view of state.
-- **Position attribution.** Schwab holds one commingled position per symbol (broker truth). Locally we additionally track an **attributed sub-position per `strategy_id`** (from fills tagged with the originating strategy) for per-strategy P&L, position caps, and reporting. The account-level reconciliation (below) always trues up to broker totals; attribution is a local ledger whose per-strategy sum is reconciled to the broker total (any unattributed delta is parked in a `manual/unknown` bucket and alerted).
+- **Position attribution.** Schwab holds one commingled position per symbol (broker truth). Locally we additionally track an **attributed sub-position per `strategy_id`** (from fills tagged with the originating strategy) for per-strategy P&L, position caps, and reporting. The account-level reconciliation (below) always trues up to broker totals; attribution is a local ledger whose per-strategy sum is reconciled to the broker total. As built, holdings beyond the strategies' sum are *unattributed*: those the operator has acknowledged (the `unknown` baseline, e.g. the owner's own positions — set only by `trader reconcile --accept-positions`) are standing; any other difference is a discrepancy until explained or acknowledged.
 - **Same-ticker conflict policy** (config `risk.conflict_policy`, default **`net`**): when two strategies trade the same symbol in one session —
   - `net` (default): decisions are netted at the account level before submission (strategy A's +10 AAPL and strategy B's −4 AAPL → one +6 order), so we never cross our own spread; attribution splits the fill back to each strategy pro-rata.
   - `independent`: each strategy's order is sent on its own (simpler attribution, but can self-trade/churn).
   - `priority`: a configured strategy ordering wins ties; lower-priority conflicting orders on the same symbol in the same cycle are dropped + logged.
   This is an explicit open decision (see §18); `net` is the safe, cost-minimizing default.
 
-**Reconciliation:** on startup, after each submit, and at EOD — pull authoritative positions/orders from Schwab and diff against local intent (both the account total and the sum of per-strategy attributed positions). Broker = source of truth for positions/fills; local = source of truth for intent. Unexplained divergence → update to broker truth, log, and consider tripping the kill switch.
+**Reconciliation:** on startup, after each submit, and at EOD — pull authoritative positions/orders from Schwab and diff against local intent (both the account total and the sum of per-strategy attributed positions). Broker = source of truth for positions/fills; local = source of truth for intent. Unexplained divergence → update to broker truth, log, and consider tripping the kill switch. As built: each submit polls its order to a terminal status and records it atomically; the live start runs `execution.account_reconcile` (settle every open order, then compare positions with the acknowledged baseline) and refuses unless clean; `trader reconcile` runs the same on demand (EOD reconciliation and the account-total diff are not built).
 
-**PDT / regulatory:** implement a **configurable** pattern-day-trader check (rolling 5-day day-trade count, $25k equity threshold) in the risk layer. **[VERIFY]** A 2026 SEC-approved amendment to FINRA Rule 4210 may change the day-trade-counting regime — do **not** hardcode the old thresholds; make them config + verify current rules. Note margin (PDT) vs cash (T+1 settlement / good-faith violations) account choice changes which constraints apply.
+**PDT / regulatory:** implement a **configurable** pattern-day-trader check (rolling 5-day day-trade count, $25k equity threshold) in the risk layer. As built: every order that may have executed counts (uncertain ones included), bucketed by the exchange session it was sent in; the broker's own day-trade count is a floor; the threshold is checked against the lower of start-of-day and current equity; at the limit both the order completing another day-trade and any new entry are refused. **[VERIFY]** A 2026 SEC-approved amendment to FINRA Rule 4210 may change the day-trade-counting regime — do **not** hardcode the old thresholds; make them config + verify current rules. Note margin (PDT) vs cash (T+1 settlement / good-faith violations) account choice changes which constraints apply.
 
 ---
 

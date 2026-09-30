@@ -138,6 +138,7 @@ class RiskManager:
             (rules.price_sanity, acct, "account-wide"),
             (rules.daily_loss_limit, acct, "account-wide"),
             (rules.max_trades_per_day, acct, "account-wide"),
+            (rules.pattern_day_trader, acct, "account-wide"),
             (rules.max_position_size, acct, "account-wide"),
             (rules.max_gross_exposure, acct, "account-wide"),
         ]

@@ -414,3 +414,10 @@ def test_parse_account_reads_the_start_of_day_value_when_present() -> None:
     assert parse_account(data).start_of_day_equity is None  # absent: the counters capture it
     data["securitiesAccount"]["initialBalances"] = {"liquidationValue": "12000.00"}
     assert parse_account(data).start_of_day_equity == Decimal("12000.00")
+
+
+def test_parse_account_reads_the_day_trade_count_when_present() -> None:
+    data = _fixture("account_with_positions.json")
+    assert parse_account(data).round_trips is None
+    data["securitiesAccount"]["roundTrips"] = 2
+    assert parse_account(data).round_trips == 2

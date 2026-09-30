@@ -276,8 +276,9 @@ def test_get_account_passes_the_brokers_start_of_day_equity() -> None:
     from dataclasses import replace
 
     client = _FakeTradingClient()
-    client._account = replace(client._account, start_of_day_equity=Decimal("12000"))
-    assert _broker(client).get_account().start_of_day_equity == Decimal("12000")
+    client._account = replace(client._account, start_of_day_equity=Decimal("12000"), round_trips=1)
+    account = _broker(client).get_account()
+    assert account.start_of_day_equity == Decimal("12000") and account.round_trips == 1
 
 
 # --- fee estimate (LR12) ---------------------------------------------------------- #

@@ -162,3 +162,62 @@ def test_after_releasing_a_loss_trip_exits_go_through_but_entries_do_not(
     assert entry.rejected and not switch.is_engaged()  # the loss rule refuses; no re-trip
     exit_ = orch.run_cycle(_Decide([Decision(Action.SELL, "AAPL", 500)]), ["AAPL"], "s1", NOW)
     assert [o.symbol for o in exit_.orders] == ["AAPL"] and not switch.is_engaged()
+
+
+def test_pdt_blocks_the_fourth_same_day_round_trip_under_25k(tmp_path: Path) -> None:
+    # Real executor -> durable fills; DailyCounters (with an exchange calendar) supplies the
+    # history; the gate's PDT rule refuses the order that would complete a 4th day-trade.
+    from trader.scheduler.calendar import TradingCalendar
+
+    symbols = ("AAPL", "MSFT", "SPY", "QQQ")
+    quotes = {s: [_quote(s, "10")] for s in (*symbols, "IWM")}
+    clock = FakeClock(NOW)
+    data = FakeMarketDataProvider(quotes=quotes)
+    conn = connect(tmp_path / "state.sqlite")
+    run_migrations(conn)
+    broker = SimBroker(data, clock, starting_cash=Decimal("20000"))  # under the $25k threshold
+    attribution = AttributionLedger(conn)
+    executor = DurableOrderExecutor(
+        broker=broker,
+        repo=OrderRepository(conn, now=clock.now),
+        attribution=attribution,
+        reconcile=in_memory_reconciler(broker.find_by_client_id),
+        poll_policy=PollPolicy(timeout_seconds=0),
+    )
+    ids = (f"o{i}" for i in itertools.count())
+    orch = Orchestrator(
+        broker=broker,
+        data=data,
+        clock=clock,
+        cycle_lock=NullLock(),
+        attribution=attribution,
+        sizer=lambda d, sid: size_decision(d, sid, ExecutionConfig(), id_factory=lambda: next(ids)),
+        risk=RiskManager(account_config=RiskConfig(max_trades_per_day=20), clock=clock),
+        executor=executor,
+        day_state_provider=DailyCounters(
+            conn,
+            tz=ZoneInfo("America/New_York"),
+            scope="paper:test",
+            sessions=TradingCalendar().sessions,
+        ).day_state,
+    )
+    # QQQ is bought first (no day-trades yet), then three complete round trips today.
+    opened = orch.run_cycle(_Decide([Decision(Action.BUY, "QQQ", 1)]), ["QQQ"], "s1", NOW)
+    assert [o.symbol for o in opened.orders] == ["QQQ"]
+    for sym in symbols[:3]:
+        orch.run_cycle(_Decide([Decision(Action.BUY, sym, 1)]), [sym], "s1", NOW)
+        done = orch.run_cycle(_Decide([Decision(Action.SELL, sym, 1)]), [sym], "s1", NOW)
+        assert [o.symbol for o in done.orders] == [sym]
+    # At the limit: closing QQQ today would be a 4th day-trade ...
+    fourth = orch.run_cycle(_Decide([Decision(Action.SELL, "QQQ", 1)]), ["QQQ"], "s1", NOW)
+    assert [o.symbol for o in fourth.rejected] == ["QQQ"]
+    assert "PDT" in _reasons(orch)[-1]
+    # ... and a new entry is refused (it could not be closed this session).
+    entry = orch.run_cycle(_Decide([Decision(Action.BUY, "IWM", 1)]), ["IWM"], "s1", NOW)
+    assert [o.symbol for o in entry.rejected] == ["IWM"]
+    assert "could not be closed this session" in _reasons(orch)[-1]
+
+
+def _reasons(orch: Orchestrator) -> list[str]:
+    events = orch._audit.events  # type: ignore[attr-defined]
+    return [str(e.payload.get("reason", "")) for e in events if e.kind == "rejected"]

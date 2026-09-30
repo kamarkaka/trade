@@ -235,3 +235,121 @@ def test_migration_006_keeps_existing_counters_under_an_empty_scope(tmp_path: Pa
         _account("10000"), datetime(2026, 6, 26, 15, tzinfo=UTC)
     )
     assert conn.execute("SELECT COUNT(*) FROM daily_counters").fetchone()[0] == 2
+
+
+# --- pattern-day-trader inputs (LR8) ---------------------------------------------- #
+
+
+def _sessions(start, end):  # type: ignore[no-untyped-def]
+    """Weekday 'sessions' (no holidays) for tests."""
+    out, d = [], start
+    while d <= end:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def _placed(
+    conn: sqlite3.Connection,
+    cid: str,
+    side: str,
+    created: str,
+    status: str = "FILLED",
+    filled: int = 1,
+) -> None:
+    """An order row sent at ``created`` (+ its fill row when anything filled and it's terminal)."""
+    conn.execute(
+        "INSERT INTO orders (client_order_id, strategy_id, symbol, side, quantity, order_type, "
+        "limit_price, tif, status, broker_order_id, created_at, updated_at) "
+        "VALUES (?, 's1', 'AAPL', ?, 1, 'MARKET', NULL, 'DAY', ?, ?, ?, ?)",
+        (cid, side, status, f"b-{cid}", created, created),
+    )
+    if filled and status in ("FILLED", "CANCELED", "EXPIRED"):
+        conn.execute(
+            "INSERT INTO fills (client_order_id, broker_order_id, symbol, quantity, price, fees, "
+            "ts, status) VALUES (?, ?, 'AAPL', ?, '100', '0', ?, ?)",
+            (cid, f"b-{cid}", filled, created, status),
+        )
+
+
+def test_pdt_window_is_the_last_n_exchange_sessions(tmp_path: Path) -> None:
+    from datetime import date
+
+    conn = _conn(tmp_path)
+    counters = DailyCounters(conn, tz=NY, scope="live", sessions=_sessions)
+    # Mon 2026-06-29: the last 5 weekday sessions are Tue 6/23 .. Mon 6/29
+    assert counters.pdt_window_start(date(2026, 6, 29)) == date(2026, 6, 23)
+    no_calendar = DailyCounters(conn, tz=NY, scope="live")
+    assert no_calendar.pdt_window_start(date(2026, 6, 29)) is None
+
+
+@pytest.mark.parametrize(
+    ("session", "window_start"),
+    [
+        ("2026-07-07", "2026-06-30"),  # Fri 7/3 is the Independence Day holiday
+        ("2026-11-30", "2026-11-23"),  # Thanksgiving Thu 11/26; Fri 11/27 is a half day
+        ("2027-01-04", "2026-12-28"),  # New Year's Day Fri 1/1
+    ],
+)
+def test_pdt_window_skips_exchange_holidays(
+    tmp_path: Path, session: str, window_start: str
+) -> None:
+    from datetime import date
+
+    from trader.scheduler.calendar import TradingCalendar
+
+    counters = DailyCounters(
+        _conn(tmp_path), tz=NY, scope="live", sessions=TradingCalendar().sessions
+    )
+    assert counters.pdt_window_start(date.fromisoformat(session)) == date.fromisoformat(
+        window_start
+    )
+
+
+def test_executions_are_every_order_that_may_have_executed(tmp_path: Path) -> None:
+    from trader.core.enums import Side
+
+    conn = _conn(tmp_path)
+    _placed(conn, "old", "BUY", "2026-06-22T15:00:00+00:00")  # before the window
+    _placed(conn, "buy", "BUY", "2026-06-29T14:00:00+00:00")  # filled
+    _placed(conn, "sell", "SELL", "2026-06-29T15:00:00+00:00", "CANCELED")  # partly filled
+    _placed(conn, "fate", "SELL", "2026-06-29T15:10:00+00:00", "unknown", 0)  # uncertain
+    _placed(conn, "live", "BUY", "2026-06-29T15:20:00+00:00", "WORKING", 0)  # unresolved
+    _placed(conn, "none", "BUY", "2026-06-29T15:30:00+00:00", "CANCELED", 0)  # nothing filled
+    _placed(conn, "rej", "BUY", "2026-06-29T15:40:00+00:00", "REJECTED", 0)
+    _placed(conn, "np", "BUY", "2026-06-29T15:50:00+00:00", "not_placed", 0)
+    state = DailyCounters(conn, tz=NY, scope="live", sessions=_sessions).day_state(
+        _account("10000"), MORNING
+    )
+    assert state.pdt_window_start is not None and state.pdt_window_start.isoformat() == "2026-06-23"
+    assert [(s, side) for s, side, _ in state.executions] == [
+        ("AAPL", Side.BUY),
+        ("AAPL", Side.SELL),
+        ("AAPL", Side.SELL),
+        ("AAPL", Side.BUY),
+    ]
+
+
+def test_executions_are_bucketed_by_the_exchange_session_they_were_sent_in(
+    tmp_path: Path,
+) -> None:
+    from datetime import date
+
+    conn = _conn(tmp_path)
+    _placed(conn, "late", "BUY", "2026-06-30T03:30:00+00:00")  # 23:30 EDT on 6/29
+    _placed(conn, "next", "SELL", "2026-06-30T04:30:00+00:00")  # 00:30 EDT on 6/30
+    counters = DailyCounters(conn, tz=NY, scope="live", sessions=_sessions)
+    sessions = [s for _, _, s in counters.executions_since(date(2026, 6, 23))]
+    assert sessions == [date(2026, 6, 29), date(2026, 6, 30)]
+
+
+def test_the_brokers_day_trade_count_is_passed_through(tmp_path: Path) -> None:
+    counters = DailyCounters(_conn(tmp_path), tz=NY, scope="live", sessions=_sessions)
+    account = Account(Decimal("1"), Decimal("1"), Decimal("1"), round_trips=2)
+    assert counters.day_state(account, MORNING).broker_day_trades == 2
+    assert counters.day_state(_account("1"), MORNING).broker_day_trades is None
+
+
+def test_terminal_statuses_match_the_placement_layer() -> None:
+    assert daily._TERMINAL == idempotency.TERMINAL

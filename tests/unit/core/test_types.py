@@ -283,3 +283,31 @@ def test_account_start_of_day_equity_is_optional_and_validated() -> None:
     assert acct.start_of_day_equity == D("2")
     with pytest.raises(TypeError):
         Account(D("1"), D("1"), D("1"), start_of_day_equity=2.0)  # type: ignore[arg-type]
+
+
+def test_day_state_pdt_inputs_are_validated_and_normalized() -> None:
+    from trader.core.enums import Side
+
+    state = DayState(
+        date(2026, 6, 29), Decimal("1"), Decimal(0), Decimal(0), 0, Decimal(0),
+        executions=(("AAPL", "BUY", date(2026, 6, 26)),), pdt_window_start=date(2026, 6, 23),
+        broker_day_trades=2,
+    )  # fmt: skip
+    assert state.executions == (("AAPL", Side.BUY, date(2026, 6, 26)),)
+    assert state.broker_day_trades == 2
+    base = (date(2026, 6, 29), Decimal("1"), Decimal(0), Decimal(0), 0, Decimal(0))
+    with pytest.raises(TypeError, match="pdt_window_start"):
+        DayState(*base, pdt_window_start=datetime(2026, 6, 23, tzinfo=UTC))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="after trading_date"):
+        DayState(*base, pdt_window_start=date(2026, 6, 30))
+    with pytest.raises(TypeError, match="session"):
+        DayState(*base, executions=(("AAPL", "BUY", datetime(2026, 6, 29, tzinfo=UTC)),))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="broker_day_trades"):
+        DayState(*base, broker_day_trades=-1)
+
+
+def test_account_round_trips_are_optional_and_validated() -> None:
+    assert Account(D("1"), D("1"), D("1")).round_trips is None
+    assert Account(D("1"), D("1"), D("1"), round_trips=3).round_trips == 3
+    with pytest.raises(ValueError, match="round_trips"):
+        Account(D("1"), D("1"), D("1"), round_trips=-1)

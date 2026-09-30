@@ -8,9 +8,12 @@ Two invariants from §10 shape these rules:
    the book ends up after the order fills.
 2. **Never block de-risking.** An order that does not *increase* a symbol's absolute
    exposure (a reduce/flatten/partial-exit) can never breach a sizing cap, so the
-   notional / position-size / gross-exposure rules exempt it. (Bad-data and policy gates
-   such as ``price_sanity`` / ``allowlist_denylist`` still apply to every order — with
-   auto-flatten OFF by default we deliberately do not force trades on uncertain data.)
+   notional / position-size / gross-exposure rules exempt it — and so do the daily
+   trade-count and daily-loss rails: hitting either must stop NEW exposure, never trap an
+   open position overnight. (The kill switch is the hard stop that halts every order; the
+   bad-data and policy gates such as ``price_sanity`` / ``allowlist_denylist`` still apply
+   to every order — with auto-flatten OFF by default we deliberately do not force trades on
+   uncertain data.)
 
 The per-strategy vs account-wide limit-scope merge is owned by the gate (M4.3), not by
 these primitives. The kill-switch check (``DayState.kill_switch_engaged``) is enforced
@@ -186,6 +189,8 @@ def max_gross_exposure(order: Order, ctx: RuleContext) -> RuleResult:
 
 
 def daily_loss_limit(order: Order, ctx: RuleContext) -> RuleResult:
+    if _reduces_or_holds_exposure(order, ctx):
+        return RuleResult(ok=True)  # cutting risk after a loss breach is always allowed
     limit = (
         ctx.day_state.start_of_day_equity
         * Decimal(str(ctx.config.daily_loss_limit_pct))
@@ -199,6 +204,8 @@ def daily_loss_limit(order: Order, ctx: RuleContext) -> RuleResult:
 
 
 def max_trades_per_day(order: Order, ctx: RuleContext) -> RuleResult:
+    if _reduces_or_holds_exposure(order, ctx):
+        return RuleResult(ok=True)  # an exit never counts against the entry budget
     if ctx.day_state.trades_today >= ctx.config.max_trades_per_day:
         return _reject(
             f"trades today {ctx.day_state.trades_today} hit limit {ctx.config.max_trades_per_day}"

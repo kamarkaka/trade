@@ -145,6 +145,27 @@ def test_max_trades_per_day() -> None:
     assert rules.max_trades_per_day(_order(), _ctx()).ok is True
 
 
+def test_daily_rails_never_block_de_risking() -> None:
+    # At the trade cap or past the loss limit, NEW exposure is refused but exits/reductions
+    # must still go through — else an open position is trapped overnight.
+    maxed_and_breached = DayState(
+        date(2024, 7, 8), Decimal("100000"), Decimal("0"), Decimal("0"), 6, Decimal("2500")
+    )
+    held = (Position("AAPL", 10, Decimal("100"), Decimal("1000")),)
+    ctx = _ctx(positions=held, day_state=maxed_and_breached)
+    close = _order(side=Side.SELL, qty=10)  # flattens
+    trim = _order(side=Side.SELL, qty=4)  # reduces
+    add = _order(side=Side.BUY, qty=1)  # increases
+    flip = _order(side=Side.SELL, qty=15)  # through zero: |-5| < |10| still reduces exposure
+    for order in (close, trim, flip):
+        assert rules.max_trades_per_day(order, ctx).ok is True
+        assert rules.daily_loss_limit(order, ctx).ok is True
+    assert rules.max_trades_per_day(add, ctx).ok is False
+    assert rules.daily_loss_limit(add, ctx).ok is False
+    short_more = _order(side=Side.SELL, qty=25)  # through zero to |-15| > |10|: new exposure
+    assert rules.max_trades_per_day(short_more, ctx).ok is False
+
+
 # --- price sanity ----------------------------------------------------------- #
 
 

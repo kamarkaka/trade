@@ -56,8 +56,14 @@ class FiredSlotLedger:
         drift_seconds: int,
         seed: int | None,
     ) -> bool:
-        """Atomically claim a slot. Returns False if already claimed/done/failed."""
+        """Atomically claim a slot. Returns False if already claimed/done/failed.
+
+        The transaction is always closed: any failure (not only the duplicate-claim
+        IntegrityError) rolls back, so the shared connection is never left inside an open
+        transaction that would silently swallow later writes (e.g. order write-ahead rows)
+        and make every later claim fail."""
         self._conn.execute("BEGIN IMMEDIATE")
+        committed = False
         try:
             self._conn.execute(
                 "INSERT INTO fired_slot (slot_date, strategy_id, slot_id, status, "
@@ -73,10 +79,13 @@ class FiredSlotLedger:
                     self._now_iso(),
                 ),
             )
+            self._conn.execute("COMMIT")
+            committed = True
         except sqlite3.IntegrityError:
-            self._conn.execute("ROLLBACK")
             return False
-        self._conn.execute("COMMIT")
+        finally:
+            if not committed and self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
         return True
 
     def mark_done(self, slot_date: date, strategy_id: str, slot_id: str) -> None:

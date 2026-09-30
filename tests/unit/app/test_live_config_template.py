@@ -21,7 +21,6 @@ def _preflight(**overrides: object):  # type: ignore[no-untyped-def]
         "kill_switch_engaged": False,
         "token_valid": True,
         "alert_channel_count": len(cfg.alerting.channels),
-        "reconcile_clean": True,
         **overrides,
     }
     return cfg, bindings, live_preflight(cfg, bindings, **inputs)  # type: ignore[arg-type]

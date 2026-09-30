@@ -225,15 +225,21 @@ def run(
     import uuid
     from zoneinfo import ZoneInfo
 
-    from trader.app.live_guard import announce_live, live_confirmed, live_preflight
+    from trader.app.live_guard import (
+        announce_live,
+        live_confirmed,
+        live_preflight,
+        reconcile_before_live,
+    )
     from trader.broker import FeesModel, SimBroker
     from trader.broker.schwab_broker import TRANSIENT_READ_ERRORS
     from trader.core.enums import Mode
     from trader.core.protocols import Broker
+    from trader.execution.account_reconcile import reconcile_account, summary_lines
     from trader.execution.executor import DurableOrderExecutor, in_memory_reconciler
     from trader.execution.idempotency import OrderRepository, Reconciler
     from trader.execution.poller import DEFAULT_RETRYABLE, PollPolicy
-    from trader.observability.alerting import build_alerter
+    from trader.observability.alerting import AlertEvent, AlertKind, build_alerter
     from trader.observability.heartbeat import Heartbeat
     from trader.observability.logging import get_logger
     from trader.orchestrator.cycle import Orchestrator, SqliteAuditSink
@@ -306,10 +312,11 @@ def run(
     overrides = {b.strategy_id: b.risk_overrides for b in bindings if b.risk_overrides}
 
     if is_live:
-        # Conservative go-live preflight: refuse to start a REAL-MONEY run unless the rollout
-        # is safe. Validates EFFECTIVE per-strategy caps (overrides can't exceed the ceiling),
-        # an alert channel (never silent), default-deny allowlist, kill switch off, valid
-        # token -- and, until M5.7 wires the idempotent submit path, refuses live entirely.
+        # Conservative go-live preflight (no broker contact yet): refuse to start a REAL-MONEY
+        # run unless the rollout is safe. Validates EFFECTIVE per-strategy caps (overrides
+        # can't exceed the ceiling), an alert channel (never silent), default-deny allowlist,
+        # kill switch off, valid token, and the LIVE_ORDER_PATH_READY lock. The startup
+        # reconciliation gate runs after connecting, below.
         problems = live_preflight(
             cfg,
             bindings,
@@ -351,6 +358,36 @@ def run(
             reconciler: Reconciler = live.reconciler
             poll_policy = PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds)
             retryable = TRANSIENT_READ_ERRORS
+            # Startup reconciliation gate (design §10): settle every open order and true the
+            # positions to the broker BEFORE trading. The trading lease is held, so nothing
+            # else can be sending; an unclean account refuses to start (and alerts).
+            report = reconcile_before_live(
+                lambda: reconcile_account(
+                    broker=live.broker,
+                    repo=repo,
+                    attribution=attribution,
+                    reconcile_order=live.reconciler,
+                    poll_policy=poll_policy,
+                    retryable=TRANSIENT_READ_ERRORS,
+                ),
+                wait=_time.sleep,
+                window_seconds=cfg.execution.reconcile_window_seconds,
+            )
+            for line in summary_lines(report):
+                typer.echo(f"startup reconcile: {line}")
+            if not report.is_clean:
+                alerter.alert(
+                    AlertEvent(
+                        AlertKind.RECONCILE_MISMATCH,
+                        "live start refused: startup reconciliation is not clean",
+                    )
+                )
+                typer.echo(
+                    "run error: startup reconciliation is not clean; settle it (trader "
+                    "reconcile) before going live",
+                    err=True,
+                )
+                raise typer.Exit(1)
             # Live state is NEVER silent: log it loud and alert at startup (design §10).
             get_logger("cli").warning("STARTING IN LIVE MODE — REAL ORDERS ENABLED")
             announce_live(alerter)

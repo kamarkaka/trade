@@ -149,7 +149,61 @@ def test_preflight_blocks_on_kill_switch_token_reconcile(monkeypatch: pytest.Mon
         p.check == "kill_switch" for p in _pf(_safe_cfg(), _bindings(), kill_switch_engaged=True)
     )
     assert any(p.check == "token" for p in _pf(_safe_cfg(), _bindings(), token_valid=False))
-    assert any(p.check == "reconcile" for p in _pf(_safe_cfg(), _bindings(), reconcile_clean=False))
+
+
+# --- the startup reconciliation gate (LR10) ---------------------------------------- #
+
+
+def _report(*, clean: bool, retry_later: bool = False):  # type: ignore[no-untyped-def]
+    from trader.execution.account_reconcile import (
+        AccountReconcileReport,
+        OrderSettlement,
+        Settlement,
+    )
+    from trader.execution.reconcile import ReconcileReport
+
+    code = "window_open" if retry_later else "ambiguous"
+    orders = () if clean else (OrderSettlement("c1", Settlement.UNRESOLVED, "x", code),)
+    return AccountReconcileReport(orders, ReconcileReport())
+
+
+def test_a_clean_account_passes_the_gate_at_once() -> None:
+    from trader.app.live_guard import reconcile_before_live
+
+    calls, waits = [], []
+    report = reconcile_before_live(
+        lambda: calls.append(1) or _report(clean=True), wait=waits.append, window_seconds=300
+    )
+    assert report.is_clean and calls == [1] and waits == []
+
+
+def test_a_pending_window_is_waited_out_once() -> None:
+    from trader.app.live_guard import reconcile_before_live
+
+    reports = iter([_report(clean=False, retry_later=True), _report(clean=True)])
+    waits: list[float] = []
+    report = reconcile_before_live(lambda: next(reports), wait=waits.append, window_seconds=300)
+    assert report.is_clean and waits == [300]
+
+
+def test_an_account_needing_attention_is_not_retried() -> None:
+    from trader.app.live_guard import reconcile_before_live
+
+    calls, waits = [], []
+    report = reconcile_before_live(
+        lambda: calls.append(1) or _report(clean=False), wait=waits.append, window_seconds=300
+    )
+    assert not report.is_clean and calls == [1] and waits == []
+
+
+def test_still_unclean_after_the_wait_is_returned_unclean() -> None:
+    from trader.app.live_guard import reconcile_before_live
+
+    waits: list[float] = []
+    report = reconcile_before_live(
+        lambda: _report(clean=False, retry_later=True), wait=waits.append, window_seconds=300
+    )
+    assert not report.is_clean and waits == [300]  # waits once, never loops
 
 
 # --- startup alert ---------------------------------------------------------- #

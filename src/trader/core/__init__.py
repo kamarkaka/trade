@@ -15,6 +15,7 @@ from .enums import (
     Side,
     TimeInForce,
 )
+from .errors import OrderNotPlacedError
 from .types import (
     Account,
     Bar,
@@ -45,6 +46,7 @@ __all__ = [
     "Mode",
     "OnOvershoot",
     "Order",
+    "OrderNotPlacedError",
     "OrderStatus",
     "OrderType",
     "Position",

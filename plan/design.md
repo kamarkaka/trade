@@ -593,7 +593,7 @@ The risk gate is a **single, non-bypassable, fail-closed** function: `Order in �
 **Default-safe posture**
 
 - **Default mode = `paper`/dry-run.** Going live requires **two** signals: `mode: live` in config **plus** an env var / CLI confirmation. Live state is logged and alerted at startup so it is never silent.
-- **Kill switch:** persisted flag (survives restarts), checked at the start of every cycle and immediately before every submit; manual CLI to flip; auto-trips on a daily-loss breach and on an order whose outcome is unknown or unresolved (a startup reconciliation mismatch refuses the live start instead; stale data is rejected per order by price sanity). On trip: halt new orders + alert. **Auto-flatten is OFF by default** (flattening in disorderly markets is itself risky); it's an explicit opt-in.
+- **Kill switch:** persisted flag (survives restarts), checked at the start of every cycle and immediately before every submit; manual CLI to flip; auto-trips on a daily-loss breach — once per session, so an operator's release lets exits through while the daily-loss rule keeps refusing entries — and on any failure after an order is handed to the broker other than a definite rejection (an unknown or unresolved outcome, a fill that can't be recorded); if the switch itself can't be engaged, the process refuses every later order until restarted. A startup reconciliation mismatch refuses the live start instead; stale data is rejected per order by price sanity. On trip: halt new orders + alert. **Auto-flatten is OFF by default** (flattening in disorderly markets is itself risky); it's an explicit opt-in.
 
 **Per-order / per-day rails (all config-driven, evaluated on the *resulting* position, not the order in isolation)**
 
@@ -618,7 +618,7 @@ The risk gate is a **single, non-bypassable, fail-closed** function: `Order in �
 
 **Reconciliation:** on startup, after each submit, and at EOD — pull authoritative positions/orders from Schwab and diff against local intent (both the account total and the sum of per-strategy attributed positions). Broker = source of truth for positions/fills; local = source of truth for intent. Unexplained divergence → update to broker truth, log, and consider tripping the kill switch.
 
-**PDT / regulatory:** implement a **configurable** pattern-day-trader check (rolling 5-day day-trade count, $25k equity threshold) in the risk layer. **[VERIFY]** A 2026 SEC-approved amendment to FINRA Rule 4210 may change the day-trade-counting regime — do **not** hardcode the old thresholds; make them config + verify current rules. Note margin (PDT) vs cash (T+1 settlement / good-faith violations) account choice changes which constraints apply.
+**PDT / regulatory:** implement a **configurable** pattern-day-trader check (rolling 5-day day-trade count, $25k equity threshold) in the risk layer. As built: every order that may have executed counts (uncertain ones included), bucketed by the exchange session it was sent in; the broker's own day-trade count is a floor; the threshold is checked against the lower of start-of-day and current equity; at the limit both the order completing another day-trade and any new entry are refused. **[VERIFY]** A 2026 SEC-approved amendment to FINRA Rule 4210 may change the day-trade-counting regime — do **not** hardcode the old thresholds; make them config + verify current rules. Note margin (PDT) vs cash (T+1 settlement / good-faith violations) account choice changes which constraints apply.
 
 ---
 

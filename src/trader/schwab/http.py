@@ -140,8 +140,9 @@ class SchwabHttp:
             return self._retrying(self._send, method, url, params, json, allow_refresh=True)
         # Non-idempotent writes (order POST / replace PUT) are NOT auto-retried on 429/5xx:
         # a blind re-send could place a SECOND real order (a 5xx may arrive AFTER the order
-        # was accepted). The 429/5xx surfaces to the caller, which reconciles-before-resend
-        # (M5.3). The internal 401->refresh->retry stays on (a 401 means the request was
+        # was accepted). The 429/5xx surfaces to the caller, which never re-sends it: the order
+        # is marked unknown and settled by reconciliation (execution.idempotency).
+        # The internal 401->refresh->retry stays on (a 401 means the request was
         # rejected, never processed, so retrying it cannot duplicate an order).
         return self._send(method, url, params, json, allow_refresh=True)
 

@@ -1,8 +1,8 @@
 """A deterministic, in-memory Broker test double with configurable behaviors.
 
 Supports the failure modes later milestones need: a one-shot submit failure
-(simulating a timeout / unknown response for idempotency tests) and optional
-broker-side dedup by client order id.
+(simulating a timeout / unknown response for idempotency tests), a one-shot definite
+rejection (``OrderNotPlacedError``), and optional broker-side dedup by client order id.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from trader.core import Account, Fill, Order, OrderStatus, Position
+from trader.core import Account, Fill, Order, OrderNotPlacedError, OrderStatus, Position
 
 _TS = datetime(2026, 1, 2, 15, 0, tzinfo=UTC)
 _DEFAULT_CASH = Decimal("100000")
@@ -42,6 +42,7 @@ class FakeBroker:
         self.fill_quantity: int | None = None  # < order qty => PARTIAL_FILL; None => full
         self.fail_next_submit = False  # raise once (simulate timeout / unknown outcome)
         self.record_on_timeout = False  # on timeout, still record (request landed, response lost)
+        self.reject_next_submit = False  # raise OrderNotPlacedError once (definitely not placed)
         self.dedupe_by_client_id = False  # broker-side idempotency
         self.ts = _TS
 
@@ -49,6 +50,9 @@ class FakeBroker:
         self.submitted.append(order)
         if self.dedupe_by_client_id and order.client_order_id in self._by_client:
             return self._by_client[order.client_order_id]
+        if self.reject_next_submit:
+            self.reject_next_submit = False
+            raise OrderNotPlacedError("simulated broker rejection (order not placed)")
         if self.fail_next_submit:
             self.fail_next_submit = False
             if self.record_on_timeout:

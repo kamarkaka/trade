@@ -5,9 +5,10 @@ orchestrator places real orders through the SAME abstraction as the simulator. I
 **safe-mode aware**: in READ-ONLY safe mode (dead refresh token) ``submit_order`` refuses
 and raises a typed error rather than silently dropping the order.
 
-Idempotency (write-ahead client_order_id + reconcile-before-resend) is layered ABOVE this
-broker in M5.3 — and the transport already refuses to auto-retry the order POST (M5.1), so a
-duplicate order is never created at this layer. Schwab does not echo our ``client_order_id``,
+Idempotency (write-ahead row, one send per client_order_id, reconciliation of unknown
+outcomes) is layered ABOVE this broker (execution.idempotency) — and the transport already
+refuses to auto-retry the order POST (M5.1), so a duplicate order is never created at this
+layer. Schwab does not echo our ``client_order_id``,
 so each returned broker order id is mapped back to the originating id: from memory for orders
 placed by this process, and through an injected durable lookup (the ``orders`` table) for
 orders placed before a restart. A ``Fill`` reports Schwab's own order id and symbol, so a

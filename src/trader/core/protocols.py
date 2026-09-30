@@ -63,7 +63,11 @@ class Broker(Protocol):
     """Order execution + account/position access. Schwab live; simulated in
     paper/backtest. The only seam through which orders ever leave the system."""
 
-    def submit_order(self, order: Order) -> str: ...  # returns broker_order_id
+    def submit_order(self, order: Order) -> str:
+        """Place ``order``; return the broker order id. Raise ``OrderNotPlacedError`` only
+        when the order definitely did not reach the book — any other exception means the
+        outcome is unknown and the order must not be blindly re-sent (see ``core.errors``)."""
+        ...
 
     def get_order(self, broker_order_id: str) -> Fill: ...
 

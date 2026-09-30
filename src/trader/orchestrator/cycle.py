@@ -339,8 +339,9 @@ class Orchestrator:
         else:
             try:
                 # Completes atomically (terminal status + fill row + attribution). An unknown
-                # or unresolved outcome raises past here and fails this cycle (alerted), so no
-                # further order is sent in it.
+                # or unresolved outcome raises past here and fails this cycle (alerted); the
+                # executor's uncertainty hook engages the kill switch, so nothing more is sent
+                # until an operator has reconciled it.
                 fill = self._executor.execute(final_order)
             except OrderNotPlacedError as exc:
                 self._not_placed(final_order, strategy_id, cycle_id, result, str(exc))

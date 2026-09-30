@@ -11,7 +11,11 @@ import pytest
 from fakes import FakeBroker
 from trader.core import Fill, Order, OrderNotPlacedError
 from trader.core.enums import OrderStatus, OrderType, Side
-from trader.execution.executor import DurableOrderExecutor, OrderUnresolvedError
+from trader.execution.executor import (
+    DurableOrderExecutor,
+    ExecutionHaltedError,
+    OrderUnresolvedError,
+)
 from trader.execution.idempotency import (
     NOT_PLACED,
     PLACED,
@@ -335,3 +339,105 @@ def test_an_unresolved_error_reports_whether_the_cancel_went_through(tmp_path: P
     with pytest.raises(OrderUnresolvedError) as ei:
         executor.execute(_order())
     assert ei.value.cancel_attempted and ei.value.cancel_accepted
+
+
+# --- the uncertainty hook (LR7) --------------------------------------------------- #
+
+
+def _hooked(tmp_path: Path, broker: FakeBroker):  # type: ignore[no-untyped-def]
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn)
+    calls: list[str] = []
+    executor = DurableOrderExecutor(
+        broker=broker,
+        repo=OrderRepository(conn),
+        attribution=AttributionLedger(conn),
+        reconcile=_inconclusive,
+        poll_policy=PollPolicy(timeout_seconds=0, post_cancel_polls=1),
+        sleep=lambda _s: None,
+        on_uncertain=calls.append,
+    )
+    return executor, calls
+
+
+def test_an_unknown_outcome_calls_the_uncertainty_hook(tmp_path: Path) -> None:
+    broker = _CancellableBroker()
+    broker.fail_next_submit = True
+    executor, calls = _hooked(tmp_path, broker)
+    with pytest.raises(OrderOutcomeUnknownError):
+        executor.execute(_order())
+    assert len(calls) == 1 and "outcome unknown" in calls[0]
+
+
+def test_an_unresolved_order_calls_the_uncertainty_hook(tmp_path: Path) -> None:
+    broker = FakeBroker()  # cancel is a no-op: a partial fill stays non-terminal
+    broker.fill_quantity = 4
+    executor, calls = _hooked(tmp_path, broker)
+    with pytest.raises(OrderUnresolvedError):
+        executor.execute(_order())
+    assert len(calls) == 1 and "unresolved" in calls[0]
+
+
+def test_a_definite_rejection_or_a_fill_does_not_call_the_hook(tmp_path: Path) -> None:
+    broker = _CancellableBroker()
+    broker.reject_next_submit = True
+    executor, calls = _hooked(tmp_path, broker)
+    with pytest.raises(OrderNotPlacedError):
+        executor.execute(_order("c1"))
+    executor.execute(_order("c2"))  # filled normally
+    assert calls == []
+
+
+def test_a_failing_hook_halts_the_executor_until_restart(tmp_path: Path) -> None:
+    # The kill switch could not be engaged: this process must send nothing more.
+    broker = _CancellableBroker()
+    broker.fail_next_submit = True
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn)
+
+    def boom(reason: str) -> None:
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    executor = DurableOrderExecutor(
+        broker=broker,
+        repo=OrderRepository(conn),
+        attribution=AttributionLedger(conn),
+        reconcile=_inconclusive,
+        poll_policy=PollPolicy(timeout_seconds=0),
+        on_uncertain=boom,
+    )
+    with pytest.raises(ExecutionHaltedError, match="could not engage the kill switch") as ei:
+        executor.execute(_order("c1"))
+    assert isinstance(ei.value.__cause__, OrderOutcomeUnknownError)  # the original, chained
+    sent = len(broker.submitted)
+    with pytest.raises(ExecutionHaltedError):
+        executor.execute(_order("c2"))
+    assert len(broker.submitted) == sent  # refused before any send
+    assert OrderRepository(conn).get("c2") is None  # not even a write-ahead row
+
+
+def test_a_fill_that_cannot_be_recorded_calls_the_hook(tmp_path: Path) -> None:
+    executor, calls = _hooked(tmp_path, _CancellableBroker())
+    repo = executor._repo
+
+    def stuck(*args: object, **kwargs: object) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    repo.complete = stuck  # type: ignore[method-assign]
+    with pytest.raises(OrderUnresolvedError):
+        executor.execute(_order())
+    assert len(calls) == 1 and "not recorded" in calls[0]
+
+
+def test_any_other_failure_after_placement_calls_the_hook(tmp_path: Path) -> None:
+    # Not an unknown/unresolved outcome as such, but the order is at the broker and its fill
+    # is not recorded: just as uncertain.
+    executor, calls = _hooked(tmp_path, _CancellableBroker())
+
+    def broken(*args: object, **kwargs: object) -> bool:
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: fills.broker_order_id")
+
+    executor._repo.complete = broken  # type: ignore[method-assign]
+    with pytest.raises(sqlite3.IntegrityError):
+        executor.execute(_order())
+    assert len(calls) == 1 and "IntegrityError" in calls[0]

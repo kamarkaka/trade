@@ -8,22 +8,29 @@ gate's ``kill_switch`` rule), and flippable by the operator (``trader kill --on/
 On a trip it halts new orders and alerts; **auto-flatten is OFF by default** (forcing exits
 in a disorderly market is itself risky), so existing positions are left as-is.
 
-Auto-trip: ``maybe_trip_on_daily_loss`` is implemented (engage when the day's loss breaches
-the limit). The other §10 auto-trip conditions (repeated broker errors, reconciliation
-mismatch, stale data) are tripped by their owning components calling ``engage(reason,
-"auto")`` as those features land (reconcile/broker-error/stale-data hooks).
+Auto-trips (source ``auto``):
+
+- a daily-loss breach — ``tripping_day_state`` wraps the daemon's day-state provider so the
+  trip happens as soon as a cycle observes the breach. It trips at most **once per session**:
+  after reviewing, an operator may release the switch so that exits can go through (the
+  gate's daily-loss rule still refuses new entries for the rest of the session);
+- an order whose outcome is unknown or unresolved, or any other failure in the durable
+  executor's order path (its hook calls ``engage``), so nothing trades until a human has
+  reconciled it.
+
+A startup reconciliation mismatch blocks the live preflight instead of tripping.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
 from trader.config.models import RiskConfig
-from trader.core import DayState
+from trader.core import Account, DayState
 from trader.observability.alerting import Alerter, AlertEvent, AlertKind
 from trader.observability.logging import get_logger
 
@@ -84,16 +91,22 @@ class KillSwitch:
         self._log.warning("kill switch released", source=source)
 
     def maybe_trip_on_daily_loss(self, day_state: DayState, config: RiskConfig) -> bool:
-        """Auto-trip if the day's loss has breached the configured limit. Returns True if it
-        tripped on this call."""
-        limit = (
-            day_state.start_of_day_equity * Decimal(str(config.daily_loss_limit_pct)) / Decimal(100)
+        """Auto-trip if the day's loss has breached the configured limit — once per session,
+        so an operator's release sticks. Returns True if it tripped on this call."""
+        if not daily_loss_breached(day_state, config):
+            return False
+        session = day_state.trading_date.isoformat()
+        row = self._conn.execute(
+            "SELECT loss_trip_session FROM kill_switch WHERE id = 1"
+        ).fetchone()
+        if row is not None and row[0] == session:
+            return False  # already tripped this session (and since released by an operator)
+        tripped = self.engage(
+            f"daily loss {day_state.loss_today} reached limit {_loss_limit(day_state, config)}",
+            source="auto",
         )
-        if day_state.loss_today >= limit:
-            return self.engage(
-                f"daily loss {day_state.loss_today} reached limit {limit}", source="auto"
-            )
-        return False
+        self._conn.execute("UPDATE kill_switch SET loss_trip_session = ? WHERE id = 1", (session,))
+        return tripped
 
     def _write(self, *, engaged: bool, reason: str | None, source: str) -> None:
         self._conn.execute(
@@ -106,4 +119,41 @@ class KillSwitch:
         )
 
 
-__all__ = ["KillSwitch", "KillSwitchState"]
+def _loss_limit(day_state: DayState, config: RiskConfig) -> Decimal:
+    return day_state.start_of_day_equity * Decimal(str(config.daily_loss_limit_pct)) / Decimal(100)
+
+
+def daily_loss_breached(day_state: DayState, config: RiskConfig) -> bool:
+    return day_state.loss_today >= _loss_limit(day_state, config)
+
+
+# (account, now, kill_switch_engaged) -> DayState — the orchestrator's day-state provider.
+DayStateSource = Callable[[Account, datetime, bool], DayState]
+
+
+def tripping_day_state(
+    source: DayStateSource, switch: KillSwitch, config: RiskConfig
+) -> DayStateSource:
+    """Wrap a day-state provider so a daily-loss breach auto-engages ``switch`` the moment a
+    cycle observes it — the returned state then says engaged, so the gate halts this order
+    and the orchestrator halts every later cycle until an operator releases the switch."""
+
+    def day_state(account: Account, now: datetime, engaged: bool) -> DayState:
+        state = source(account, now, engaged)
+        if state.kill_switch_engaged or not daily_loss_breached(state, config):
+            return state
+        # Tripped now — or engaged by someone else since the caller read the switch.
+        if switch.maybe_trip_on_daily_loss(state, config) or switch.is_engaged():
+            state = replace(state, kill_switch_engaged=True)
+        return state
+
+    return day_state
+
+
+__all__ = [
+    "DayStateSource",
+    "KillSwitch",
+    "KillSwitchState",
+    "daily_loss_breached",
+    "tripping_day_state",
+]

@@ -106,3 +106,59 @@ def test_a_loss_breach_blocks_new_entries(tmp_path: Path) -> None:
     quotes["AAPL"] = [_quote("AAPL", "95")]  # the provider reads this dict: AAPL drops 5%
     later = orch.run_cycle(_Decide([Decision(Action.BUY, "MSFT", 1)]), ["MSFT"], "s1", NOW)
     assert [o.symbol for o in later.rejected] == ["MSFT"]  # -2.5% > 1%: entries refused
+
+
+def test_a_loss_breach_auto_engages_the_kill_switch_and_halts_later_cycles(
+    tmp_path: Path,
+) -> None:
+    from trader.risk.kill_switch import KillSwitch, tripping_day_state
+
+    quotes = {"AAPL": [_quote("AAPL", "100")], "MSFT": [_quote("MSFT", "100")]}
+    roomy = RiskConfig(
+        daily_loss_limit_pct=1,
+        max_order_notional_usd=Decimal("100000"),
+        max_position_size_pct=100,
+        max_gross_exposure_usd=Decimal("1000000"),
+    )
+    orch, _, _ = _pipeline(tmp_path, quotes, roomy)
+    conn = connect(tmp_path / "state.sqlite")
+    switch = KillSwitch(conn)
+    counters = orch._day_state_provider
+    assert counters is not None
+    orch._day_state_provider = tripping_day_state(counters, switch, roomy)
+    orch._kill_switch = switch.is_engaged
+    orch.run_cycle(_Decide([Decision(Action.BUY, "AAPL", 500)]), ["AAPL"], "s1", NOW)
+    quotes["AAPL"] = [_quote("AAPL", "95")]  # -2.5% > 1%
+    breached = orch.run_cycle(_Decide([Decision(Action.BUY, "MSFT", 1)]), ["MSFT"], "s1", NOW)
+    assert breached.rejected and switch.is_engaged() and switch.state().source == "auto"
+    halted = orch.run_cycle(_Decide([Decision(Action.SELL, "AAPL", 500)]), ["AAPL"], "s1", NOW)
+    assert halted.halted and halted.orders == []  # every later cycle halts until released
+
+
+def test_after_releasing_a_loss_trip_exits_go_through_but_entries_do_not(
+    tmp_path: Path,
+) -> None:
+    from trader.risk.kill_switch import KillSwitch, tripping_day_state
+
+    quotes = {"AAPL": [_quote("AAPL", "100")], "MSFT": [_quote("MSFT", "100")]}
+    roomy = RiskConfig(
+        daily_loss_limit_pct=1,
+        max_order_notional_usd=Decimal("100000"),
+        max_position_size_pct=100,
+        max_gross_exposure_usd=Decimal("1000000"),
+    )
+    orch, _, _ = _pipeline(tmp_path, quotes, roomy)
+    switch = KillSwitch(connect(tmp_path / "state.sqlite"))
+    counters = orch._day_state_provider
+    assert counters is not None
+    orch._day_state_provider = tripping_day_state(counters, switch, roomy)
+    orch._kill_switch = switch.is_engaged
+    orch.run_cycle(_Decide([Decision(Action.BUY, "AAPL", 500)]), ["AAPL"], "s1", NOW)
+    quotes["AAPL"] = [_quote("AAPL", "95")]  # -2.5% > 1%: trips
+    orch.run_cycle(_Decide([Decision(Action.BUY, "MSFT", 1)]), ["MSFT"], "s1", NOW)
+    assert switch.is_engaged()
+    switch.disengage()  # the operator reviews and releases it
+    entry = orch.run_cycle(_Decide([Decision(Action.BUY, "MSFT", 1)]), ["MSFT"], "s1", NOW)
+    assert entry.rejected and not switch.is_engaged()  # the loss rule refuses; no re-trip
+    exit_ = orch.run_cycle(_Decide([Decision(Action.SELL, "AAPL", 500)]), ["AAPL"], "s1", NOW)
+    assert [o.symbol for o in exit_.orders] == ["AAPL"] and not switch.is_engaged()

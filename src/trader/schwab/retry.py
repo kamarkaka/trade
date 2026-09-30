@@ -2,7 +2,8 @@
 
 Retries ONLY rate-limit (429) and server (5xx) errors — never auth/4xx. Uses
 exponential backoff with jitter, but honors a server-provided ``Retry-After``
-when present. The sleep function is injectable so tests never wall-sleep.
+when present (capped at ``max_retry_after_seconds``). The sleep function is
+injectable so tests never wall-sleep.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ def make_retrying(
         outcome = retry_state.outcome
         exc = outcome.exception() if outcome is not None else None
         if isinstance(exc, SchwabRateLimitError) and exc.retry_after is not None:
-            return float(exc.retry_after)
+            return min(float(exc.retry_after), config.max_retry_after_seconds)
         return base_wait(retry_state)
 
     return tenacity.Retrying(

@@ -30,6 +30,9 @@ class SchwabClientConfig(BaseModel):
     refresh_token_alert_lead_days: int = Field(default=2, ge=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     max_retries: int = Field(default=4, ge=0)
+    # Ceiling on a server-requested Retry-After wait: a huge or bogus header must not stall
+    # the daemon (and the global cycle lock) for hours.
+    max_retry_after_seconds: float = Field(default=60.0, gt=0)
 
     @field_validator("redirect_uri")
     @classmethod

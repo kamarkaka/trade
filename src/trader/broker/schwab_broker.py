@@ -14,6 +14,10 @@ placed by this process, and through an injected durable lookup (the ``orders`` t
 orders placed before a restart. A ``Fill`` reports Schwab's own order id and symbol, so a
 response for a different order is visible to the caller rather than masked.
 
+Submit failures follow the core ``OrderNotPlacedError`` contract: only a failure that proves
+the order never reached the book becomes ``OrderNotPlacedError``; anything else propagates as
+an UNKNOWN outcome (the placement layer then never re-sends it).
+
 SAFETY: this is the real-money order path. It is only constructed by the go-live wiring
 (M5.6) after the double-confirm; the paper daemon still uses SimBroker and refuses mode=live.
 """
@@ -23,13 +27,41 @@ from __future__ import annotations
 from collections.abc import Callable
 from decimal import Decimal
 
+import httpx
+
 from trader.broker.sim import FeesModel
-from trader.core import Account, Fill, Order, Position
+from trader.core import Account, Fill, Order, OrderNotPlacedError, Position
 from trader.core.enums import Side
 from trader.core.protocols import Clock
 from trader.observability.logging import get_logger
-from trader.schwab.errors import SchwabReadOnlyModeError
+from trader.schwab.errors import (
+    SchwabAuthError,
+    SchwabBadResponseError,
+    SchwabError,
+    SchwabRateLimitError,
+    SchwabReadOnlyModeError,
+    SchwabServerError,
+)
 from trader.schwab.orders import SchwabTradingClient, build_order_json
+
+# Transport failures raised before any byte of the request left the process.
+_NEVER_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+def _definitely_not_placed(exc: Exception) -> bool:
+    """True only when ``exc`` proves the order never reached the book: refused before sending
+    (read-only safe mode, missing/dead credentials), the connection never established, or a
+    definite 4xx rejection (401/403 after a refresh, 429, validation errors) — the server
+    processes nothing on a 4xx [VERIFY]. A 5xx, a timeout or protocol error after sending,
+    or a 2xx without a ``Location`` id leaves the outcome UNKNOWN."""
+    if isinstance(exc, (SchwabReadOnlyModeError, SchwabAuthError, SchwabRateLimitError)):
+        return True
+    if isinstance(exc, _NEVER_SENT):
+        return True
+    if isinstance(exc, (SchwabServerError, SchwabBadResponseError)):
+        return False
+    status = exc.status_code if isinstance(exc, SchwabError) else None
+    return status is not None and 400 <= status < 500
 
 
 class SchwabBroker:
@@ -58,11 +90,12 @@ class SchwabBroker:
         self._log = get_logger("broker.schwab")
 
     def submit_order(self, order: Order) -> str:
+        cid = order.client_order_id
         if self._client.is_read_only:
             # Never silently drop: refuse loudly so the caller/alerting sees it.
-            raise SchwabReadOnlyModeError(
-                f"refusing to submit {order.client_order_id}: client is in READ-ONLY safe mode"
-            )
+            raise OrderNotPlacedError(
+                f"refusing to submit {cid}: client is in READ-ONLY safe mode"
+            ) from SchwabReadOnlyModeError("read-only safe mode")
         order_json = build_order_json(
             symbol=order.symbol,
             side=order.side,
@@ -70,8 +103,13 @@ class SchwabBroker:
             order_type=order.order_type,
             limit_price=order.limit_price,
         )
-        broker_order_id = self._client.place_order(self._account, order_json)
-        self._submitted[broker_order_id] = (order.client_order_id, order.symbol, order.side)
+        try:
+            broker_order_id = self._client.place_order(self._account, order_json)
+        except Exception as exc:
+            if _definitely_not_placed(exc):
+                raise OrderNotPlacedError(f"order {cid} not placed: {type(exc).__name__}") from exc
+            raise  # unknown outcome: the order may be live
+        self._submitted[broker_order_id] = (cid, order.symbol, order.side)
         self._log.info(
             "order submitted",
             cid=order.client_order_id,

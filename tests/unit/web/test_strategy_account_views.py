@@ -155,3 +155,51 @@ def test_account_fragment_is_partial(tmp_path: Path) -> None:
     assert resp.status_code == 200
     assert "<html" not in resp.text.lower()
     assert "Broker-truth positions" in resp.text
+
+
+# --- LR6 review follow-ups -------------------------------------------------------- #
+
+
+def _add_order(db: Path, cid: str, created: str, status: str) -> None:
+    conn = connect(db)
+    conn.execute(
+        "INSERT INTO orders (client_order_id, strategy_id, symbol, side, quantity, order_type, "
+        "tif, status, broker_order_id, created_at, updated_at) VALUES "
+        "(?,'momentum','AAPL','BUY',1,'MARKET','DAY',?,NULL,?,?)",
+        (cid, status, created, created),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_trades_today_counts_the_exchange_session_and_skips_not_placed(tmp_path: Path) -> None:
+    client = _build(tmp_path)  # seeds c1 (FILLED) at 2026-06-29 08:00 EDT
+    db = tmp_path / "trader.sqlite"
+    _add_order(db, "np", NOW.isoformat(), "not_placed")  # never at the broker: not a trade
+    _add_order(db, "prev", "2026-06-29T03:30:00+00:00", "FILLED")  # 23:30 EDT on the 28th
+    _add_order(db, "late", "2026-06-30T03:30:00+00:00", "FILLED")  # 23:30 EDT, still the 29th
+    _add_order(db, "later", "2026-06-30T03:45:00+00:00", "FILLED")  # 23:45 EDT, the 29th
+    # c1 + late + later (a UTC-date bucket would count c1 + prev instead)
+    assert "3 / 6" in client.get("/strategies").text
+
+
+def test_account_page_says_which_session_the_counters_are_for(tmp_path: Path) -> None:
+    body = _build(tmp_path).get("/account").text
+    assert "session 2026-06-29" in body and "not today" not in body
+
+
+def test_account_page_flags_counters_from_an_earlier_session(tmp_path: Path) -> None:
+    client = _build(tmp_path)
+    conn = connect(tmp_path / "trader.sqlite")
+    conn.execute("UPDATE daily_counters SET trading_date = '2026-06-26'")
+    conn.commit()
+    conn.close()
+    body = client.get("/account").text
+    assert "session 2026-06-26" in body and "not today&#39;s session" in body
+
+
+def test_the_web_not_placed_status_matches_the_placement_layer() -> None:
+    from trader.execution.idempotency import NOT_PLACED
+    from trader.web import repository
+
+    assert repository._NOT_PLACED == NOT_PLACED

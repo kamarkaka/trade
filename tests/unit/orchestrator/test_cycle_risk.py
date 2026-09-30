@@ -278,8 +278,9 @@ def test_day_state_is_recomputed_per_order_so_in_cycle_trades_count(tmp_path: Pa
     result = orch.run_cycle(strategy, ["AAPL", "MSFT"], "s1", NOW)
     assert [o.symbol for o in result.orders] == ["AAPL"]
     assert [o.symbol for o in result.rejected] == ["MSFT"]
-    # the cycle-start check-in, then one call per order (the second after the first landed)
-    assert calls == [0, 0, 1]
+    # the cycle-start check-in, one call per order (the second after the first landed), then
+    # the post-cycle refresh of the persisted counters
+    assert calls == [0, 0, 1, 1]
 
 
 def test_explicit_day_state_overrides_the_provider(tmp_path: Path) -> None:
@@ -347,3 +348,33 @@ def test_the_gate_day_state_re_reads_the_kill_switch_per_order(tmp_path: Path) -
     switch["on"] = True  # e.g. an auto-trip after the first order of the cycle
     assert day_state_for(account).kill_switch_engaged
     assert seen == [False, True]
+
+
+def test_counters_are_refreshed_after_a_cycle_that_placed_orders(tmp_path: Path) -> None:
+    seen: list[int] = []
+
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        seen.append(len(broker.submitted))
+        return DayState(now.date(), account.equity, Decimal(0), Decimal(0), 0, Decimal(0))
+
+    orch, broker, _ = _orchestrator(
+        tmp_path, risk=ApproveAllRiskManager(), day_state_provider=provider
+    )
+    orch.run_cycle(_Decide([Decision(Action.BUY, "AAPL", 1)]), ["AAPL"], "s1", NOW)
+    assert seen == [0, 0, 1]  # check-in, the order's gate, then the refresh after it
+
+
+def test_a_failed_counters_refresh_does_not_fail_the_cycle(tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        calls["n"] += 1
+        if calls["n"] == 3:  # the post-cycle refresh
+            raise ValueError("implausible account equity 0")
+        return DayState(now.date(), account.equity, Decimal(0), Decimal(0), 0, Decimal(0))
+
+    orch, broker, _ = _orchestrator(
+        tmp_path, risk=ApproveAllRiskManager(), day_state_provider=provider
+    )
+    result = orch.run_cycle(_Decide([Decision(Action.BUY, "AAPL", 1)]), ["AAPL"], "s1", NOW)
+    assert result.errors == [] and len(broker.submitted) == 1 and calls["n"] == 3

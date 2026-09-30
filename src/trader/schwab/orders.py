@@ -328,6 +328,7 @@ class SchwabAccountSnapshot:
     buying_power: Decimal
     equity: Decimal
     positions: tuple[SchwabPositionRow, ...]
+    start_of_day_equity: Decimal | None = None  # initialBalances.liquidationValue [VERIFY]
 
 
 def parse_account(data: Any) -> SchwabAccountSnapshot:
@@ -347,11 +348,18 @@ def parse_account(data: Any) -> SchwabAccountSnapshot:
                 market_value=_dec(p.get("marketValue", 0), "marketValue"),
             )
         )
+    # The start-of-day balances [VERIFY: initialBalances.liquidationValue is today's opening
+    # account value]. Optional: absent => the daily counters capture it themselves.
+    initial = account.get("initialBalances")
+    sod = initial.get("liquidationValue") if isinstance(initial, dict) else None
     return SchwabAccountSnapshot(
         cash=_dec(balances.get("cashBalance", 0), "cashBalance"),
         buying_power=_dec(balances.get("buyingPower", 0), "buyingPower"),
         equity=_dec(_require(balances, "liquidationValue"), "liquidationValue"),
         positions=tuple(rows),
+        start_of_day_equity=(
+            _dec(sod, "initialBalances.liquidationValue") if sod is not None else None
+        ),
     )
 
 

@@ -167,7 +167,6 @@ def run(
 ) -> None:
     """Run the trading daemon. PAPER (default) uses SimBroker against live quotes (no real
     orders). LIVE places REAL orders and requires mode=live PLUS a second confirmation."""
-    import hashlib
     import time as _time
     import uuid
     from zoneinfo import ZoneInfo
@@ -297,8 +296,8 @@ def run(
                 raise typer.Exit(1)
             trading = SchwabTradingClient(http)
             account_hash = mappings[0].hash_value
-            # Live counters persist per account (a short digest, never the identifier itself).
-            counters_scope = "live:" + hashlib.sha256(account_hash.encode()).hexdigest()[:12]
+            # Live counters persist across restarts; the live state database serves one account.
+            counters_scope = "live"
             broker = SchwabBroker(
                 trading, account_hash, clock=clock, fees=fees, client_id_for=repo.client_id_for
             )

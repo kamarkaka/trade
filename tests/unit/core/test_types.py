@@ -275,3 +275,11 @@ def test_day_state_validates_money_and_counts() -> None:
         make_day_state(trades_today=-1)
     with pytest.raises(TypeError):
         make_day_state(kill_switch_engaged="yes")
+
+
+def test_account_start_of_day_equity_is_optional_and_validated() -> None:
+    assert Account(cash=D("1"), buying_power=D("1"), equity=D("1")).start_of_day_equity is None
+    acct = Account(D("1"), D("1"), D("1"), start_of_day_equity=D("2"))
+    assert acct.start_of_day_equity == D("2")
+    with pytest.raises(TypeError):
+        Account(D("1"), D("1"), D("1"), start_of_day_equity=2.0)  # type: ignore[arg-type]

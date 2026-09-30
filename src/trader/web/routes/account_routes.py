@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 
 from trader.web.auth import require_session
-from trader.web.views import base_context
+from trader.web.views import base_context, exchange_session
 
 router = APIRouter(dependencies=[Depends(require_session)])
 
@@ -55,11 +55,15 @@ def _account_data(request: Request) -> dict[str, Any]:
     loss_pct = _dec(risk.get("daily_loss_limit_pct"))
     loss_limit = (sod_equity * loss_pct / Decimal("100")) if sod_equity > 0 else Decimal("0")
     loss_today = _dec(today.get("loss_today"))
+    session, _, _ = exchange_session(cfg, request.app.state.now())
 
     return {
         "positions": positions,
         "latest_equity": summary.get("latest_equity"),
         "today": today,
+        # The daemon persists the counters as it trades; a row from an earlier session means
+        # nothing has checked in today yet.
+        "counters_current": today.get("trading_date") == session.isoformat(),
         "gross_exposure": str(gross),
         "gross_limit": str(gross_limit) if gross_limit > 0 else None,
         "gross_badge": _proximity(gross, gross_limit),

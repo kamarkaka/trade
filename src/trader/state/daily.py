@@ -3,8 +3,10 @@
 The account-wide daily rails (daily-loss limit, max trades per day) need facts measured per
 EXCHANGE session (the exchange-tz calendar date, not UTC):
 
-- **start-of-day equity** — captured at the first cycle of each session (every cycle calls
-  in, orders or not) and persisted in ``daily_counters``;
+- **start-of-day equity** — the broker's own start-of-session figure when it reports one
+  (``Account.start_of_day_equity``: it includes the opening move a later first cycle would
+  miss); otherwise captured at the first cycle of each session (every cycle calls in,
+  orders or not). Either way it is persisted in ``daily_counters``;
 - **trades today** — orders sent this session, counted from the durable ``orders`` table:
   every write-ahead row except the definitely-not-placed ones (an order whose outcome is
   unknown counts — conservative);
@@ -12,12 +14,13 @@ EXCHANGE session (the exchange-tz calendar date, not UTC):
   mark-to-market, so it includes realized and unrealized P&L; the split is not tracked
   per session (``DayState.realized_pnl`` / ``unrealized_pnl`` stay 0).
 
-Counters are keyed by (session, **scope**) — the equity source they measure. Live uses one
-scope per account, so the start-of-day equity survives restarts; paper uses one scope per
-process, because its SimBroker restarts flat (a persisted paper start-of-day equity would read
-a restart as a loss). A non-positive equity reading is refused (fail closed, the cycle errors
-and alerts) rather than recorded or compared: it would otherwise disable the loss rail for
-the day or trip it spuriously.
+Counters are keyed by (session, **scope**) — the equity source they measure. Live uses the
+constant scope ``live`` (its state database serves one account), so the start-of-day equity
+survives restarts; paper uses one scope per process, because its SimBroker restarts flat (a
+persisted paper start-of-day equity would read a restart as a loss). A non-positive equity
+reading is refused (fail closed: the cycle errors and alerts, and no order is sent) rather
+than recorded or compared — it would otherwise disable the loss rail for the day or trip it
+spuriously. A non-positive broker start-of-day figure is ignored (the capture is used).
 
 Every read refreshes the ``daily_counters`` row so the read-only web UI shows current values.
 """
@@ -71,7 +74,7 @@ class DailyCounters:
                 "daily rails (fail closed)"
             )
         session = self.session_of(at)
-        start_equity = self._start_of_day_equity(session, account.equity)
+        start_equity = self._start_of_day_equity(session, account)
         trades = self.trades_on(session)
         loss = max(Decimal(0), start_equity - account.equity)
         self._conn.execute(
@@ -101,8 +104,19 @@ class DailyCounters:
         ).fetchone()
         return int(row[0])
 
-    def _start_of_day_equity(self, session: date, equity: Decimal) -> Decimal:
+    def _start_of_day_equity(self, session: date, account: Account) -> Decimal:
         key = (session.isoformat(), self._scope)
+        broker_sod = account.start_of_day_equity
+        if broker_sod is not None and broker_sod > 0:
+            self._conn.execute(
+                "INSERT INTO daily_counters "
+                "(trading_date, scope, trades_today, loss_today, start_of_day_equity, updated_at) "
+                "VALUES (?, ?, 0, '0', ?, ?) ON CONFLICT(trading_date, scope) "
+                "DO UPDATE SET start_of_day_equity = excluded.start_of_day_equity",
+                (*key, str(broker_sod), self._stamp()),
+            )
+            return broker_sod
+        equity = account.equity
         # First observation of the session wins; later ones (and restarts) keep it.
         self._conn.execute(
             "INSERT OR IGNORE INTO daily_counters "

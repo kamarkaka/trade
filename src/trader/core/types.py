@@ -147,6 +147,9 @@ class Account:
     cash: Decimal
     buying_power: Decimal
     equity: Decimal
+    # The broker's own start-of-session equity, when it reports one (Schwab). None => the
+    # daily counters capture it at the session's first cycle instead.
+    start_of_day_equity: Decimal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cash", _require_decimal(self.cash, "cash"))
@@ -154,6 +157,12 @@ class Account:
             self, "buying_power", _require_decimal(self.buying_power, "buying_power")
         )
         object.__setattr__(self, "equity", _require_decimal(self.equity, "equity"))
+        if self.start_of_day_equity is not None:
+            object.__setattr__(
+                self,
+                "start_of_day_equity",
+                _require_decimal(self.start_of_day_equity, "start_of_day_equity"),
+            )
 
 
 # --------------------------------------------------------------------------- #

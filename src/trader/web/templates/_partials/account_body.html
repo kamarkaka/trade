@@ -23,6 +23,9 @@
           {% if loss_limit %} / {{ loss_limit }}{% endif %}</td></tr>
     {% if today %}
     <tr><th class="l">Trades today</th><td class="l">{{ today.trades_today }}</td></tr>
+    <tr><th class="l">Counters</th>
+        <td class="l">session {{ today.trading_date }}, updated {{ today.updated_at | nyt }}
+          {% if not counters_current %}<span class="{{ 'warn' | badge }}">not today&#39;s session</span>{% endif %}</td></tr>
     {% endif %}
   </table>
 </section>

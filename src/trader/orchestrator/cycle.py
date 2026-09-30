@@ -266,6 +266,8 @@ class Orchestrator:
                     self._handle_resolved(
                         rd, strategy_id, cycle_id, snapshot, day_state_for, result
                     )
+                if result.orders and day_state is None and self._day_state_provider is not None:
+                    self._refresh_counters(day_state_for, strategy_id)
             except Exception as exc:
                 # Strategy isolation (Appendix C#6): a failing cycle must never crash the
                 # daemon or block other strategies. exc_info carries the traceback to logs
@@ -380,6 +382,18 @@ class Orchestrator:
             )
         )
         result.not_placed.append(order)
+
+    def _refresh_counters(
+        self, day_state_for: Callable[[Account], DayState], strategy_id: str
+    ) -> None:
+        """Re-persist the day's counters after this cycle's orders, so the read-only web UI
+        isn't a cycle behind. Display only (the gate recomputes per order): best effort."""
+        try:
+            day_state_for(self._broker.get_account())
+        except Exception as exc:
+            self._log.warning(
+                "could not refresh the daily counters", strategy_id=strategy_id, error=str(exc)
+            )
 
     def _kill_switch_now(self) -> bool:
         return bool(self._kill_switch()) if self._kill_switch is not None else False

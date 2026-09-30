@@ -175,7 +175,12 @@ class SchwabBroker:
 
     def get_account(self) -> Account:
         snap = self._client.get_account(self._account)
-        return Account(cash=snap.cash, buying_power=snap.buying_power, equity=snap.equity)
+        return Account(
+            cash=snap.cash,
+            buying_power=snap.buying_power,
+            equity=snap.equity,
+            start_of_day_equity=snap.start_of_day_equity,
+        )
 
 
 __all__ = ["TRANSIENT_READ_ERRORS", "SchwabBroker"]

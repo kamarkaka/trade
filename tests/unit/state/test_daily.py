@@ -27,7 +27,7 @@ def _conn(tmp_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _counters(conn: sqlite3.Connection, scope: str = "live:abc", **kw: object) -> DailyCounters:
+def _counters(conn: sqlite3.Connection, scope: str = "live", **kw: object) -> DailyCounters:
     return DailyCounters(conn, tz=NY, scope=scope, **kw)  # type: ignore[arg-type]
 
 
@@ -114,7 +114,7 @@ def test_counters_row_is_kept_current_for_the_web_ui(tmp_path: Path) -> None:
     counters.day_state(_account("9900"), MORNING)
     row = conn.execute(
         "SELECT trades_today, loss_today, start_of_day_equity FROM daily_counters "
-        "WHERE trading_date = '2026-06-29' AND scope = 'live:abc'"
+        "WHERE trading_date = '2026-06-29' AND scope = 'live'"
     ).fetchone()
     assert (row[0], Decimal(row[1]), Decimal(row[2])) == (1, Decimal("100"), Decimal("10000"))
 
@@ -131,3 +131,107 @@ def test_a_scope_is_required(tmp_path: Path) -> None:
 
 def test_not_placed_matches_the_placement_layer() -> None:
     assert daily._NOT_PLACED == idempotency.NOT_PLACED
+
+
+# --- review follow-ups ------------------------------------------------------------ #
+
+
+def _broker_account(equity: str, sod: str | None) -> Account:
+    e = Decimal(equity)
+    return Account(e, e, e, start_of_day_equity=Decimal(sod) if sod is not None else None)
+
+
+def test_the_brokers_start_of_day_equity_wins_over_the_first_cycle(tmp_path: Path) -> None:
+    # The broker's figure includes the opening move a 10:00 first cycle would miss.
+    conn = _conn(tmp_path)
+    counters = _counters(conn)
+    state = counters.day_state(_broker_account("9800", "10500"), MORNING)
+    assert state.start_of_day_equity == Decimal("10500") and state.loss_today == Decimal("700")
+    # A later read without the broker's figure keeps the persisted broker value.
+    later = counters.day_state(_account("9900"), MORNING + timedelta(hours=1))
+    assert later.start_of_day_equity == Decimal("10500") and later.loss_today == Decimal("600")
+    row = conn.execute("SELECT start_of_day_equity FROM daily_counters").fetchone()
+    assert Decimal(row[0]) == Decimal("10500")
+
+
+def test_the_broker_figure_replaces_an_earlier_capture(tmp_path: Path) -> None:
+    counters = _counters(_conn(tmp_path))
+    counters.day_state(_account("9800"), MORNING)  # captured before the broker reported one
+    state = counters.day_state(_broker_account("9800", "10500"), MORNING + timedelta(hours=1))
+    assert state.start_of_day_equity == Decimal("10500")
+    # ... and it is what later reads (without the broker's figure) keep.
+    later = counters.day_state(_account("9800"), MORNING + timedelta(hours=2))
+    assert later.start_of_day_equity == Decimal("10500")
+
+
+@pytest.mark.parametrize("sod", ["0", "-5"])
+def test_a_non_positive_broker_figure_is_ignored(tmp_path: Path, sod: str) -> None:
+    state = _counters(_conn(tmp_path)).day_state(_broker_account("9800", sod), MORNING)
+    assert state.start_of_day_equity == Decimal("9800")  # the capture
+
+
+@pytest.mark.parametrize(
+    ("created_utc", "session"),
+    [
+        # Fall back (2026-11-01, 02:00 EDT -> 01:00 EST): a 25-hour session.
+        ("2026-11-01T03:30:00+00:00", "2026-10-31"),  # 23:30 EDT
+        ("2026-11-01T04:30:00+00:00", "2026-11-01"),  # 00:30 EDT
+        ("2026-11-02T04:30:00+00:00", "2026-11-01"),  # 23:30 EST
+        ("2026-11-02T05:30:00+00:00", "2026-11-02"),  # 00:30 EST
+        # Spring forward (2026-03-08, 02:00 EST -> 03:00 EDT): a 23-hour session.
+        ("2026-03-08T04:30:00+00:00", "2026-03-07"),  # 23:30 EST
+        ("2026-03-08T05:30:00+00:00", "2026-03-08"),  # 00:30 EST
+        ("2026-03-09T03:30:00+00:00", "2026-03-08"),  # 23:30 EDT
+        ("2026-03-09T04:30:00+00:00", "2026-03-09"),  # 00:30 EDT
+    ],
+)
+def test_sessions_bucket_correctly_across_dst(
+    tmp_path: Path, created_utc: str, session: str
+) -> None:
+    from datetime import date
+
+    conn = _conn(tmp_path)
+    _order_row(conn, "o1", created_utc, "FILLED")
+    counters = _counters(conn)
+    counts = {
+        d: counters.trades_on(date.fromisoformat(d))
+        for d in (
+            "2026-10-31",
+            "2026-11-01",
+            "2026-11-02",
+            "2026-03-07",
+            "2026-03-08",
+            "2026-03-09",
+        )
+    }
+    assert counts == {d: int(d == session) for d in counts}
+
+
+def test_migration_006_keeps_existing_counters_under_an_empty_scope(tmp_path: Path) -> None:
+    import shutil
+
+    from trader.state.migrate import MIGRATIONS_DIR
+
+    before = tmp_path / "before_006"
+    before.mkdir()
+    for path in sorted(Path(MIGRATIONS_DIR).glob("*.sql")):
+        if path.name < "006":
+            shutil.copy(path, before / path.name)
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn, before)
+    conn.execute(
+        "INSERT INTO daily_counters (trading_date, trades_today, loss_today, "
+        "start_of_day_equity, updated_at) VALUES ('2026-06-26', 3, '12.5', '10000', 'x')"
+    )
+    conn.commit()
+    run_migrations(conn)
+    rows = conn.execute(
+        "SELECT trading_date, scope, trades_today, loss_today, start_of_day_equity "
+        "FROM daily_counters"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("2026-06-26", "", 3, "12.5", "10000")]
+    # Keyed by (session, scope) now: another scope on the same session is its own row.
+    _counters(conn, scope="live").day_state(
+        _account("10000"), datetime(2026, 6, 26, 15, tzinfo=UTC)
+    )
+    assert conn.execute("SELECT COUNT(*) FROM daily_counters").fetchone()[0] == 2

@@ -168,7 +168,8 @@ on a cycle exception.
 
 5. **Kill switch.** `docker compose exec trader trader kill --on --reason soak-drill`, wait for
    the next slot, and confirm an `audit_log` row `kill_switch_halt` and no new orders; then
-   `trader kill --off`. The switch also engages itself on a daily-loss breach.
+   `trader kill --off`. The switch also engages itself on a daily-loss breach (once per
+   session) and on an order of uncertain fate.
 
 6. **Liveness (healthcheck).** The dedicated heartbeat executor keeps liveness independent of
    cycle work, so a healthy-but-busy daemon stays `healthy`. Note the restart semantics:

@@ -24,6 +24,10 @@ from typing import Any
 
 from trader.web.db import ReadOnlyStateDB
 
+# execution.idempotency.NOT_PLACED (kept local: this module imports no trading code; a test
+# pins the two together).
+_NOT_PLACED = "not_placed"
+
 # Substrings that mark a dict key as secret-bearing -> redact its value. This is KEY-based
 # defense in depth ONLY; the PRIMARY guarantee is the explicit-column SELECTs (no secret column
 # is ever read from the state DB). scrub does NOT value-scan free text (e.g. audit `detail`).
@@ -191,7 +195,7 @@ class MonitoringRepo:
         )
         counters = self._db.query_one(
             "SELECT trading_date, trades_today, loss_today, start_of_day_equity, updated_at "
-            "FROM daily_counters ORDER BY trading_date DESC LIMIT 1"
+            "FROM daily_counters ORDER BY trading_date DESC, updated_at DESC LIMIT 1"
         )
         return {"latest_equity": _row(snapshot), "today": _row(counters)}
 
@@ -213,14 +217,16 @@ class MonitoringRepo:
             )
         )
 
-    def trades_today_by_strategy(self, trading_date: str) -> dict[str, int]:
-        """Order count per strategy for ``trading_date`` (ISO date). Per-strategy daily
-        counters aren't persisted (§12 daily_counters is account-level), so this is derived
-        from the orders' ``created_at`` date — a read-only display approximation."""
+    def trades_today_by_strategy(self, start: datetime, end: datetime) -> dict[str, int]:
+        """Order count per strategy created in ``[start, end)`` — the exchange session. Counted
+        as the gate's trades-today rail counts them: every order except the definitely-not-
+        placed. Compared as instants (julianday), so any stored UTC offset buckets correctly.
+        (Per-strategy counters aren't persisted; §12 daily_counters is account-level.)"""
         rows = self._db.query(
             "SELECT strategy_id, COUNT(*) AS n FROM orders "
-            "WHERE substr(created_at, 1, 10) = ? GROUP BY strategy_id",
-            (trading_date,),
+            "WHERE julianday(created_at) >= julianday(?) AND julianday(created_at) < julianday(?) "
+            "AND status != ? GROUP BY strategy_id",
+            (start.isoformat(), end.isoformat(), _NOT_PLACED),
         )
         return {str(r["strategy_id"]): int(r["n"]) for r in rows}
 

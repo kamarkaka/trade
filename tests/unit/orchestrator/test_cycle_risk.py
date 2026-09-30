@@ -80,6 +80,7 @@ def _orchestrator(
     risk: object,
     broker: FakeBroker | None = None,
     quotes: dict[str, list[Quote]] | None = None,
+    day_state_provider: object | None = None,
 ) -> tuple[Orchestrator, FakeBroker, AttributionLedger]:
     conn = connect(tmp_path / "s.sqlite")
     run_migrations(conn)
@@ -99,6 +100,7 @@ def _orchestrator(
         attribution=attribution,
         sizer=sizer,
         risk=risk,  # type: ignore[arg-type]
+        day_state_provider=day_state_provider,  # type: ignore[arg-type]
     )
     return orch, broker, attribution
 
@@ -244,3 +246,135 @@ def test_real_gate_rejects_unpriceable_symbol(tmp_path: Path) -> None:
     assert broker.submitted == []
     assert result.missing_symbols == ["NOPE"]
     assert len(result.rejected) == 1
+
+
+def test_day_state_is_recomputed_per_order_so_in_cycle_trades_count(tmp_path: Path) -> None:
+    # max_trades_per_day=1 and a durable-style provider that counts submitted orders: the
+    # second order of the SAME cycle must see the first and be rejected.
+    broker = _FillingBroker()
+    calls: list[int] = []
+
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        calls.append(len(broker.submitted))
+        return DayState(
+            trading_date=now.date(),
+            start_of_day_equity=account.equity,
+            realized_pnl=Decimal(0),
+            unrealized_pnl=Decimal(0),
+            trades_today=len(broker.submitted),
+            loss_today=Decimal(0),
+            kill_switch_engaged=engaged,
+        )
+
+    risk = RiskManager(account_config=RiskConfig(max_trades_per_day=1), clock=FakeClock(NOW))
+    orch, broker, _ = _orchestrator(
+        tmp_path,
+        risk=risk,
+        broker=broker,
+        quotes={"AAPL": [_quote_for("AAPL")], "MSFT": [_quote_for("MSFT")]},
+        day_state_provider=provider,  # the daemon injects DailyCounters.day_state
+    )
+    strategy = _Decide([Decision(Action.BUY, "AAPL", 1), Decision(Action.BUY, "MSFT", 1)])
+    result = orch.run_cycle(strategy, ["AAPL", "MSFT"], "s1", NOW)
+    assert [o.symbol for o in result.orders] == ["AAPL"]
+    assert [o.symbol for o in result.rejected] == ["MSFT"]
+    # the cycle-start check-in, one call per order (the second after the first landed), then
+    # the post-cycle refresh of the persisted counters
+    assert calls == [0, 0, 1, 1]
+
+
+def test_explicit_day_state_overrides_the_provider(tmp_path: Path) -> None:
+    risk = RiskManager(account_config=RiskConfig(max_trades_per_day=5), clock=FakeClock(NOW))
+
+    def unused(*_args: object) -> DayState:
+        raise AssertionError("an explicit day state must win over the provider")
+
+    orch, _, _ = _orchestrator(tmp_path, risk=risk, day_state_provider=unused)
+    explicit = DayState(NOW.date(), Decimal("100000"), Decimal(0), Decimal(0), 5, Decimal(0))
+    result = orch.run_cycle(
+        _Decide([Decision(Action.BUY, "AAPL", 1)]), ["AAPL"], "s1", NOW, explicit
+    )
+    assert result.orders == [] and len(result.rejected) == 1  # 5 trades already: over the cap
+
+
+def test_every_cycle_checks_in_even_without_orders(tmp_path: Path) -> None:
+    # The session's start-of-day equity must be captured at its first cycle, not at the
+    # first order (a no-order morning followed by a loss would otherwise set SOD late).
+    seen: list[Decimal] = []
+
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        seen.append(account.equity)
+        return DayState(now.date(), account.equity, Decimal(0), Decimal(0), 0, Decimal(0))
+
+    orch, _, _ = _orchestrator(tmp_path, risk=ApproveAllRiskManager(), day_state_provider=provider)
+    orch.run_cycle(_Decide([]), ["AAPL"], "s1", NOW)  # no decisions at all
+    assert seen == [Decimal("100000")]
+
+
+def test_implausible_equity_fails_the_cycle_before_the_strategy_runs(tmp_path: Path) -> None:
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        raise ValueError("implausible account equity 0")
+
+    decided: list[bool] = []
+
+    class _Spy(_Decide):
+        def decide(self, *args: object, **kwargs: object) -> Sequence[Decision]:  # type: ignore[override]
+            decided.append(True)
+            return []
+
+    orch, broker, _ = _orchestrator(
+        tmp_path, risk=ApproveAllRiskManager(), day_state_provider=provider
+    )
+    result = orch.run_cycle(_Spy([]), ["AAPL"], "s1", NOW)
+    assert result.errors and decided == [] and broker.submitted == []
+
+
+def test_the_gate_day_state_re_reads_the_kill_switch_per_order(tmp_path: Path) -> None:
+    # Defense in depth behind the orchestrator's own mid-cycle check: the day state handed to
+    # the gate carries the kill switch as read for THAT order, not as read at cycle start.
+    switch = {"on": False}
+    seen: list[bool] = []
+
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        seen.append(engaged)
+        return DayState(now.date(), account.equity, Decimal(0), Decimal(0), 0, Decimal(0), engaged)
+
+    risk = RiskManager(account_config=RiskConfig(), clock=FakeClock(NOW))
+    orch, _, _ = _orchestrator(tmp_path, risk=risk, day_state_provider=provider)
+    orch._kill_switch = lambda: switch["on"]
+    day_state_for = orch._day_state_source(None, NOW, False)
+    account = FakeBroker().get_account()
+    assert not day_state_for(account).kill_switch_engaged
+    switch["on"] = True  # e.g. an auto-trip after the first order of the cycle
+    assert day_state_for(account).kill_switch_engaged
+    assert seen == [False, True]
+
+
+def test_counters_are_refreshed_after_a_cycle_that_placed_orders(tmp_path: Path) -> None:
+    seen: list[int] = []
+
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        seen.append(len(broker.submitted))
+        return DayState(now.date(), account.equity, Decimal(0), Decimal(0), 0, Decimal(0))
+
+    orch, broker, _ = _orchestrator(
+        tmp_path, risk=ApproveAllRiskManager(), day_state_provider=provider
+    )
+    orch.run_cycle(_Decide([Decision(Action.BUY, "AAPL", 1)]), ["AAPL"], "s1", NOW)
+    assert seen == [0, 0, 1]  # check-in, the order's gate, then the refresh after it
+
+
+def test_a_failed_counters_refresh_does_not_fail_the_cycle(tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        calls["n"] += 1
+        if calls["n"] == 3:  # the post-cycle refresh
+            raise ValueError("implausible account equity 0")
+        return DayState(now.date(), account.equity, Decimal(0), Decimal(0), 0, Decimal(0))
+
+    orch, broker, _ = _orchestrator(
+        tmp_path, risk=ApproveAllRiskManager(), day_state_provider=provider
+    )
+    result = orch.run_cycle(_Decide([Decision(Action.BUY, "AAPL", 1)]), ["AAPL"], "s1", NOW)
+    assert result.errors == [] and len(broker.submitted) == 1 and calls["n"] == 3

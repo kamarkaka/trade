@@ -58,6 +58,8 @@ from trader.state.attribution import AttributionLedger
 from .lock import CycleLock
 
 Sizer = Callable[[Decision, str], Order | None]
+# (account, now, kill_switch_engaged) -> the gate's DayState, from durable per-session state.
+DayStateProvider = Callable[[Account, datetime, bool], DayState]
 
 
 class RiskManager(Protocol):
@@ -189,6 +191,7 @@ class Orchestrator:
         audit: AuditSink | None = None,
         kill_switch: Callable[[], bool] | None = None,
         executor: OrderExecutor | None = None,
+        day_state_provider: DayStateProvider | None = None,
     ) -> None:
         self._broker = broker
         self._data = data
@@ -205,6 +208,9 @@ class Orchestrator:
         # placement, bounded polling, atomic completion). None => the direct path below
         # (submit + one read against the synchronous SimBroker), used by backtests.
         self._executor = executor
+        # Real per-session counters (start-of-day equity, trades/loss today). None => the
+        # neutral default day state (backtests), under which the daily rails never trip.
+        self._day_state_provider = day_state_provider
         self._log = get_logger("orchestrator")
 
     def run_cycle(
@@ -222,7 +228,7 @@ class Orchestrator:
                 # Kill switch: checked at the START of every cycle (design §10). If engaged,
                 # skip the whole cycle -- never decide or submit. The gate also rejects per
                 # order pre-submit (defense in depth via day_state.kill_switch_engaged).
-                engaged = bool(self._kill_switch()) if self._kill_switch is not None else False
+                engaged = self._kill_switch_now()
                 if engaged:
                     self._log.warning("kill switch engaged; cycle skipped", strategy_id=strategy_id)
                     self._audit.record(
@@ -234,15 +240,16 @@ class Orchestrator:
                 snapshot = MarketSnapshot(asof=now, quotes=quotes)
                 positions = self._broker.get_positions()
                 account = self._broker.get_account()
+                day_state_for = self._day_state_source(day_state, now, engaged)
+                if day_state is None and self._day_state_provider is not None:
+                    # Every cycle checks in, orders or not: the session's start-of-day equity
+                    # is captured at its first cycle, and implausible equity fails the cycle
+                    # closed before the strategy even runs.
+                    day_state_for(account)
                 decisions = list(
                     strategy.decide(snapshot, positions, account, self._data, self._clock)
                 )
                 result.decisions = decisions
-                ds = (
-                    day_state
-                    if day_state is not None
-                    else self._default_day_state(account, now, kill_switch_engaged=engaged)
-                )
                 # Reconcile same-ticker conflicts across the cycle's decisions BEFORE sizing
                 # (net default), then route each resulting order through the chokepoint.
                 resolved = self._risk.resolve_conflicts([(strategy_id, d) for d in decisions])
@@ -256,7 +263,11 @@ class Orchestrator:
                         )
                         result.halted = True
                         break
-                    self._handle_resolved(rd, strategy_id, cycle_id, snapshot, ds, result)
+                    self._handle_resolved(
+                        rd, strategy_id, cycle_id, snapshot, day_state_for, result
+                    )
+                if result.orders and day_state is None and self._day_state_provider is not None:
+                    self._refresh_counters(day_state_for, strategy_id)
             except Exception as exc:
                 # Strategy isolation (Appendix C#6): a failing cycle must never crash the
                 # daemon or block other strategies. exc_info carries the traceback to logs
@@ -277,7 +288,7 @@ class Orchestrator:
         strategy_id: str,
         cycle_id: str,
         snapshot: MarketSnapshot,
-        day_state: DayState,
+        day_state_for: Callable[[Account], DayState],
         result: CycleResult,
     ) -> None:
         decision = Decision(rd.action, rd.symbol, rd.quantity, rd.limit_price)
@@ -295,7 +306,9 @@ class Orchestrator:
         # still count toward the resulting-position caps).
         positions = self._broker.get_positions()
         account = self._broker.get_account()
-        verdict = self._risk.check(order, positions, account, quote, day_state)
+        # Day state per ORDER too: an order placed earlier in this cycle counts toward
+        # trades-today, and the loss is measured against the current equity.
+        verdict = self._risk.check(order, positions, account, quote, day_state_for(account))
         if not verdict.approved:
             self._reject(order, strategy_id, cycle_id, result, "; ".join(verdict.reasons))
             return
@@ -370,6 +383,18 @@ class Orchestrator:
         )
         result.not_placed.append(order)
 
+    def _refresh_counters(
+        self, day_state_for: Callable[[Account], DayState], strategy_id: str
+    ) -> None:
+        """Re-persist the day's counters after this cycle's orders, so the read-only web UI
+        isn't a cycle behind. Display only (the gate recomputes per order): best effort."""
+        try:
+            day_state_for(self._broker.get_account())
+        except Exception as exc:
+            self._log.warning(
+                "could not refresh the daily counters", strategy_id=strategy_id, error=str(exc)
+            )
+
     def _kill_switch_now(self) -> bool:
         return bool(self._kill_switch()) if self._kill_switch is not None else False
 
@@ -406,14 +431,27 @@ class Orchestrator:
         )
         result.rejected.append(order)
 
+    def _day_state_source(
+        self, explicit: DayState | None, now: datetime, engaged: bool
+    ) -> Callable[[Account], DayState]:
+        """account -> DayState for this cycle: an explicit day state (tests) wins, then the
+        injected durable provider, then the neutral default."""
+        if explicit is not None:
+            return lambda _account: explicit
+        provider = self._day_state_provider
+        if provider is not None:
+            # Re-read the kill switch per order: an auto-trip earlier in this cycle (or an
+            # operator's engage) must reach the gate before the next order.
+            return lambda account: provider(account, now, self._kill_switch_now())
+        return lambda account: self._default_day_state(account, now, kill_switch_engaged=engaged)
+
     @staticmethod
     def _default_day_state(
         account: Account, now: datetime, *, kill_switch_engaged: bool = False
     ) -> DayState:
-        # Neutral day-state for callers that don't track one yet. loss/trades = 0 means the
-        # daily-loss / trade-count rails do NOT trip under this default, so paper mode does
-        # not enforce those two account-wide rails; real per-day counters / start-of-day
-        # equity (from the daily_counters table) are wired with live trading in M5.
+        # Neutral day-state for callers without a provider (backtests). loss/trades = 0
+        # means the daily-loss / trade-count rails do NOT trip under this default; the
+        # paper/live daemon injects state.daily.DailyCounters instead.
         return DayState(
             trading_date=now.date(),
             start_of_day_equity=account.equity,

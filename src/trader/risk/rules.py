@@ -205,7 +205,7 @@ def daily_loss_limit(order: Order, ctx: RuleContext) -> RuleResult:
 
 def max_trades_per_day(order: Order, ctx: RuleContext) -> RuleResult:
     if _reduces_or_holds_exposure(order, ctx):
-        return RuleResult(ok=True)  # an exit never counts against the entry budget
+        return RuleResult(ok=True)  # never blocks an exit (exits still count toward the total)
     if ctx.day_state.trades_today >= ctx.config.max_trades_per_day:
         return _reject(
             f"trades today {ctx.day_state.trades_today} hit limit {ctx.config.max_trades_per_day}"

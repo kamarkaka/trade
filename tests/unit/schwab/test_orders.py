@@ -407,3 +407,10 @@ def test_order_shape_fields_and_lenient_unparsed_entry_time() -> None:
     first, second = listing.unparsed
     assert first.entered_time == datetime(2026, 6, 29, 14, 0, tzinfo=UTC)
     assert second.entered_time is None  # unparseable time -> unknown (blocks conservatively)
+
+
+def test_parse_account_reads_the_start_of_day_value_when_present() -> None:
+    data = _fixture("account_with_positions.json")
+    assert parse_account(data).start_of_day_equity is None  # absent: the counters capture it
+    data["securitiesAccount"]["initialBalances"] = {"liquidationValue": "12000.00"}
+    assert parse_account(data).start_of_day_equity == Decimal("12000.00")

@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 
 from trader.web.auth import require_session
-from trader.web.views import base_context
+from trader.web.views import base_context, exchange_session
 
 router = APIRouter(dependencies=[Depends(require_session)])
 
@@ -24,8 +24,8 @@ def _strategies_data(request: Request) -> dict[str, Any]:
     cfg = repo.config_view()
     risk = cfg.get("risk", {}) if isinstance(cfg.get("risk"), dict) else {}
     default_limit = risk.get("max_trades_per_day")
-    today = request.app.state.now().date().isoformat()
-    counts = repo.trades_today_by_strategy(today)
+    _, start, end = exchange_session(cfg, request.app.state.now())
+    counts = repo.trades_today_by_strategy(start, end)
     strategies = []
     for sb in cfg.get("strategies", []) or []:
         sid = sb.get("id")

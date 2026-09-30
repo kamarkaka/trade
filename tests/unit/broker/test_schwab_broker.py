@@ -269,6 +269,15 @@ def test_get_account_maps_balances() -> None:
     assert account.cash == Decimal("1000")
     assert account.buying_power == Decimal("5000")
     assert account.equity == Decimal("12345.67")
+    assert account.start_of_day_equity is None
+
+
+def test_get_account_passes_the_brokers_start_of_day_equity() -> None:
+    from dataclasses import replace
+
+    client = _FakeTradingClient()
+    client._account = replace(client._account, start_of_day_equity=Decimal("12000"))
+    assert _broker(client).get_account().start_of_day_equity == Decimal("12000")
 
 
 # --- fee estimate (LR12) ---------------------------------------------------------- #

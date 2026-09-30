@@ -58,6 +58,8 @@ from trader.state.attribution import AttributionLedger
 from .lock import CycleLock
 
 Sizer = Callable[[Decision, str], Order | None]
+# (account, now, kill_switch_engaged) -> the gate's DayState, from durable per-session state.
+DayStateProvider = Callable[[Account, datetime, bool], DayState]
 
 
 class RiskManager(Protocol):
@@ -189,6 +191,7 @@ class Orchestrator:
         audit: AuditSink | None = None,
         kill_switch: Callable[[], bool] | None = None,
         executor: OrderExecutor | None = None,
+        day_state_provider: DayStateProvider | None = None,
     ) -> None:
         self._broker = broker
         self._data = data
@@ -205,6 +208,9 @@ class Orchestrator:
         # placement, bounded polling, atomic completion). None => the direct path below
         # (submit + one read against the synchronous SimBroker), used by backtests.
         self._executor = executor
+        # Real per-session counters (start-of-day equity, trades/loss today). None => the
+        # neutral default day state (backtests), under which the daily rails never trip.
+        self._day_state_provider = day_state_provider
         self._log = get_logger("orchestrator")
 
     def run_cycle(
@@ -238,11 +244,7 @@ class Orchestrator:
                     strategy.decide(snapshot, positions, account, self._data, self._clock)
                 )
                 result.decisions = decisions
-                ds = (
-                    day_state
-                    if day_state is not None
-                    else self._default_day_state(account, now, kill_switch_engaged=engaged)
-                )
+                day_state_for = self._day_state_source(day_state, now, engaged)
                 # Reconcile same-ticker conflicts across the cycle's decisions BEFORE sizing
                 # (net default), then route each resulting order through the chokepoint.
                 resolved = self._risk.resolve_conflicts([(strategy_id, d) for d in decisions])
@@ -256,7 +258,9 @@ class Orchestrator:
                         )
                         result.halted = True
                         break
-                    self._handle_resolved(rd, strategy_id, cycle_id, snapshot, ds, result)
+                    self._handle_resolved(
+                        rd, strategy_id, cycle_id, snapshot, day_state_for, result
+                    )
             except Exception as exc:
                 # Strategy isolation (Appendix C#6): a failing cycle must never crash the
                 # daemon or block other strategies. exc_info carries the traceback to logs
@@ -277,7 +281,7 @@ class Orchestrator:
         strategy_id: str,
         cycle_id: str,
         snapshot: MarketSnapshot,
-        day_state: DayState,
+        day_state_for: Callable[[Account], DayState],
         result: CycleResult,
     ) -> None:
         decision = Decision(rd.action, rd.symbol, rd.quantity, rd.limit_price)
@@ -295,7 +299,9 @@ class Orchestrator:
         # still count toward the resulting-position caps).
         positions = self._broker.get_positions()
         account = self._broker.get_account()
-        verdict = self._risk.check(order, positions, account, quote, day_state)
+        # Day state per ORDER too: an order placed earlier in this cycle counts toward
+        # trades-today, and the loss is measured against the current equity.
+        verdict = self._risk.check(order, positions, account, quote, day_state_for(account))
         if not verdict.approved:
             self._reject(order, strategy_id, cycle_id, result, "; ".join(verdict.reasons))
             return
@@ -406,14 +412,25 @@ class Orchestrator:
         )
         result.rejected.append(order)
 
+    def _day_state_source(
+        self, explicit: DayState | None, now: datetime, engaged: bool
+    ) -> Callable[[Account], DayState]:
+        """account -> DayState for this cycle: an explicit day state (tests) wins, then the
+        injected durable provider, then the neutral default."""
+        if explicit is not None:
+            return lambda _account: explicit
+        provider = self._day_state_provider
+        if provider is not None:
+            return lambda account: provider(account, now, engaged)
+        return lambda account: self._default_day_state(account, now, kill_switch_engaged=engaged)
+
     @staticmethod
     def _default_day_state(
         account: Account, now: datetime, *, kill_switch_engaged: bool = False
     ) -> DayState:
-        # Neutral day-state for callers that don't track one yet. loss/trades = 0 means the
-        # daily-loss / trade-count rails do NOT trip under this default, so paper mode does
-        # not enforce those two account-wide rails; real per-day counters / start-of-day
-        # equity (from the daily_counters table) are wired with live trading in M5.
+        # Neutral day-state for callers without a provider (backtests). loss/trades = 0
+        # means the daily-loss / trade-count rails do NOT trip under this default; the
+        # paper/live daemon injects state.daily.DailyCounters instead.
         return DayState(
             trading_date=now.date(),
             start_of_day_equity=account.equity,

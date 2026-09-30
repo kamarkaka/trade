@@ -80,6 +80,7 @@ def _orchestrator(
     risk: object,
     broker: FakeBroker | None = None,
     quotes: dict[str, list[Quote]] | None = None,
+    day_state_provider: object | None = None,
 ) -> tuple[Orchestrator, FakeBroker, AttributionLedger]:
     conn = connect(tmp_path / "s.sqlite")
     run_migrations(conn)
@@ -99,6 +100,7 @@ def _orchestrator(
         attribution=attribution,
         sizer=sizer,
         risk=risk,  # type: ignore[arg-type]
+        day_state_provider=day_state_provider,  # type: ignore[arg-type]
     )
     return orch, broker, attribution
 
@@ -244,3 +246,50 @@ def test_real_gate_rejects_unpriceable_symbol(tmp_path: Path) -> None:
     assert broker.submitted == []
     assert result.missing_symbols == ["NOPE"]
     assert len(result.rejected) == 1
+
+
+def test_day_state_is_recomputed_per_order_so_in_cycle_trades_count(tmp_path: Path) -> None:
+    # max_trades_per_day=1 and a durable-style provider that counts submitted orders: the
+    # second order of the SAME cycle must see the first and be rejected.
+    broker = _FillingBroker()
+    calls: list[int] = []
+
+    def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        calls.append(len(broker.submitted))
+        return DayState(
+            trading_date=now.date(),
+            start_of_day_equity=account.equity,
+            realized_pnl=Decimal(0),
+            unrealized_pnl=Decimal(0),
+            trades_today=len(broker.submitted),
+            loss_today=Decimal(0),
+            kill_switch_engaged=engaged,
+        )
+
+    risk = RiskManager(account_config=RiskConfig(max_trades_per_day=1), clock=FakeClock(NOW))
+    orch, broker, _ = _orchestrator(
+        tmp_path,
+        risk=risk,
+        broker=broker,
+        quotes={"AAPL": [_quote_for("AAPL")], "MSFT": [_quote_for("MSFT")]},
+        day_state_provider=provider,  # the daemon injects DailyCounters.day_state
+    )
+    strategy = _Decide([Decision(Action.BUY, "AAPL", 1), Decision(Action.BUY, "MSFT", 1)])
+    result = orch.run_cycle(strategy, ["AAPL", "MSFT"], "s1", NOW)
+    assert [o.symbol for o in result.orders] == ["AAPL"]
+    assert [o.symbol for o in result.rejected] == ["MSFT"]
+    assert calls == [0, 1]  # one provider call per order, after the first order landed
+
+
+def test_explicit_day_state_overrides_the_provider(tmp_path: Path) -> None:
+    risk = RiskManager(account_config=RiskConfig(max_trades_per_day=5), clock=FakeClock(NOW))
+
+    def unused(*_args: object) -> DayState:
+        raise AssertionError("an explicit day state must win over the provider")
+
+    orch, _, _ = _orchestrator(tmp_path, risk=risk, day_state_provider=unused)
+    explicit = DayState(NOW.date(), Decimal("100000"), Decimal(0), Decimal(0), 5, Decimal(0))
+    result = orch.run_cycle(
+        _Decide([Decision(Action.BUY, "AAPL", 1)]), ["AAPL"], "s1", NOW, explicit
+    )
+    assert result.orders == [] and len(result.rejected) == 1  # 5 trades already: over the cap

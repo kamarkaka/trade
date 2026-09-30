@@ -135,3 +135,33 @@ def test_register_secret_ignores_empty() -> None:
     configure_logging(stream=buf)
     get_logger().info("plain message")
     assert "plain message" in buf.getvalue()
+
+
+def test_exception_rendered_without_frame_locals_and_scrubbed() -> None:
+    # structlog's default (rich) renderer prints frame locals — e.g. a bearer token held in
+    # the HTTP layer. Ours renders a plain traceback string and scrubs it like any field.
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    register_secret("REGISTERED-TOKEN-123")
+
+    def _leaky() -> None:
+        bearer = "LOCAL-ONLY-SECRET-456"  # a local: must never be rendered
+        raise RuntimeError(f"request failed for REGISTERED-TOKEN-123 ({len(bearer)})")
+
+    try:
+        _leaky()
+    except RuntimeError:
+        get_logger().error("cycle failed", exc_info=True)
+    out = buf.getvalue()
+    assert "LOCAL-ONLY-SECRET-456" not in out  # no locals
+    assert "REGISTERED-TOKEN-123" not in out  # scrubbed inside the traceback text
+    record = _one(buf)
+    assert "Traceback" in record["exception"] and "RuntimeError" in record["exception"]
+
+
+def test_default_output_goes_to_the_current_stderr(capsys: pytest.CaptureFixture[str]) -> None:
+    configure_logging()
+    get_logger().info("to stderr")
+    captured = capsys.readouterr()
+    assert captured.out == ""  # stdout stays clean for command output
+    assert json.loads(captured.err.strip())["event"] == "to stderr"

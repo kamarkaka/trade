@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 
+from trader.observability.logging import configure_logging
 from trader.web.app import create_app
 from trader.web.settings import WebSettings
 
@@ -21,6 +22,7 @@ _PORT = 8000
 def main() -> None:
     import uvicorn
 
+    configure_logging(os.environ.get("TRADER_LOG_LEVEL", "INFO"))  # scrubbed, no locals
     settings = WebSettings.from_env(dict(os.environ))
     uvicorn.run(create_app(settings), host=_HOST, port=_PORT, log_level="info")
 

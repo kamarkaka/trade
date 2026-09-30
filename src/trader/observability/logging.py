@@ -3,10 +3,14 @@
 ``configure_logging()`` installs a structlog pipeline that renders one JSON object
 per line. A scrubbing processor redacts sensitive keys (e.g. ``access_token``,
 ``authorization``, raw ``account_number``) and any registered secret literals, so
-tokens never reach the logs even if accidentally passed. ``bind_cycle_id()``
-attaches a correlation id (via contextvars) that ties a trade cycle's records
-together (inputs → decision → order → fill). Reused by the Schwab client (M1) and
-the web UI (M7).
+tokens never reach the logs even if accidentally passed. Exceptions are rendered as a
+plain traceback string WITHOUT frame locals (structlog's default rich renderer shows
+locals — e.g. a bearer token in the HTTP layer) and are scrubbed like any other field.
+Every entrypoint (the CLI, ``trader-web``) must call it before doing any work.
+
+``bind_cycle_id()`` attaches a correlation id (via contextvars) that ties a trade
+cycle's records together (inputs → decision → order → fill). Reused by the Schwab
+client (M1) and the web UI (M7).
 """
 
 from __future__ import annotations
@@ -94,16 +98,26 @@ def _level_to_int(level: str | int) -> int:
     return logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
 
 
+class _StderrLoggerFactory:
+    """Resolve ``sys.stderr`` when a log line is written, not when logging is configured,
+    so a swapped or closed stream (test runners, redirected output) is never written to."""
+
+    def __call__(self, *args: Any) -> structlog.PrintLogger:
+        return structlog.PrintLogger(file=sys.stderr)
+
+
 def configure_logging(
     level: str | int = "INFO",
     *,
     json_output: bool = True,
     stream: TextIO | None = None,
 ) -> None:
-    """Configure structlog: contextvars + level + ISO-UTC timestamp + scrub + render.
+    """Configure structlog: contextvars + level + ISO-UTC timestamp + traceback text +
+    scrub + render.
 
-    ``stream`` lets tests capture output; production logs to stdout (one JSON line
-    per event, collected by the Docker json-file driver, §16).
+    ``stream`` lets tests capture output; otherwise logs go to stderr (one JSON line per
+    event, collected by the Docker json-file driver, §16), keeping stdout for command
+    output.
     """
     renderer: Any = (
         structlog.processors.JSONRenderer()
@@ -115,11 +129,16 @@ def configure_logging(
             merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", utc=True),
+            # exc_info -> a plain traceback string (no frame locals), BEFORE scrubbing so
+            # registered secret literals inside exception text are redacted too.
+            structlog.processors.format_exc_info,
             _scrub_processor,
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(_level_to_int(level)),
-        logger_factory=structlog.PrintLoggerFactory(file=stream or sys.stdout),
+        logger_factory=(
+            structlog.PrintLoggerFactory(file=stream) if stream else _StderrLoggerFactory()
+        ),
         cache_logger_on_first_use=False,
     )
 

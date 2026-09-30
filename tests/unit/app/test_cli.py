@@ -204,3 +204,18 @@ def test_data_fetch_rejects_non_daily(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_console_script_entrypoint_is_callable() -> None:
     assert callable(app)  # Typer instances are callable (console_scripts entry point)
+
+
+def test_cli_installs_the_scrubbed_logging_pipeline() -> None:
+    # Every command runs behind the app callback, which must replace structlog's defaults
+    # (tracebacks with frame locals, no secret scrubbing) with our pipeline.
+    import structlog
+
+    from trader.observability.logging import _scrub_processor
+
+    structlog.reset_defaults()
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    processors = structlog.get_config()["processors"]
+    assert _scrub_processor in processors
+    assert structlog.processors.format_exc_info in processors

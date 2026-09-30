@@ -12,17 +12,23 @@ IMPORTANT (M5.6): the live submit path is **not yet idempotent** — the at-most
 unconditional blocker so ``trader run`` **refuses every live start** and no real order can be
 placed. M5.6 ships the gate machinery; M5.7 turns it on with the first real order.
 
+After these static checks pass, ``trader run`` connects and runs the startup reconciliation
+gate (``reconcile_before_live``): every open order settled and positions matching the
+acknowledged baseline before trading — an unclean account refuses to start (and the refusal
+latches the kill switch).
+
 These functions are pure/inspectable so the safety gate is CI-enforced, not manual.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
 from trader.config.models import AppConfig
 from trader.core.types import StrategyBinding
+from trader.execution.account_reconcile import AccountReconcileReport
 from trader.observability.alerting import Alerter, AlertEvent, AlertKind
 
 # The out-of-band confirmation signals (the SECOND signal beyond mode: live).
@@ -88,12 +94,12 @@ def live_preflight(
     kill_switch_engaged: bool,
     token_valid: bool,
     alert_channel_count: int,
-    reconcile_clean: bool = True,
 ) -> list[PreflightProblem]:
-    """Conservative go-live checks. Returns the list of problems (empty == cleared to start).
+    """Conservative go-live checks that need no broker connection. Returns the list of
+    problems (empty == cleared to connect; the startup reconciliation gate follows).
 
-    Inputs that need the DB / token store / network (kill switch, token, reconcile, alert
-    channels) are computed by the caller and passed in, keeping this pure + unit-testable."""
+    Inputs that need the DB / token store (kill switch, token, alert channels) are computed by
+    the caller and passed in, keeping this pure + unit-testable."""
     problems: list[PreflightProblem] = []
 
     if not LIVE_ORDER_PATH_READY:
@@ -153,13 +159,29 @@ def live_preflight(
                 "token", "no valid Schwab token; run `trader reauth` before going live"
             )
         )
-    if not reconcile_clean:
-        problems.append(
-            PreflightProblem(
-                "reconcile", "startup reconciliation found unexplained divergence; resolve first"
-            )
-        )
     return problems
+
+
+def reconcile_before_live(
+    run_reconcile: Callable[[], AccountReconcileReport],
+    *,
+    wait: Callable[[float], None],
+    window_seconds: float,
+    notify: Callable[[str], None] = lambda _message: None,
+) -> AccountReconcileReport:
+    """The startup reconciliation gate: settle every open order and compare positions before
+    trading. If the only obstacle is a consistency window still open (e.g. a restart right
+    after a crash mid-send), wait it out once and try again. Each pass is judged on its own
+    and neither acknowledges anything (reconciliation never moves the positions baseline),
+    so a change seen by the first pass is still a change on the second — and on every later
+    start — until the operator settles or accepts it. The caller refuses to start on
+    anything that is not clean."""
+    report = run_reconcile()
+    if not report.is_clean and report.retry_later:
+        notify(f"waiting {window_seconds:.0f}s for the consistency window before a second pass")
+        wait(window_seconds)
+        report = run_reconcile()
+    return report
 
 
 __all__ = [
@@ -173,4 +195,5 @@ __all__ = [
     "announce_live",
     "live_confirmed",
     "live_preflight",
+    "reconcile_before_live",
 ]

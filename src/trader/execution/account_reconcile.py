@@ -1,4 +1,4 @@
-"""Account reconciliation: settle every open order row, then true positions (LR9; §10).
+"""Account reconciliation: settle every open order row, then check positions (LR9; §10).
 
 ``reconcile_account`` drives each unsettled order to a terminal, fully recorded state:
 
@@ -10,8 +10,10 @@
    cancel it. Otherwise it is polled to a terminal status — a remainder is cancelled, since
    nothing may rest untracked — and completed atomically (terminal status + fill row +
    attribution, exactly once); a fill the repository refuses leaves it unresolved;
-3. only then are positions trued to the broker (``execution.reconcile``): fills settled above
-   are attributed to their strategy before any residual is parked under ``unknown``.
+3. only then are positions compared with the broker (``execution.reconcile``), so fills
+   settled above are attributed to their strategy first; what the broker holds beyond that
+   is checked against the operator-acknowledged baseline, which reconciliation never moves
+   — only ``accept_positions`` (the operator, with nothing unresolved) does.
 
 It never places an order. Callers must hold the trading lease (``state.lease``) — checked:
 ``resolve`` treats a ``pending`` row as orphaned, which is only true when no other process
@@ -41,9 +43,9 @@ from trader.execution.poller import (
     PollPolicy,
     poll_until_terminal,
 )
-from trader.execution.reconcile import ReconcileReport, reconcile
+from trader.execution.reconcile import ReconcileReport, accept, reconcile
 from trader.observability.logging import get_logger
-from trader.state.attribution import AttributionLedger
+from trader.state.attribution import AttributionLedger, BaselineChange
 from trader.state.lease import TradingLease
 
 _log = get_logger("execution.account_reconcile")
@@ -232,6 +234,17 @@ def _canon(symbol: str) -> str:
     return symbol.strip().upper().replace("/", ".")
 
 
+def accept_positions(
+    report: AccountReconcileReport, attribution: AttributionLedger
+) -> list[BaselineChange]:
+    """The operator acknowledges the report's unattributed holdings as the new baseline.
+    Refused (``ValueError``, nothing written) while any order is unresolved: its fill may be
+    exactly what is unattributed."""
+    if report.unresolved:
+        raise ValueError(f"{len(report.unresolved)} order(s) unresolved; settle them first")
+    return accept(report.positions, attribution)
+
+
 def summary_lines(report: AccountReconcileReport) -> list[str]:
     """A human-readable report for the reconcile command (no account identifiers)."""
     counts = {s: sum(1 for o in report.orders if o.outcome is s) for s in Settlement}
@@ -241,18 +254,27 @@ def summary_lines(report: AccountReconcileReport) -> list[str]:
     ]
     lines += [f"  {o.client_order_id}: unresolved [{o.code}] {o.detail}" for o in report.unresolved]
     discrepancies = report.positions.discrepancies
+    standing = report.positions.standing
+    if standing:
+        lines.append(
+            f"positions: {len(standing)} acknowledged unattributed holding(s), unchanged: "
+            + ", ".join(f"{d.symbol} {d.baseline_qty}" for d in standing)
+        )
     if discrepancies:
-        lines.append(f"positions: {len(discrepancies)} discrepancy(ies), parked under 'unknown'")
+        lines.append(
+            f"positions: {len(discrepancies)} unexplained change(s) against the acknowledged "
+            "baseline (your own trades? review, then: trader reconcile --accept-positions)"
+        )
         lines += [
             f"  {d.symbol}: broker {d.broker_qty}, attributed {d.attributed_qty}, "
-            f"parked {d.parked_qty}"
+            f"unattributed {d.unattributed_qty}, acknowledged {d.baseline_qty}"
             for d in discrepancies
         ]
-    else:
+    elif not standing:
         lines.append("positions: clean")
     if report.is_clean:
         verdict = "CLEAN"
-    elif report.retry_later and not discrepancies:
+    elif report.retry_later:  # an unresolved order's fill may explain a position change
         verdict = "NOT CLEAN - run again after the consistency window"
     else:
         verdict = "NOT CLEAN - needs attention"
@@ -264,6 +286,7 @@ __all__ = [
     "AccountReconcileReport",
     "OrderSettlement",
     "Settlement",
+    "accept_positions",
     "reconcile_account",
     "summary_lines",
 ]

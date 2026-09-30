@@ -1,9 +1,11 @@
 """Per-strategy position attribution (design §10 #16).
 
 Each fill updates a sub-position tagged by ``strategy_id`` (average-cost, signed), so
-two strategies trading the same symbol keep strictly separate books. ``reconcile_total``
-compares the attributed sums to the broker's true positions and parks any unattributed
-delta under the special ``'unknown'`` strategy (so the books always tie out).
+two strategies trading the same symbol keep strictly separate books. What the broker holds
+beyond the strategies' sums is *unattributed* (``unattributed``). The special ``'unknown'``
+strategy holds the operator-acknowledged baseline of unattributed holdings (e.g. the owner's
+own positions in the same account); only ``accept_unattributed`` — the operator's explicit
+act — writes it (see ``execution.reconcile``).
 
 ``Fill`` carries no side, so ``apply`` takes it explicitly (the orchestrator has the
 originating order).
@@ -28,6 +30,15 @@ class AttributedPosition:
     symbol: str
     quantity: int
     avg_price: Decimal
+
+
+@dataclass(frozen=True)
+class BaselineChange:
+    """A symbol whose acknowledged unattributed quantity was set from ``old`` to ``new``."""
+
+    symbol: str
+    old: int
+    new: int
 
 
 def _apply_avg(old_qty: int, old_avg: Decimal, signed: int, price: Decimal) -> tuple[int, Decimal]:
@@ -76,26 +87,9 @@ class AttributionLedger:
             AttributedPosition(strategy_id, sym, int(qty), Decimal(avg)) for sym, qty, avg in rows
         ]
 
-    def reconcile_total(self, broker_positions: Sequence[Position]) -> list[AttributedPosition]:
-        """Set 'unknown' = broker - real-attributed for each symbol; return the residual.
-
-        Idempotent in state: the parked 'unknown' quantity is always exactly the true
-        residual (the *real*, non-'unknown' attribution is excluded from the sum), and a
-        symbol that has come to tie out has its stale 'unknown' row cleared. Atomic: a
-        failure part-way leaves the previous 'unknown' rows untouched.
-        """
-        self._conn.execute("BEGIN IMMEDIATE")
-        committed = False
-        try:
-            residual = self._reconcile_total(broker_positions)
-            self._conn.execute("COMMIT")
-            committed = True
-            return residual
-        finally:
-            if not committed and self._conn.in_transaction:
-                self._conn.execute("ROLLBACK")
-
-    def _reconcile_total(self, broker_positions: Sequence[Position]) -> list[AttributedPosition]:
+    def unattributed(self, broker_positions: Sequence[Position]) -> dict[str, int]:
+        """Per symbol, the broker's quantity minus the real (non-'unknown') attributed sum —
+        only where they differ. Read-only."""
         real = {
             sym: int(qty)
             for sym, qty in self._conn.execute(
@@ -104,20 +98,37 @@ class AttributionLedger:
                 (UNKNOWN,),
             ).fetchall()
         }
-        broker = {p.symbol: p for p in broker_positions}
-        # union of broker, real-attributed, and existing 'unknown' rows (so stale
-        # 'unknown' rows are revisited and cleared when they newly tie out)
-        existing_unknown = {p.symbol for p in self.get_attributed(UNKNOWN)}
-        residual: list[AttributedPosition] = []
-        for symbol in sorted(set(real) | set(broker) | existing_unknown):
-            broker_pos = broker.get(symbol)
-            broker_qty = broker_pos.quantity if broker_pos is not None else 0
-            delta = broker_qty - real.get(symbol, 0)
-            avg = broker_pos.avg_price if broker_pos is not None else Decimal("0")
-            self._upsert(UNKNOWN, symbol, delta, avg)  # delta == 0 deletes a stale row
-            if delta != 0:
-                residual.append(AttributedPosition(UNKNOWN, symbol, delta, avg))
-        return residual
+        broker = {p.symbol: p.quantity for p in broker_positions}
+        return {
+            symbol: broker.get(symbol, 0) - real.get(symbol, 0)
+            for symbol in sorted(set(real) | set(broker))
+            if broker.get(symbol, 0) != real.get(symbol, 0)
+        }
+
+    def accept_unattributed(self, broker_positions: Sequence[Position]) -> list[BaselineChange]:
+        """Make the current unattributed quantities the acknowledged baseline (the 'unknown'
+        rows), atomically; returns every symbol whose baseline changed."""
+        avg_price = {p.symbol: p.avg_price for p in broker_positions}
+        self._conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            before = {p.symbol: p.quantity for p in self.get_attributed(UNKNOWN)}
+            after = self.unattributed(broker_positions)
+            changes = [
+                BaselineChange(symbol, before.get(symbol, 0), after.get(symbol, 0))
+                for symbol in sorted(set(before) | set(after))
+                if before.get(symbol, 0) != after.get(symbol, 0)
+            ]
+            for change in changes:  # a new quantity of 0 deletes the row
+                self._upsert(
+                    UNKNOWN, change.symbol, change.new, avg_price.get(change.symbol, Decimal(0))
+                )
+            self._conn.execute("COMMIT")
+            committed = True
+            return changes
+        finally:
+            if not committed and self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
 
     def _upsert(self, strategy_id: str, symbol: str, quantity: int, avg_price: Decimal) -> None:
         if quantity == 0:

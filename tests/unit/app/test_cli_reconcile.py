@@ -1,7 +1,10 @@
-"""`trader reconcile` against a (fake) live Schwab account (LR9): overrides are all checked
-before anything changes — each ``--adopt`` id against the broker's own order — and applied
-all or nothing; the exit code says what happened (0 clean, 2 not clean or an override
-refused, 4 the broker failed)."""
+"""`trader reconcile` and the live start gate against a (fake) live Schwab account.
+
+LR9: overrides are all checked before anything changes — each ``--adopt`` id against the
+broker's own order — and applied all or nothing; the exit code says what happened (0 clean,
+2 not clean or an override refused, 4 the broker failed). LR10: position changes stay
+reported until the operator accepts them (``--accept-positions``), and a refused live start
+alerts once and latches the kill switch."""
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -76,8 +79,15 @@ strategies:
     universe: [AAPL]
     slots:
       - {{id: open, time: "09:45"}}
+risk:  # inside the guarded-rollout ceilings, so `run` gets past the live preflight
+  max_position_size_pct: 5
+  max_order_notional_usd: 1000
+  max_gross_exposure_usd: 2000
+  allowlist: [AAPL]
 execution:
   fees_model: {{commission: "0.65", regulatory_bps: 0}}
+alerting:
+  channels: [telegram]
 observability:
   data_cache: "{tmp_path}"
   db_path: "{tmp_path / "state.sqlite"}"
@@ -200,3 +210,108 @@ def test_bad_overrides_exit_2_before_the_broker_is_contacted(
     assert result.exit_code == 2 and message in result.output
     assert live.connected == []  # refused before connecting
     assert live.row("c1").status == "unknown"
+
+
+# --- accepting positions (LR10) --------------------------------------------------------- #
+
+
+def _baseline(live: _Live) -> dict[str, int]:
+    from trader.state.attribution import AttributionLedger
+
+    return {
+        p.symbol: p.quantity
+        for p in AttributionLedger(live.repo.connection).get_attributed("unknown")
+    }
+
+
+def test_accepted_positions_stand_from_then_on(live: _Live) -> None:
+    live.broker.set_position(Position("TSLA", 5, Decimal("200"), Decimal("1000")))  # by hand
+    assert live.invoke().exit_code == 2
+    assert live.invoke().exit_code == 2  # re-running acknowledges nothing
+    accepted = live.invoke("--accept-positions")
+    assert "accepted: TSLA unattributed 0 -> 5" in accepted.output
+    assert accepted.exit_code == 0 and "result after accepting: CLEAN" in accepted.output
+    after = live.invoke()
+    assert after.exit_code == 0 and "unchanged: TSLA 5" in after.output
+    assert _baseline(live) == {"TSLA": 5}
+
+
+def test_positions_are_not_accepted_while_an_order_is_unresolved(live: _Live) -> None:
+    live.unknown("c1")  # the reconciler answers WINDOW_OPEN: its fill may be the change
+    live.broker.set_position(Position("AAPL", 1, Decimal("100"), Decimal("100")))
+    result = live.invoke("--accept-positions")
+    assert result.exit_code == 2
+    assert "positions not accepted: 1 order(s) unresolved" in result.output
+    assert _baseline(live) == {}
+
+
+# --- the live start gate (`trader run`, LR10) -------------------------------------------- #
+
+
+class _Alerts:
+    """Stands in for the alerter `run` builds (one channel configured)."""
+
+    def __init__(self) -> None:
+        self._channels = [object()]
+        self.events: list[object] = []
+
+    def alert(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.fixture
+def alerts(live: _Live, monkeypatch: pytest.MonkeyPatch) -> _Alerts:
+    sent = _Alerts()
+    monkeypatch.setattr(
+        "trader.observability.alerting.build_alerter", lambda channels, environ: sent
+    )
+    # Only in this test process: the repository keeps LIVE_ORDER_PATH_READY False.
+    monkeypatch.setattr("trader.app.live_guard.LIVE_ORDER_PATH_READY", True)
+    monkeypatch.setattr(cli, "_token_valid", lambda cfg: True)
+    monkeypatch.setenv("TRADER_CONFIRM_LIVE", "I_UNDERSTAND")
+    return sent
+
+
+def _start(live: _Live):  # type: ignore[no-untyped-def]
+    return runner.invoke(cli.app, ["run", "--config", str(live.config), "--once"])
+
+
+def _kinds(alerts: _Alerts) -> list[str]:
+    return [e.kind.value for e in alerts.events]  # type: ignore[attr-defined]
+
+
+def _kill_switch_engaged(live: _Live) -> bool:
+    from trader.risk.kill_switch import KillSwitch
+
+    return KillSwitch(live.repo.connection).is_engaged()
+
+
+def test_an_unclean_live_start_is_refused_alerted_once_and_latched(
+    live: _Live, alerts: _Alerts
+) -> None:
+    live.broker.set_position(Position("TSLA", 5, Decimal("200"), Decimal("1000")))  # by hand
+    result = _start(live)
+    assert result.exit_code == 1 and "live start refused" in result.output
+    assert "TSLA: broker 5" in result.output
+    assert _kinds(alerts) == ["reconcile_mismatch"] and _kill_switch_engaged(live)
+    again = _start(live)  # e.g. the container's restart policy
+    assert again.exit_code == 1 and "live preflight FAILED [kill_switch]" in again.output
+    assert _kinds(alerts) == ["reconcile_mismatch"]  # no alert storm
+    runner.invoke(cli.app, ["kill", "--off", "--config", str(live.config)])
+    released = _start(live)  # released without settling anything: still refused
+    assert released.exit_code == 1 and "live start refused" in released.output
+    assert _baseline(live) == {}  # no start ever acknowledged the change
+
+
+def test_a_failed_startup_reconciliation_refuses_cleanly(
+    live: _Live, alerts: _Alerts, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def down(cfg, http, repo, *, clock, fees, command):  # type: ignore[no-untyped-def]
+        raise SchwabServerError(f"accounts/{ACCT} returned 503")
+
+    monkeypatch.setattr(cli, "_live_account", down)
+    result = _start(live)
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit)  # no traceback
+    assert "startup reconciliation failed (SchwabServerError)" in result.output
+    assert ACCT not in result.output
+    assert _kinds(alerts) == ["crash"] and _kill_switch_engaged(live)

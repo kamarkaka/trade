@@ -19,7 +19,10 @@ The injected ``RiskManager`` is the real fail-closed gate (``trader.risk.gate``)
 live; it defaults to a permissive approve-all manager so backtests and M3 callers behave
 unchanged until the paper pipeline (M4.7) injects the real one.
 
-SAFETY: M4 uses FakeBroker (tests) or SimBroker (paper) only — no real orders.
+Execution: the paper/live daemon injects ``execution.executor.DurableOrderExecutor`` (durable
+write-ahead, at-most-once placement, bounded polling, atomic completion); without one the
+cycle submits directly and reads once — correct only for the synchronous SimBroker used by
+backtests, which keeps golden runs unchanged.
 """
 
 from __future__ import annotations
@@ -40,12 +43,14 @@ from trader.core import (
     Fill,
     MarketSnapshot,
     Order,
+    OrderNotPlacedError,
     Position,
     Quote,
     RiskVerdict,
 )
 from trader.core.enums import Action, ConflictPolicy
 from trader.core.protocols import Broker, Clock, MarketDataProvider, Strategy
+from trader.execution.executor import OrderExecutor
 from trader.observability.logging import cycle_context, get_logger
 from trader.risk.gate import ResolvedDecision
 from trader.state.attribution import AttributionLedger
@@ -111,7 +116,7 @@ def _utcnow() -> datetime:
 class AuditEvent:
     cycle_id: str  # correlation id tying every row of one cycle's chain together
     strategy_id: str
-    kind: str  # order_pending | fill | rejected | cycle_error
+    kind: str  # order_pending | fill | rejected | order_not_placed | cycle_error
     detail: str
     payload: Mapping[str, object] = field(default_factory=dict)
 
@@ -165,6 +170,7 @@ class CycleResult:
     errors: list[str] = field(default_factory=list)
     missing_symbols: list[str] = field(default_factory=list)
     halted: bool = False  # kill switch engaged -> the whole cycle was skipped
+    not_placed: list[Order] = field(default_factory=list)  # the broker definitely refused
 
 
 class Orchestrator:
@@ -182,6 +188,7 @@ class Orchestrator:
         risk: RiskManager | None = None,
         audit: AuditSink | None = None,
         kill_switch: Callable[[], bool] | None = None,
+        executor: OrderExecutor | None = None,
     ) -> None:
         self._broker = broker
         self._data = data
@@ -194,6 +201,10 @@ class Orchestrator:
         # Read each cycle (fresh DB read) so an engage that lands mid-session is honored on
         # the next slot. None => never engaged (backtest / tests without a kill switch).
         self._kill_switch = kill_switch
+        # The paper/live daemon injects the durable executor (write-ahead, at-most-once
+        # placement, bounded polling, atomic completion). None => the direct path below
+        # (submit + one read against the synchronous SimBroker), used by backtests.
+        self._executor = executor
         self._log = get_logger("orchestrator")
 
     def run_cycle(
@@ -235,7 +246,16 @@ class Orchestrator:
                 # Reconcile same-ticker conflicts across the cycle's decisions BEFORE sizing
                 # (net default), then route each resulting order through the chokepoint.
                 resolved = self._risk.resolve_conflicts([(strategy_id, d) for d in decisions])
-                for rd in resolved:
+                for i, rd in enumerate(resolved):
+                    if i and self._kill_switch_now():
+                        # Re-read before every further order: execution (polling) can take a
+                        # while, and an engage in the meantime must stop the rest of the cycle.
+                        self._log.warning("kill switch engaged mid-cycle; remaining orders dropped")
+                        self._audit.record(
+                            AuditEvent(cycle_id, strategy_id, "kill_switch_halt", "mid-cycle")
+                        )
+                        result.halted = True
+                        break
                     self._handle_resolved(rd, strategy_id, cycle_id, snapshot, ds, result)
             except Exception as exc:
                 # Strategy isolation (Appendix C#6): a failing cycle must never crash the
@@ -264,7 +284,7 @@ class Orchestrator:
         order = self._sizer(decision, strategy_id)
         if order is None:
             return
-        quote = snapshot.quotes.get(order.symbol)
+        quote = self._quote_for_gate(order.symbol, snapshot)
         if quote is None:
             # Fail closed: never trade a symbol we have no quote for (the gate would reject
             # anyway; do it here so check() keeps its non-optional Quote contract).
@@ -299,11 +319,19 @@ class Orchestrator:
                 },
             )
         )
-        broker_order_id = self._broker.submit_order(final_order)
-        # TODO(M5, §4.2): poll get_order until a terminal status (FILLED/PARTIAL/REJECTED)
-        # with a bounded timeout; M4's SimBroker/FakeBroker fill synchronously.
-        fill = self._broker.get_order(broker_order_id)
-        self._attribution.apply(fill, strategy_id, final_order.side)
+        if self._executor is None:
+            broker_order_id = self._broker.submit_order(final_order)
+            fill = self._broker.get_order(broker_order_id)  # synchronous SimBroker/FakeBroker
+            self._attribution.apply(fill, strategy_id, final_order.side)
+        else:
+            try:
+                # Completes atomically (terminal status + fill row + attribution). An unknown
+                # or unresolved outcome raises past here and fails this cycle (alerted), so no
+                # further order is sent in it.
+                fill = self._executor.execute(final_order)
+            except OrderNotPlacedError as exc:
+                self._not_placed(final_order, strategy_id, cycle_id, result, str(exc))
+                return
         self._audit.record(
             AuditEvent(
                 cycle_id,
@@ -320,6 +348,42 @@ class Orchestrator:
         )
         result.orders.append(final_order)
         result.fills.append(fill)
+
+    def _not_placed(
+        self, order: Order, strategy_id: str, cycle_id: str, result: CycleResult, reason: str
+    ) -> None:
+        self._log.warning(
+            "order not placed by the broker",
+            strategy_id=strategy_id,
+            symbol=order.symbol,
+            cid=order.client_order_id,
+            reason=reason,
+        )
+        self._audit.record(
+            AuditEvent(
+                cycle_id,
+                strategy_id,
+                "order_not_placed",
+                order.client_order_id,
+                payload={"symbol": order.symbol, "reason": reason},
+            )
+        )
+        result.not_placed.append(order)
+
+    def _kill_switch_now(self) -> bool:
+        return bool(self._kill_switch()) if self._kill_switch is not None else False
+
+    def _quote_for_gate(self, symbol: str, snapshot: MarketSnapshot) -> Quote | None:
+        """The quote the gate checks an order against. On the durable (paper/live) path it is
+        re-read for each order — earlier orders' polling may have taken a while, and a stale
+        cycle-start quote would be refused (or worse, relied on). Backtests use the snapshot
+        (the virtual clock doesn't move within a cycle)."""
+        if self._executor is None:
+            return snapshot.quotes.get(symbol)
+        try:
+            return self._data.get_quote(symbol, self._clock.now())
+        except (LookupError, ValueError):
+            return None
 
     def _reject(
         self, order: Order, strategy_id: str, cycle_id: str, result: CycleResult, reason: str

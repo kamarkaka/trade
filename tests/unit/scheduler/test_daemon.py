@@ -240,3 +240,69 @@ def test_overlapping_callbacks_share_one_lock(tmp_path: Path) -> None:
     daemon.fire("m", "open")
     daemon.fire("n", "noon")
     assert lock.enters == 2  # both cycles serialized through the one shared lock
+
+
+def test_orders_the_broker_refused_raise_a_broker_error_alert(tmp_path: Path) -> None:
+    from trader.core import Order
+    from trader.core.enums import OrderType, Side
+    from trader.observability.alerting import AlertEvent, AlertKind
+
+    events: list[AlertEvent] = []
+
+    class _Rec:
+        def alert(self, event: AlertEvent) -> None:
+            events.append(event)
+
+    class _Refused(_SpyOrchestrator):
+        def run_cycle(
+            self, strategy: object, universe: Sequence[str], strategy_id: str, now: datetime
+        ) -> CycleResult:
+            result = super().run_cycle(strategy, universe, strategy_id, now)
+            result.not_placed.append(
+                Order("c1", strategy_id, "AAPL", Side.BUY, 1, OrderType.MARKET)
+            )
+            return result
+
+    daemon = _daemon(tmp_path, [_binding("m", "open", time(9, 45))], _Refused())
+    daemon._alerter = _Rec()  # type: ignore[assignment]
+    daemon.fire("m", "open")
+    assert [e.kind for e in events] == [AlertKind.BROKER_ERROR]
+    assert "AAPL" in events[0].message
+    assert daemon._ledger.was_fired(SESSION, "m", "open") == "done"  # the slot itself ran
+
+
+def test_an_order_the_broker_rejected_after_accepting_it_alerts(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from trader.core import Fill
+    from trader.core.enums import OrderStatus
+    from trader.observability.alerting import AlertEvent, AlertKind
+
+    events: list[AlertEvent] = []
+
+    class _Rec:
+        def alert(self, event: AlertEvent) -> None:
+            events.append(event)
+
+    class _Rejected(_SpyOrchestrator):
+        def run_cycle(self, strategy, universe, strategy_id, now):  # type: ignore[no-untyped-def]
+            result = super().run_cycle(strategy, universe, strategy_id, now)
+            result.fills.append(
+                Fill(
+                    "c1",
+                    "b1",
+                    "AAPL",
+                    0,
+                    Decimal("0"),
+                    Decimal("0"),
+                    datetime(2024, 7, 8, 14, 0, tzinfo=UTC),
+                    OrderStatus.REJECTED,
+                )
+            )
+            return result
+
+    daemon = _daemon(tmp_path, [_binding("m", "open", time(9, 45))], _Rejected())
+    daemon._alerter = _Rec()  # type: ignore[assignment]
+    daemon.fire("m", "open")
+    assert [e.kind for e in events] == [AlertKind.BROKER_ERROR] and "AAPL" in events[0].message

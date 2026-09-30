@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from trader.core import Account, Bar, Fill, Order, Position, Quote
+from trader.core import Account, Bar, Fill, Order, OrderNotPlacedError, Position, Quote
 from trader.core.enums import OrderStatus, OrderType, Side, TimeInForce
 from trader.core.protocols import Clock, MarketDataProvider
 
@@ -112,6 +112,7 @@ class SimBroker:
         fees: FeesModel | None = None,
         slippage: SlippageModel | None = None,
         max_participation: Decimal | None = None,
+        id_prefix: str = "SIM",
     ) -> None:
         self._data = data
         self._clock = clock
@@ -119,6 +120,10 @@ class SimBroker:
         self._fees = fees or FeesModel()
         self._slippage = slippage or SlippageModel()
         self._max_participation = max_participation
+        # Order ids are "<prefix>-<n>". The paper daemon gives each process its own prefix:
+        # durable order rows outlive this in-memory broker, and a broker id may belong to
+        # only one order row.
+        self._id_prefix = id_prefix
         self._lots: dict[str, _Lot] = {}
         self._fills: dict[str, Fill] = {}  # broker_order_id -> latest cumulative Fill
         self._working: dict[str, _Working] = {}  # broker_order_id -> open order
@@ -132,9 +137,14 @@ class SimBroker:
         if existing is not None:  # idempotent: never double-submit
             return existing
 
-        broker_order_id = f"SIM-{self._seq + 1}"
+        broker_order_id = f"{self._id_prefix}-{self._seq + 1}"
         working = _Working(order=order, broker_order_id=broker_order_id)
-        self._try_fill(working)  # may raise (negative price) before _seq is committed
+        try:
+            self._try_fill(working)  # raises only before any state is touched
+        except (LookupError, ValueError) as exc:  # no quote/bar, or a negative fill price
+            raise OrderNotPlacedError(
+                f"simulated order {order.client_order_id} not placed: {exc}"
+            ) from exc
         self._seq += 1
         status = self._status_of(working)
         self._fills[broker_order_id] = self._snapshot(working, status)
@@ -148,6 +158,12 @@ class SimBroker:
             return self._fills[broker_order_id]
         except KeyError as exc:
             raise KeyError(f"unknown broker_order_id {broker_order_id!r}") from exc
+
+    def find_by_client_id(self, client_order_id: str) -> Fill | None:
+        """The order placed under ``client_order_id`` in this process, if any (the paper
+        reconciler; authoritative for this in-memory broker)."""
+        broker_order_id = self._by_client.get(client_order_id)
+        return self._fills.get(broker_order_id) if broker_order_id is not None else None
 
     def cancel_order(self, broker_order_id: str) -> None:
         if broker_order_id not in self._fills:

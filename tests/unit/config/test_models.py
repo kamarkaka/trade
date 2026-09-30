@@ -242,3 +242,13 @@ def test_execution_fees_model_defaults_to_zero_and_validates() -> None:
     assert cfg.fees_model.commission == Decimal("0.5") and cfg.fees_model.regulatory_bps == 0.3
     with pytest.raises(ValueError):
         ExecutionConfig.model_validate({"fees_model": {"regulatory_bps": -1}})
+
+
+def test_execution_poll_timeout_is_bounded_and_reconcile_window_defaults() -> None:
+    from trader.config.models import ExecutionConfig
+
+    assert ExecutionConfig().reconcile_window_seconds == 300
+    with pytest.raises(ValueError):
+        ExecutionConfig(poll_timeout_seconds=601)  # the cycle lock must never wait unbounded
+    with pytest.raises(ValueError):
+        ExecutionConfig(reconcile_window_seconds=0)

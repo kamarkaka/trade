@@ -47,6 +47,10 @@ class AttributionLedger:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._conn
+
     def apply(self, fill: Fill, strategy_id: str, side: Side) -> None:
         # SELECT-then-upsert is safe under the single global cycle lock (§7.5), which
         # serializes the only writer; it would be a read-modify-write race without it.

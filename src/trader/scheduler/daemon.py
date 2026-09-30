@@ -27,6 +27,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from trader.config.models import ScheduleConfig
+from trader.core.enums import OrderStatus
 from trader.core.protocols import Clock
 from trader.core.types import SlotSpec, StrategyBinding
 from trader.observability.alerting import Alerter, AlertEvent, AlertKind
@@ -210,6 +211,19 @@ class SchedulerDaemon:
             )
             return None
 
+        rejected = [f.symbol for f in result.fills if f.status is OrderStatus.REJECTED]
+        if rejected:  # accepted, then rejected by the broker
+            self._emit(
+                AlertKind.BROKER_ERROR,
+                f"{binding.strategy_id}/{slot.slot_id}: broker rejected order(s) for "
+                f"{', '.join(rejected)}",
+            )
+        if result.not_placed:
+            symbols = ", ".join(o.symbol for o in result.not_placed)
+            self._emit(
+                AlertKind.BROKER_ERROR,
+                f"{binding.strategy_id}/{slot.slot_id}: broker refused order(s) for {symbols}",
+            )
         if result.errors:
             self._ledger.mark_failed(
                 today, binding.strategy_id, slot.slot_id, "; ".join(result.errors)

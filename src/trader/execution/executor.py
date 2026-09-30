@@ -26,7 +26,13 @@ from typing import Protocol
 
 from trader.core import Fill, Order
 from trader.core.protocols import Broker
-from trader.execution.idempotency import OrderRepository, Reconciler, place_idempotent
+from trader.execution.idempotency import (
+    OrderRecord,
+    OrderRepository,
+    Reconciler,
+    ReconcileResult,
+    place_idempotent,
+)
 from trader.execution.poller import (
     DEFAULT_RETRYABLE,
     OrderStatusUnavailableError,
@@ -121,4 +127,22 @@ class DurableOrderExecutor:
         return fill
 
 
-__all__ = ["DurableOrderExecutor", "OrderExecutor", "OrderUnresolvedError"]
+def in_memory_reconciler(find_by_client_id: Callable[[str], Fill | None]) -> Reconciler:
+    """Reconciler over an in-memory broker's own record of what it received (SimBroker in
+    paper, FakeBroker in tests) — authoritative there, so ABSENT is exact."""
+
+    def reconcile(record: OrderRecord) -> ReconcileResult:
+        fill = find_by_client_id(record.client_order_id)
+        if fill is None:
+            return ReconcileResult.absent("not received by the in-memory broker")
+        return ReconcileResult.found(fill.broker_order_id)
+
+    return reconcile
+
+
+__all__ = [
+    "DurableOrderExecutor",
+    "OrderExecutor",
+    "OrderUnresolvedError",
+    "in_memory_reconciler",
+]

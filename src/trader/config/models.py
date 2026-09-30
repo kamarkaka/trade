@@ -180,8 +180,12 @@ class FeesModelConfig(_Base):
 
 class ExecutionConfig(_Base):
     order_type: OrderType = OrderType.MARKET
-    poll_timeout_seconds: int = Field(default=60, gt=0)
+    # Bounded: the cycle (and the global cycle lock) waits at most this long per order.
+    poll_timeout_seconds: int = Field(default=60, gt=0, le=600)
     rate_limit_per_min: int = Field(default=100, gt=0, le=120)
+    # How long after an unknown-outcome send the order listing must stay empty before the
+    # order is trusted to be absent (covers listing lag + post-response processing + skew).
+    reconcile_window_seconds: int = Field(default=300, gt=0)
     # Fee estimate applied to paper (SimBroker) and live (SchwabBroker) fills so their P&L
     # tracks real economics; the backtest has its own ``backtest.fees_model``.
     fees_model: FeesModelConfig = Field(default_factory=FeesModelConfig)

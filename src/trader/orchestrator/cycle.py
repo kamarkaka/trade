@@ -38,12 +38,12 @@ from typing import Protocol
 
 from trader.core import (
     Account,
-    OrderNotPlacedError,
     DayState,
     Decision,
     Fill,
     MarketSnapshot,
     Order,
+    OrderNotPlacedError,
     Position,
     Quote,
     RiskVerdict,

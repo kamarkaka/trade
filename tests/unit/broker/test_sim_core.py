@@ -221,3 +221,25 @@ def test_models_from_config() -> None:
 def test_unknown_slippage_kind_rejected() -> None:
     with pytest.raises(ValueError, match="unknown slippage kind"):
         SlippageModel("bogus", Decimal("1"))
+
+
+def test_find_by_client_id_is_the_paper_reconciliation_lookup() -> None:
+    from trader.execution.executor import in_memory_reconciler
+    from trader.execution.idempotency import ReconcileOutcome
+
+    broker = _broker()
+    order = _order(Side.BUY, 5)
+    broker_order_id = broker.submit_order(order)
+    found = broker.find_by_client_id(order.client_order_id)
+    assert found is not None and found.broker_order_id == broker_order_id
+    assert broker.find_by_client_id("never-sent") is None
+
+    reconcile = in_memory_reconciler(broker.find_by_client_id)
+
+    class _Rec:
+        client_order_id = order.client_order_id
+
+    result = reconcile(_Rec())  # type: ignore[arg-type]
+    assert result.outcome is ReconcileOutcome.FOUND and result.broker_order_id == broker_order_id
+    _Rec.client_order_id = "never-sent"
+    assert reconcile(_Rec()).outcome is ReconcileOutcome.ABSENT  # type: ignore[arg-type]

@@ -44,6 +44,16 @@ from trader.schwab.errors import (
 )
 from trader.schwab.orders import SchwabTradingClient, build_order_json
 
+# Status-read failures that waiting can fix: the poller retries these until its deadline;
+# anything else (safe mode, auth, a malformed response) escalates at once.
+TRANSIENT_READ_ERRORS: tuple[type[BaseException], ...] = (
+    SchwabRateLimitError,
+    SchwabServerError,
+    httpx.TransportError,
+    TimeoutError,
+    ConnectionError,
+)
+
 # Transport failures raised before any byte of the request left the process.
 _NEVER_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
@@ -168,4 +178,4 @@ class SchwabBroker:
         return Account(cash=snap.cash, buying_power=snap.buying_power, equity=snap.equity)
 
 
-__all__ = ["SchwabBroker"]
+__all__ = ["TRANSIENT_READ_ERRORS", "SchwabBroker"]

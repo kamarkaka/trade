@@ -171,8 +171,13 @@ def run(
 
     from trader.app.live_guard import announce_live, live_confirmed, live_preflight
     from trader.broker import FeesModel, SimBroker
+    from trader.broker.schwab_broker import TRANSIENT_READ_ERRORS
     from trader.core.enums import Mode
     from trader.core.protocols import Broker
+    from trader.execution.executor import DurableOrderExecutor, in_memory_reconciler
+    from trader.execution.idempotency import OrderRepository, Reconciler
+    from trader.execution.poller import DEFAULT_RETRYABLE, PollPolicy
+    from trader.execution.schwab_reconciler import SchwabOrderReconciler
     from trader.observability.alerting import build_alerter
     from trader.observability.heartbeat import Heartbeat
     from trader.observability.logging import get_logger
@@ -269,6 +274,8 @@ def run(
         http = SchwabHttp(schwab_cfg, client, TokenStore(schwab_cfg.token_store_path), clock=clock)
         data = SchwabMarketData(SchwabClient(http), clock)
         fees = FeesModel.from_config(cfg.execution.fees_model)  # same estimate paper + live
+        repo = OrderRepository(state)
+        attribution = AttributionLedger(state)  # same connection: atomic completion
         broker: Broker
         if is_live:
             from trader.broker import SchwabBroker
@@ -284,16 +291,43 @@ def run(
                     err=True,
                 )
                 raise typer.Exit(1)
+            trading = SchwabTradingClient(http)
+            account_hash = mappings[0].hash_value
             broker = SchwabBroker(
-                SchwabTradingClient(http), mappings[0].hash_value, clock=clock, fees=fees
+                trading, account_hash, clock=clock, fees=fees, client_id_for=repo.client_id_for
             )
+            reconcile: Reconciler = SchwabOrderReconciler(
+                trading,
+                account_hash,
+                clock=clock,
+                bound_broker_ids=repo.bound_broker_ids,
+                awaiting_resolution=repo.awaiting_resolution,
+                consistency_window=timedelta(seconds=cfg.execution.reconcile_window_seconds),
+            )
+            poll_policy = PollPolicy(timeout_seconds=cfg.execution.poll_timeout_seconds)
+            retryable = TRANSIENT_READ_ERRORS
             # Live state is NEVER silent: log it loud and alert at startup (design §10).
             get_logger("cli").warning("STARTING IN LIVE MODE — REAL ORDERS ENABLED")
             announce_live(alerter)
         else:
-            # PAPER: SimBroker, never real
-            broker = SimBroker(data, clock, starting_cash=cash, fees=fees)
-        attribution = AttributionLedger(state)
+            # PAPER: SimBroker, never real. It can't change state while we poll, so read once
+            # and cancel any remainder (a resting limit order is never left WORKING).
+            sim = SimBroker(data, clock, starting_cash=cash, fees=fees)
+            broker = sim
+            reconcile = in_memory_reconciler(sim.find_by_client_id)
+            poll_policy = PollPolicy(timeout_seconds=0)
+            retryable = DEFAULT_RETRYABLE
+        # Durable execution for paper AND live: write-ahead order rows, at most one send per
+        # client_order_id, bounded polling, and atomic completion (orders + fills +
+        # attribution) — so the paper soak exercises the live order path.
+        executor = DurableOrderExecutor(
+            broker=broker,
+            repo=repo,
+            attribution=attribution,
+            reconcile=reconcile,
+            poll_policy=poll_policy,
+            retryable=retryable,
+        )
         # Read the persisted kill switch fresh each cycle: an engage (CLI or auto-trip) halts
         # the daemon at the next cycle start AND pre-submit (gate). Its own connection so the
         # worker thread never shares one cross-thread.
@@ -308,6 +342,7 @@ def run(
             risk=risk,  # the real fail-closed gate is the single chokepoint
             audit=SqliteAuditSink(state),  # durable audit chain
             kill_switch=kill_switch.is_engaged,
+            executor=executor,
         )
         # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
         # only for a broker whose positions survive a restart; SimBroker is in-memory (always

@@ -139,6 +139,10 @@ class SchwabOrderStatus:
     side: Side | None = None  # the side of the book that instruction trades
     order_type: str = ""  # raw Schwab orderType, upper-cased (MARKET, LIMIT…)
     price: Decimal | None = None  # the order's price field (None for MARKET / absent)
+    leg_quantity: int = 0  # the first leg's quantity (0 if absent)
+    duration: str = ""  # DAY, GTC… (upper-cased; "" if absent)
+    session: str = ""  # NORMAL, AM, PM, SEAMLESS… (upper-cased; "" if absent)
+    strategy_type: str = ""  # orderStrategyType: SINGLE, OCO, TRIGGER… ("" if absent)
 
 
 def _first_leg(data: Any) -> dict[str, Any] | None:
@@ -206,27 +210,33 @@ def _average_fill_price(data: Any) -> Decimal:
     return (total_cost / total_qty) if total_qty > 0 else Decimal(0)
 
 
-def _intent_fields(data: Any, order_type: str) -> tuple[datetime | None, Decimal | None]:
+def _intent_fields(data: Any, order_type: str) -> tuple[datetime | None, Decimal | None, int]:
     price = data.get("price") if order_type != "MARKET" else None
-    return _entered_time_of(data), (_dec(price, "price") if price is not None else None)
+    leg = _first_leg(data)
+    leg_quantity = _int(leg.get("quantity", 0), "leg quantity") if leg is not None else 0
+    return (
+        _entered_time_of(data),
+        (_dec(price, "price") if price is not None else None),
+        leg_quantity,
+    )
 
 
 def parse_order_status(data: Any, *, strict_intent: bool = False) -> SchwabOrderStatus:
     """Parse one order object.
 
     The status/quantity/fill fields are always strict (a bad value raises). The intent-only
-    fields (``enteredTime``, ``price``) are parsed leniently by default — an unexpected
-    format becomes None so it can never break status POLLING — and strictly for
-    reconciliation listings (``strict_intent=True``), where a silently-dropped timestamp
+    fields (``enteredTime``, ``price``, the leg quantity) are parsed leniently by default —
+    an unexpected format becomes None/0 so it can never break status POLLING — and strictly
+    for reconciliation listings (``strict_intent=True``), where a silently-dropped timestamp
     could widen a match window."""
     raw = str(_require(data, "status"))
     order_type = str(data.get("orderType") or "").upper()
     try:
-        entered_time, price = _intent_fields(data, order_type)
+        entered_time, price, leg_quantity = _intent_fields(data, order_type)
     except SchwabBadResponseError:
         if strict_intent:
             raise
-        entered_time, price = None, None
+        entered_time, price, leg_quantity = None, None, 0
     instruction = _instruction_of(data)
     return SchwabOrderStatus(
         order_id=str(_require(data, "orderId")),
@@ -241,6 +251,10 @@ def parse_order_status(data: Any, *, strict_intent: bool = False) -> SchwabOrder
         side=_SIDE_BY_INSTRUCTION.get(instruction),
         order_type=order_type,
         price=price,
+        leg_quantity=leg_quantity,
+        duration=str(data.get("duration") or "").upper(),
+        session=str(data.get("session") or "").upper(),
+        strategy_type=str(data.get("orderStrategyType") or "").upper(),
     )
 
 
@@ -253,12 +267,20 @@ class SchwabUnparsedOrder:
     order_id: str  # "" if absent
     symbol: str  # best effort from the first leg ("" if unknown)
     error: str
+    entered_time: datetime | None = None  # best effort (None if absent or unparseable)
 
 
 @dataclass(frozen=True)
 class OrderListing:
     orders: tuple[SchwabOrderStatus, ...]
     unparsed: tuple[SchwabUnparsedOrder, ...] = ()
+
+
+def _lenient_entered(item: Any) -> datetime | None:
+    try:
+        return _entered_time_of(item)
+    except SchwabBadResponseError:
+        return None
 
 
 def parse_order_list(data: Any) -> OrderListing:
@@ -274,7 +296,9 @@ def parse_order_list(data: Any) -> OrderListing:
             orders.append(parse_order_status(item, strict_intent=True))
         except (SchwabBadResponseError, AttributeError, TypeError) as exc:
             order_id = str(item.get("orderId", "")) if isinstance(item, dict) else ""
-            unparsed.append(SchwabUnparsedOrder(order_id, _symbol_of(item), str(exc)))
+            unparsed.append(
+                SchwabUnparsedOrder(order_id, _symbol_of(item), str(exc), _lenient_entered(item))
+            )
     return OrderListing(tuple(orders), tuple(unparsed))
 
 

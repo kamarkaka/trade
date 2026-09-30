@@ -442,3 +442,55 @@ def test_stored_timestamps_parse_robustly(tmp_path: Path) -> None:
 def test_blank_broker_ids_are_rejected() -> None:
     with pytest.raises(ValueError, match="broker_order_id"):
         ReconcileResult.found("   ")
+
+
+def test_repository_reconciliation_queries(tmp_path: Path) -> None:
+    repo, _ = _repo(tmp_path)
+    broker = FakeBroker()
+    place_idempotent(broker, repo, _order("c-placed"), reconcile=_perfect(broker))  # b-1
+    repo._write_pending(_order("c-pending"))
+    broker.fail_next_submit = True
+    with pytest.raises(OrderOutcomeUnknownError):
+        place_idempotent(broker, repo, _order("c-unknown"), reconcile=_perfect(broker))
+    broker.reject_next_submit = True
+    with pytest.raises(OrderNotPlacedError):
+        place_idempotent(broker, repo, _order("c-rejected"), reconcile=_perfect(broker))
+    assert repo.bound_broker_ids() == {"b-1"}
+    assert [r.client_order_id for r in repo.awaiting_resolution()] == ["c-pending", "c-unknown"]
+
+
+def test_reconciliation_coverage_query_and_awaiting_excludes_bound_rows(tmp_path: Path) -> None:
+    clock = _Clock()
+    repo, conn = _repo(tmp_path, clock)
+    broker = FakeBroker()
+    place_idempotent(broker, repo, _order("c-early"), reconcile=_perfect(broker))  # b-1 @ NOW
+    clock.advance(3600)
+    place_idempotent(broker, repo, _order("c-late"), reconcile=_perfect(broker))  # b-2 @ +1h
+    window_lo, window_hi = NOW - timedelta(minutes=5), NOW + timedelta(minutes=5)
+    assert repo.bound_orders_created_between(window_lo, window_hi) == {"b-1": NOW}
+    # A row that somehow carries a broker id is settled, never "awaiting resolution".
+    repo._write_pending(_order("c-odd"))
+    conn.execute(
+        "UPDATE orders SET status = 'unknown', broker_order_id = 'b-9' "
+        "WHERE client_order_id = 'c-odd'"
+    )
+    assert [r.client_order_id for r in repo.awaiting_resolution()] == []
+
+
+def test_a_raising_reconciler_is_logged_and_inconclusive(tmp_path: Path) -> None:
+    import io
+
+    from trader.observability.logging import configure_logging
+
+    repo, _ = _repo(tmp_path)
+    repo._write_pending(_order())
+    repo.mark_unknown_after_send("c1")
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+
+    def broken(record: OrderRecord) -> ReconcileResult:
+        raise KeyError("wiring bug")
+
+    result = resolve(repo, _row(repo), reconcile=broken)
+    assert result.outcome is ResolveOutcome.UNRESOLVED and "KeyError" in result.detail
+    assert "reconciler raised" in buf.getvalue() and "Traceback" in buf.getvalue()

@@ -88,6 +88,7 @@ class ReconcileResult:
     outcome: ReconcileOutcome
     broker_order_id: str | None = None
     detail: str = ""  # human-readable; must never contain account identifiers
+    code: str = ""  # machine-readable reason (e.g. the reconciler's "window_open" = wait)
 
     def __post_init__(self) -> None:
         has_id = bool((self.broker_order_id or "").strip())
@@ -95,16 +96,16 @@ class ReconcileResult:
             raise ValueError("broker_order_id is required for FOUND and forbidden otherwise")
 
     @classmethod
-    def found(cls, broker_order_id: str, detail: str = "") -> ReconcileResult:
-        return cls(ReconcileOutcome.FOUND, broker_order_id, detail)
+    def found(cls, broker_order_id: str, detail: str = "", code: str = "") -> ReconcileResult:
+        return cls(ReconcileOutcome.FOUND, broker_order_id, detail, code)
 
     @classmethod
-    def absent(cls, detail: str = "") -> ReconcileResult:
-        return cls(ReconcileOutcome.ABSENT, None, detail)
+    def absent(cls, detail: str = "", code: str = "") -> ReconcileResult:
+        return cls(ReconcileOutcome.ABSENT, None, detail, code)
 
     @classmethod
-    def inconclusive(cls, detail: str = "") -> ReconcileResult:
-        return cls(ReconcileOutcome.INCONCLUSIVE, None, detail)
+    def inconclusive(cls, detail: str = "", code: str = "") -> ReconcileResult:
+        return cls(ReconcileOutcome.INCONCLUSIVE, None, detail, code)
 
 
 @dataclass(frozen=True)
@@ -140,15 +141,16 @@ class OrderRecord:
 
 # Looks up whether an order for this intent exists at the broker. Contract — ABSENT marks an
 # order not_placed, so a false ABSENT leaves a real order untracked. An implementation must:
-# - list the broker's orders (every status) over [record.created_at - clock skew, snapshot],
-#   the snapshot being the local time the listing was requested;
-# - return FOUND only for a unique match of the intent (symbol, side, quantity, type, limit
-#   price) whose broker id is not already bound to another local order, and only when no
-#   OTHER unresolved local order has the same intent (else it can't tell whose order it is);
-# - return ABSENT only when the listing is complete (not truncated; every unparseable item
-#   provably not a match) AND snapshot - record.updated_at >= a consistency window that
-#   covers the broker's listing lag, server-side processing after a lost response, and clock
-#   skew between us and the broker (a forward jump of the local clock shortens it);
+# - reconcile only an 'unknown' row (its updated_at is stamped after the send returned);
+# - wait until snapshot - record.updated_at >= a consistency window covering the broker's
+#   listing lag and server-side processing after a lost response (the snapshot is the local
+#   time the listing is requested; a forward jump of the local clock shortens it);
+# - return FOUND only when exactly one broker order could be this one, it matches the
+#   intent exactly, was entered while this order could have been in flight, and no other
+#   unresolved local order could own it;
+# - return ABSENT only when the listing is complete and NO broker order that could be this
+#   one was entered anywhere it could have landed (the send window — reaching at least to
+#   updated_at, e.g. for a re-anchored row — widened by the consistency window both ways);
 # - otherwise return INCONCLUSIVE.
 Reconciler = Callable[[OrderRecord], ReconcileResult]
 
@@ -192,6 +194,34 @@ class OrderRepository:
     @property
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
+
+    def bound_broker_ids(self) -> set[str]:
+        """Every broker order id already bound to a local order."""
+        rows = self._conn.execute(
+            "SELECT broker_order_id FROM orders WHERE broker_order_id IS NOT NULL"
+        ).fetchall()
+        return {str(r[0]) for r in rows}
+
+    def bound_orders_created_between(self, start: datetime, end: datetime) -> dict[str, datetime]:
+        """Broker id -> write-ahead time of local orders written within [start, end]. The
+        broker's listing of that span must include them (a coverage self-check) and their
+        entry times calibrate our clock against the broker's."""
+        rows = self._conn.execute(
+            "SELECT broker_order_id, created_at FROM orders WHERE broker_order_id IS NOT NULL "
+            "AND julianday(created_at) >= julianday(?) AND julianday(created_at) <= julianday(?)",
+            (_iso(start), _iso(end)),
+        ).fetchall()
+        return {str(r[0]): _parse_ts(r[1]) for r in rows}
+
+    def awaiting_resolution(self) -> list[OrderRecord]:
+        """Rows whose placement outcome is not settled: pending/unknown with no broker id."""
+        rows = self._conn.execute(
+            "SELECT client_order_id FROM orders WHERE broker_order_id IS NULL "
+            "AND status IN (?, ?) ORDER BY created_at, rowid",
+            (PENDING, UNKNOWN),
+        ).fetchall()
+        records = (self.get(str(r[0])) for r in rows)
+        return [r for r in records if r is not None]
 
     def get(self, client_order_id: str) -> OrderRecord | None:
         row = self._conn.execute(
@@ -313,7 +343,11 @@ def _safe_reconcile(reconcile: Reconciler, record: OrderRecord) -> ReconcileResu
     try:
         return reconcile(record)
     except Exception as exc:
-        return ReconcileResult.inconclusive(f"reconciler raised {type(exc).__name__}")
+        # Logged with its traceback: a local bug must not hide behind "inconclusive" forever.
+        _log.error(
+            "reconciler raised", cid=record.client_order_id, error=type(exc).__name__, exc_info=True
+        )
+        return ReconcileResult.inconclusive(f"reconciler raised {type(exc).__name__}", "error")
 
 
 def resolve(repo: OrderRepository, record: OrderRecord, *, reconcile: Reconciler) -> ResolveResult:

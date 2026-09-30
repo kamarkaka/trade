@@ -4,10 +4,10 @@ WAL mode lets the future read-only web reader (M7) read concurrently with the
 daemon writer; ``busy_timeout`` absorbs brief write contention; foreign keys are
 enforced. ``synchronous=FULL`` makes every commit durable before it returns: the order
 write-ahead row must survive a power loss once the order has been sent (WAL's default
-NORMAL may lose the last commits). Connections run in **autocommit** mode (``isolation_level=None``) so
-transactions are controlled explicitly (e.g. the migration runner) rather than by
-sqlite3's implicit management. Money is stored as TEXT (Decimal string) by callers
-to avoid binary floats.
+NORMAL may lose the last commits). Connections run in **autocommit** mode
+(``isolation_level=None``) so transactions are controlled explicitly (e.g. the migration
+runner) rather than by sqlite3's implicit management. Money is stored as TEXT (Decimal
+string) by callers to avoid binary floats.
 """
 
 from __future__ import annotations

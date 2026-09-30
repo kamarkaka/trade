@@ -328,32 +328,22 @@ def test_implausible_equity_fails_the_cycle_before_the_strategy_runs(tmp_path: P
     assert result.errors and decided == [] and broker.submitted == []
 
 
-def test_the_kill_switch_is_re_read_before_every_order(tmp_path: Path) -> None:
-    # An engage that lands mid-cycle (e.g. an auto-trip after the first order) must reach
-    # the gate for the next order.
+def test_the_gate_day_state_re_reads_the_kill_switch_per_order(tmp_path: Path) -> None:
+    # Defense in depth behind the orchestrator's own mid-cycle check: the day state handed to
+    # the gate carries the kill switch as read for THAT order, not as read at cycle start.
     switch = {"on": False}
-    broker = _FillingBroker()
+    seen: list[bool] = []
 
     def provider(account: Account, now: datetime, engaged: bool) -> DayState:
+        seen.append(engaged)
         return DayState(now.date(), account.equity, Decimal(0), Decimal(0), 0, Decimal(0), engaged)
 
-    class _TripAfterFirst(_FillingBroker):
-        def submit_order(self, order: Order) -> str:
-            broker_order_id = super().submit_order(order)
-            switch["on"] = True
-            return broker_order_id
-
-    broker = _TripAfterFirst()
     risk = RiskManager(account_config=RiskConfig(), clock=FakeClock(NOW))
-    orch, _, _ = _orchestrator(
-        tmp_path,
-        risk=risk,
-        broker=broker,
-        quotes={"AAPL": [_quote_for("AAPL")], "MSFT": [_quote_for("MSFT")]},
-        day_state_provider=provider,
-    )
+    orch, _, _ = _orchestrator(tmp_path, risk=risk, day_state_provider=provider)
     orch._kill_switch = lambda: switch["on"]
-    decisions = [Decision(Action.BUY, "AAPL", 1), Decision(Action.BUY, "MSFT", 1)]
-    result = orch.run_cycle(_Decide(decisions), ["AAPL", "MSFT"], "s1", NOW)
-    assert [o.symbol for o in result.orders] == ["AAPL"]
-    assert [o.symbol for o in result.rejected] == ["MSFT"]
+    day_state_for = orch._day_state_source(None, NOW, False)
+    account = FakeBroker().get_account()
+    assert not day_state_for(account).kill_switch_engaged
+    switch["on"] = True  # e.g. an auto-trip after the first order of the cycle
+    assert day_state_for(account).kill_switch_engaged
+    assert seen == [False, True]

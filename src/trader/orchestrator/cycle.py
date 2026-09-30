@@ -228,7 +228,7 @@ class Orchestrator:
                 # Kill switch: checked at the START of every cycle (design §10). If engaged,
                 # skip the whole cycle -- never decide or submit. The gate also rejects per
                 # order pre-submit (defense in depth via day_state.kill_switch_engaged).
-                engaged = bool(self._kill_switch()) if self._kill_switch is not None else False
+                engaged = self._kill_switch_now()
                 if engaged:
                     self._log.warning("kill switch engaged; cycle skipped", strategy_id=strategy_id)
                     self._audit.record(
@@ -430,9 +430,6 @@ class Orchestrator:
             # operator's engage) must reach the gate before the next order.
             return lambda account: provider(account, now, self._kill_switch_now())
         return lambda account: self._default_day_state(account, now, kill_switch_engaged=engaged)
-
-    def _kill_switch_now(self) -> bool:
-        return bool(self._kill_switch()) if self._kill_switch is not None else False
 
     @staticmethod
     def _default_day_state(

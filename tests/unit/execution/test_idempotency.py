@@ -442,3 +442,18 @@ def test_stored_timestamps_parse_robustly(tmp_path: Path) -> None:
 def test_blank_broker_ids_are_rejected() -> None:
     with pytest.raises(ValueError, match="broker_order_id"):
         ReconcileResult.found("   ")
+
+
+def test_repository_reconciliation_queries(tmp_path: Path) -> None:
+    repo, _ = _repo(tmp_path)
+    broker = FakeBroker()
+    place_idempotent(broker, repo, _order("c-placed"), reconcile=_perfect(broker))  # b-1
+    repo._write_pending(_order("c-pending"))
+    broker.fail_next_submit = True
+    with pytest.raises(OrderOutcomeUnknownError):
+        place_idempotent(broker, repo, _order("c-unknown"), reconcile=_perfect(broker))
+    broker.reject_next_submit = True
+    with pytest.raises(OrderNotPlacedError):
+        place_idempotent(broker, repo, _order("c-rejected"), reconcile=_perfect(broker))
+    assert repo.bound_broker_ids() == {"b-1"}
+    assert [r.client_order_id for r in repo.awaiting_resolution()] == ["c-pending", "c-unknown"]

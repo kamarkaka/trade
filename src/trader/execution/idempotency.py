@@ -193,6 +193,23 @@ class OrderRepository:
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
 
+    def bound_broker_ids(self) -> set[str]:
+        """Every broker order id already bound to a local order."""
+        rows = self._conn.execute(
+            "SELECT broker_order_id FROM orders WHERE broker_order_id IS NOT NULL"
+        ).fetchall()
+        return {str(r[0]) for r in rows}
+
+    def awaiting_resolution(self) -> list[OrderRecord]:
+        """Rows whose placement outcome is not settled: pending/unknown with no broker id."""
+        rows = self._conn.execute(
+            "SELECT client_order_id FROM orders WHERE broker_order_id IS NULL "
+            "AND status IN (?, ?) ORDER BY created_at, rowid",
+            (PENDING, UNKNOWN),
+        ).fetchall()
+        records = (self.get(str(r[0])) for r in rows)
+        return [r for r in records if r is not None]
+
     def get(self, client_order_id: str) -> OrderRecord | None:
         row = self._conn.execute(
             f"SELECT {_COLUMNS} FROM orders WHERE client_order_id = ?", (client_order_id,)

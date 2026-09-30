@@ -8,7 +8,8 @@ false ABSENT marks a live order ``not_placed``, so absence must be proven:
   snapshot (+ skew);
 - FOUND only for a UNIQUE exact match of the intent — same symbol, the exact instruction we
   send (BUY/SELL), quantity, order type and LIMIT price, entered inside the window — whose
-  broker id is not already bound to another local order;
+  broker id is not already bound to another local order, and only when no OTHER unresolved
+  local order shares the intent (a single listed order could then be either one's);
 - INCONCLUSIVE whenever absence cannot be proven: the listing failed or may be truncated;
   several orders match exactly; a listed order COULD be this one (every field it reports is
   compatible — e.g. a short-sale instruction on the same side, or missing fields); an
@@ -16,6 +17,10 @@ false ABSENT marks a live order ``not_placed``, so absence must be proven:
   the consistency window since ``record.updated_at`` (stamped at/after the last send) has
   not elapsed;
 - ABSENT only when none of the above holds.
+
+The listing covers every status (filled, cancelled, rejected orders count as "landed"); the
+snapshot is the local time the listing was requested, so a slow, retried request only makes
+the window check more conservative — but a forward jump of the local clock shortens it.
 
 Schwab does not echo our ``client_order_id``, hence the intent matching. It is only needed
 for orders whose broker id was never captured — normally the id is recorded at submit (LR3).
@@ -45,6 +50,7 @@ class SchwabOrderReconciler:
         *,
         clock: Clock,
         bound_broker_ids: Callable[[], Collection[str]],
+        awaiting_resolution: Callable[[], Collection[OrderRecord]],
         consistency_window: timedelta = timedelta(minutes=5),
         clock_skew: timedelta = timedelta(minutes=2),
     ) -> None:
@@ -56,6 +62,7 @@ class SchwabOrderReconciler:
         self._account = account_hash
         self._clock = clock
         self._bound_broker_ids = bound_broker_ids
+        self._awaiting_resolution = awaiting_resolution
         self._window = consistency_window
         self._skew = clock_skew
 
@@ -66,11 +73,20 @@ class SchwabOrderReconciler:
         try:
             listing = self._client.get_orders(self._account, from_entered=start, to_entered=end)
             bound = set(self._bound_broker_ids())
+            rivals = [
+                r
+                for r in self._awaiting_resolution()
+                if r.client_order_id != record.client_order_id and _same_intent(r, record)
+            ]
         except Exception as exc:  # a failed or possibly-truncated listing proves nothing
             return ReconcileResult.inconclusive(f"order listing failed ({type(exc).__name__})")
 
         candidates = [o for o in listing.orders if o.order_id not in bound]
         exact = [o for o in candidates if _exact_match(o, record, start, end)]
+        if exact and rivals:
+            return ReconcileResult.inconclusive(
+                f"{len(rivals)} other unresolved local order(s) share this intent"
+            )
         if len(exact) == 1:
             return ReconcileResult.found(exact[0].order_id, "unique intent match")
         if exact:
@@ -102,6 +118,16 @@ def _exact_match(o: SchwabOrderStatus, record: OrderRecord, start: datetime, end
         and (record.order_type is not OrderType.LIMIT or o.price == record.limit_price)
         and o.entered_time is not None
         and start <= o.entered_time <= end
+    )
+
+
+def _same_intent(a: OrderRecord, b: OrderRecord) -> bool:
+    return (
+        a.symbol == b.symbol
+        and a.side is b.side
+        and a.quantity == b.quantity
+        and a.order_type is b.order_type
+        and a.limit_price == b.limit_price
     )
 
 

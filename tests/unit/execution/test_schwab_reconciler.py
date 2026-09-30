@@ -26,9 +26,10 @@ def _record(
     order_type: OrderType = OrderType.MARKET,
     limit: Decimal | None = None,
     updated: datetime = CREATED,
+    cid: str = "c1",
 ) -> OrderRecord:
     return OrderRecord(
-        client_order_id="c1",
+        client_order_id=cid,
         strategy_id="s1",
         symbol="AAPL",
         side=side,
@@ -90,6 +91,7 @@ def _reconcile(
     *,
     at: datetime,
     bound: tuple[str, ...] = (),
+    awaiting: tuple[OrderRecord, ...] = (),
 ) -> tuple[ReconcileOutcome, str | None, _Client]:
     client = _Client(listing)
     reconciler = SchwabOrderReconciler(
@@ -97,6 +99,7 @@ def _reconcile(
         ACCT,
         clock=FakeClock(at),
         bound_broker_ids=lambda: bound,
+        awaiting_resolution=lambda: (record, *awaiting),
         consistency_window=WINDOW,
         clock_skew=SKEW,
     )
@@ -194,8 +197,28 @@ def test_absent_only_after_the_window_measured_from_updated_at() -> None:
     assert _reconcile(empty, recent, at=LATE)[0] is ReconcileOutcome.INCONCLUSIVE
 
 
+def test_another_unresolved_local_order_with_the_same_intent_blocks_found() -> None:
+    # Two local orders with identical intents are both unresolved: one listed order could be
+    # either one's, so it must not be adopted by whichever asks first.
+    rival = _record(cid="c2")
+    listing = OrderListing((_listed(),))
+    assert _reconcile(listing, _record(), at=LATE, awaiting=(rival,))[0] is (
+        ReconcileOutcome.INCONCLUSIVE
+    )
+    different = _record(cid="c3", side=Side.SELL)  # not a rival: another intent
+    assert _reconcile(listing, _record(), at=LATE, awaiting=(different,))[0] is (
+        ReconcileOutcome.FOUND
+    )
+
+
+def test_rivals_do_not_matter_when_nothing_matches() -> None:
+    assert _reconcile(OrderListing(()), _record(), at=LATE, awaiting=(_record(cid="c2"),))[0] is (
+        ReconcileOutcome.ABSENT
+    )
+
+
 def test_constructor_validation() -> None:
-    kwargs = {"clock": FakeClock(CREATED), "bound_broker_ids": tuple}
+    kwargs = {"clock": FakeClock(CREATED), "bound_broker_ids": tuple, "awaiting_resolution": tuple}
     with pytest.raises(ValueError, match="window"):
         SchwabOrderReconciler(
             _Client(OrderListing(())), ACCT, consistency_window=timedelta(0), **kwargs

@@ -168,6 +168,7 @@ def run(
     """Run the trading daemon. PAPER (default) uses SimBroker against live quotes (no real
     orders). LIVE places REAL orders and requires mode=live PLUS a second confirmation."""
     import time as _time
+    from zoneinfo import ZoneInfo
 
     from trader.app.live_guard import announce_live, live_confirmed, live_preflight
     from trader.broker import SimBroker
@@ -184,6 +185,7 @@ def run(
     from trader.scheduler.daemon import SchedulerDaemon
     from trader.sizing.sizer import size_decision
     from trader.state.attribution import AttributionLedger
+    from trader.state.daily import DailyCounters
     from trader.state.db import connect
     from trader.state.ledger import FiredSlotLedger
     from trader.state.migrate import run_migrations
@@ -304,6 +306,8 @@ def run(
             risk=risk,  # the real fail-closed gate is the single chokepoint
             audit=SqliteAuditSink(state),  # durable audit chain
             kill_switch=kill_switch.is_engaged,
+            # Real daily rails: persisted start-of-day equity + today's orders (exchange tz).
+            day_state_provider=DailyCounters(state, tz=ZoneInfo(schedule.timezone)).day_state,
         )
         # NOTE: reconcile-against-broker-truth on startup is wired in M5. It is meaningful
         # only for a broker whose positions survive a restart; SimBroker is in-memory (always

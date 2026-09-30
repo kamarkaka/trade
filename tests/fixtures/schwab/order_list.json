@@ -20,7 +20,7 @@
     "quantity": 5,
     "filledQuantity": 0,
     "orderType": "LIMIT",
-    "price": "410.50",
+    "price": 410.5,
     "orderLegCollection": [
       {"instruction": "SELL", "quantity": 5, "instrument": {"symbol": "MSFT", "assetType": "EQUITY"}}
     ]

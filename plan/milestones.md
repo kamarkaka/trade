@@ -1,6 +1,6 @@
 # Implementation Plan — Milestones & Execution Steps
 
-- **Status:** Draft for review (no execution yet)
+- **Status (2026-09-30):** M0–M4, M5.1–M5.6, M6–M7 and live-readiness LR1–LR14 are implemented and merged. **Remaining: M5.7 and M5.8**, the first real orders and the live deployment. Both are human-gated by design ([`docs/runbooks/go-live.md`](../docs/runbooks/go-live.md)); `LIVE_ORDER_PATH_READY` stays `False` until M5.7.
 - **Companion to:** [`design.md`](./design.md) — this document operationalizes design §17 into fine-grained, individually-validatable steps.
 - **Milestones:** 8 (M0–M7), **80 sub-steps total**, plus **14 live-readiness steps (LR1–LR14)** added before M5.7 (see the M5 section).
 
@@ -73,20 +73,20 @@
 | M5.5 | PDT rule (configurable) | A configurable PDT day-trade-count rule wired into the risk gate | M4.3 |
 | M5.6 | Go-live double-confirm + safe rollout guards | A double-confirm go-live gate with a conservative preflight, CI-enforced | M5.3, M5.4 |
 | **Live-readiness (code prerequisites for M5.7; 14 steps)** | | | |
-| LR1 | Schwab list-orders endpoint | Read-only, contract-tested `get_orders(from, to)` exposing entered time / side / qty / type per order | M5.1 |
-| LR2 | Bounded order-status poller | Poll-until-terminal with a bounded timeout, cancel-remainder-on-timeout, injected clock/sleep | M5.2 |
-| LR3 | Hardened idempotent placement | Broker id persisted at submit, tri-state reconcile, unknown outcome refused (never resent), lagging-reconciler fuzz | M5.3 |
-| LR4 | Production Schwab order reconciler | Window-bounded unique intent-match over listed orders; ABSENT only after the consistency window | LR1, LR3 |
-| LR5 | Durable order executor wired into the orchestrator | Paper + live orders go write-ahead → place → poll → atomic completion (orders/fills/attribution); backtest unchanged | LR2, LR3, LR4 |
-| LR6 | Persisted daily counters → real DayState | Daily-loss and trades/day rails enforced from persisted start-of-day equity + today's orders | LR5 |
-| LR7 | Kill-switch auto-trips | Auto-engage on a daily-loss breach and on an unknown order outcome | LR5, LR6 |
-| LR8 | PDT rule in the risk gate | Day-trade history from durable fills drives a pure gate rule | LR6 |
-| LR9 | Account reconciliation routine + `trader reconcile` | Resolve non-terminal orders + true positions to the broker; operator command with exit status | LR4, LR5 |
-| LR10 | Live startup reconcile gate | Live `run` reconciles before acting; an unclean reconcile blocks the preflight + alerts | LR9 |
-| LR11 | SchwabBroker crash-safe order mapping | Durable broker-id → client-id resolution so Fills stay complete after a restart | LR3 |
-| LR12 | SchwabBroker fee estimate | Sell-side regulatory fees estimated with the backtest FeesModel (true-up from transactions deferred) | LR11 |
-| LR13 | Conservative live config template | `config/live.example.yaml` proven (by test) to pass the guarded-rollout preflight | M5.6 |
-| LR14 | Go-live runbook | `docs/runbooks/go-live.md`: the M5.7 procedure + the M5.8 compose deployment | LR1–LR13 |
+| LR1 | Schwab list-orders endpoint (#97) | Read-only, contract-tested `get_orders(from, to)` exposing entered time / side / qty / type per order | M5.1 |
+| LR2 | Bounded order-status poller (#98) | Poll-until-terminal with a bounded timeout, cancel-remainder-on-timeout, injected clock/sleep | M5.2 |
+| LR3 | Hardened idempotent placement (#99) | Broker id persisted at submit, tri-state reconcile, unknown outcome refused (never resent), lagging-reconciler fuzz | M5.3 |
+| LR4 | Production Schwab order reconciler (#109) | Window-bounded unique intent-match over listed orders; ABSENT only after the consistency window | LR1, LR3 |
+| LR5 | Durable order executor wired into the orchestrator (#116) | Paper + live orders go write-ahead → place → poll → atomic completion (orders/fills/attribution); backtest unchanged | LR2, LR3, LR4 |
+| LR6 | Persisted daily counters → real DayState (#117) | Daily-loss and trades/day rails enforced from persisted start-of-day equity + today's orders | LR5 |
+| LR7 | Kill-switch auto-trips (#118) | Auto-engage on a daily-loss breach (once per session) and on any post-send order failure; a failed engage latches the executor | LR5, LR6 |
+| LR8 | PDT rule in the risk gate (#119) | Day-trade history from durable orders (uncertain ones count; broker count as a floor) drives a pure gate rule; entries refused at the limit | LR6 |
+| LR9 | Account reconciliation routine + `trader reconcile` (#120) | Settle non-terminal orders + compare positions; operator command with verified overrides, exit codes and a trading lease | LR4, LR5 |
+| LR10 | Live startup reconcile gate (#121) | Live `run` reconciles before acting; unclean → refuse + alert + kill-switch latch; positions checked against an operator-acknowledged baseline | LR9 |
+| LR11 | SchwabBroker crash-safe order mapping (#105) | Durable broker-id → client-id resolution so Fills stay complete after a restart | LR3 |
+| LR12 | SchwabBroker fee estimate (#106) | Sell-side regulatory fees estimated with the backtest FeesModel (true-up from transactions deferred) | LR11 |
+| LR13 | Conservative live config template (#104) | `config/live.example.yaml` proven (by test) to pass the guarded-rollout preflight | M5.6 |
+| LR14 | Go-live runbook (#122) | `docs/runbooks/go-live.md`: the M5.7 procedure + the M5.8 compose deployment | LR1–LR13 |
 | M5.7 | Guarded live verification (first real orders) | Verified guarded live trading at minimal size with intent-match, clean reconciliation, and a working kill… | M5.6, LR1–LR14 |
 | M5.8 | Deploy live via compose | The validated trader running live on the server via docker compose with monitoring and runbooks | M5.7 |
 | **M6 — Refine calculation (9 steps)** | | | |
@@ -1925,6 +1925,8 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 > **Why.** M5.1–M5.6 shipped the parts (order endpoints, SchwabBroker, `submit_idempotent`, kill switch, PDT rule, go-live guard) but not their assembly into the live order path. A 2026-09 audit found: the orchestrator still submits via `broker.submit_order` directly (no write-ahead order row, no reconcile-before-resend); nothing polls a real order to a terminal status (a still-WORKING order would be attributed as a 0-share fill); the daemon passes a neutral DayState, so the daily-loss / trades-per-day rails and the daily-loss auto-trip never fire; PDT is not in the gate; `trader reconcile` is a stub and live startup never reconciles (the preflight's `reconcile_clean` defaults to True); SchwabBroker's broker-id map is in-memory only and fees are 0. Each LR step closes one gap. **All of it is built and tested against fakes — `LIVE_ORDER_PATH_READY` stays `False` throughout; flipping it is part of M5.7, by a human.**
 >
+> **Status (2026-09-30): all 14 steps are merged** (PRs in the table above), each reviewed adversarially and mutation-tested. Review changed a few things from the plan text below: LR7 trips once per session and on any post-send failure; LR8 counts orders rather than fills and refuses entries at the limit; LR9 adds the trading lease and verified overrides; LR10 replaced "park deltas under `unknown`" with an operator-acknowledged positions baseline (`trader reconcile --accept-positions`) and latches the kill switch on a refused start. Related fixes merged alongside: scrubbed logging with no traceback locals (#102), durable SQLite commits (#112), de-risking orders exempt from the daily rails (#111), live state in its own database (#114), the web UI reading the mounted config (#113), compose mounting a chosen config (#108), capped Retry-After (#100), fired-slot claim handling (#103), and a long-only canary strategy (#101).
+
 > **Order-outcome model (LR3/LR5).** A submit ends in exactly one of: *placed* (broker id captured and persisted immediately, before any poll), *definitely not placed* (the broker raises `OrderNotPlacedError`: 4xx rejection, read-only safe mode, connection never established → terminal `not_placed`), or *unknown* (timeout / 5xx / lost response / 2xx without an id → status `unknown`, never resent; resolved only by reconciliation). A reconciler answers FOUND (unique match), ABSENT (authoritative: consistency window elapsed, nothing matches) or INCONCLUSIVE (lagging, ambiguous, or errored); only ABSENT permits a resend of the same `client_order_id`, and the orchestrator never retries an order anyway (each slot makes a fresh decision).
 
 **LR1 — Schwab list-orders endpoint.** *Build:* `schwab/orders.py` — `SchwabTradingClient.get_orders(account_hash, *, from_entered, to_entered)` (GET `accounts/{hash}/orders?fromEnteredTime=&toEnteredTime=` **[VERIFY]**); `SchwabOrderStatus` gains `entered_time`, `side`, `order_type`, `price`. *Validation:* respx contract tests for the query-param format, list parsing, empty list, malformed payload → `SchwabBadResponseError`. Read-only; no order path.
@@ -1939,13 +1941,13 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 **LR6 — Persisted daily counters → real DayState.** *Build:* `state/daily.py` — start-of-day equity persisted at the first observation of each exchange session; `trades_today` from today's orders (excluding `not_placed`); `loss_today = max(0, SOD equity − equity)`; the `daily_counters` row kept current for the web UI. The orchestrator takes an optional day-state provider, recomputed per order so in-cycle orders count. *Validation:* SOD persistence across restarts and sessions, counting, per-order recomputation blocks the (max+1)th trade, loss breach rejects.
 
-**LR7 — Kill-switch auto-trips.** *Build:* `trader run` composes `maybe_trip_on_daily_loss` into the day-state provider and engages the switch (source `auto`) when the executor reports an unknown order outcome. *Validation:* breach → engaged + alert, next cycle halted; unknown outcome → engaged.
+**LR7 — Kill-switch auto-trips.** *Build:* `trader run` composes `maybe_trip_on_daily_loss` into the day-state provider and engages the switch (source `auto`) when the executor reports an unknown order outcome. *As built:* the daily-loss trip fires once per session (migration 007), so an operator's release lets exits through while the loss rule refuses entries. The executor's hook fires on any failure after placement except a definite rejection, and a failed engage makes the executor refuse every later order until restart. *Validation:* breach → engaged + alert, next cycle halted; unknown outcome → engaged.
 
-**LR8 — PDT rule in the risk gate.** *Build:* `DayState` gains the day-trade count over the rolling window and today's executed (symbol, side) pairs, derived from durable fills ⨝ orders over the calendar window; `rules.pattern_day_trader` is a pure rule the gate runs account-wide. *Validation:* blocks the (max+1)th day-trade under the equity threshold, allows above it, disabled by `enforce_pdt: false`, window expiry.
+**LR8 — PDT rule in the risk gate.** *Build:* `DayState` gains the day-trade count over the rolling window and today's executed (symbol, side) pairs, derived from durable fills ⨝ orders over the calendar window; `rules.pattern_day_trader` is a pure rule the gate runs account-wide. *As built:* executions come from the durable orders: every order that may have executed, uncertain ones included, bucketed by the session it was sent in. Schwab's `roundTrips` is a floor. The threshold is checked against the lower of start-of-day and current equity, and at the limit new entries are refused too. *Validation:* blocks the (max+1)th day-trade under the equity threshold, allows above it, disabled by `enforce_pdt: false`, window expiry.
 
-**LR9 — Account reconciliation routine + `trader reconcile`.** *Build:* `execution/account_reconcile.py` — resolve every non-terminal local order (poll/cancel/complete by broker id; adopt via LR4; mark `not_placed` only on ABSENT) and true positions to the broker (park deltas under `unknown`); `trader reconcile` prints the report and exits 0 clean / 2 divergent. *Validation:* each order-resolution branch, position divergence, CLI exit codes.
+**LR9 — Account reconciliation routine + `trader reconcile`.** *Build:* `execution/account_reconcile.py` — resolve every non-terminal local order (poll/cancel/complete by broker id; adopt via LR4; mark `not_placed` only on ABSENT) and true positions to the broker (park deltas under `unknown`); `trader reconcile` prints the report and exits 0 clean / 2 divergent. *As built:* positions are compared, not parked. The routine requires the trading lease (`state/lease.py`). A bound order is read before it is polled, since polling may cancel it. Overrides (`--mark-not-placed`, `--adopt` verified against the Schwab order, `--unbind`) are all-or-nothing. Exit codes: 0 clean, 1 config/state, 2 not clean, 3 lease held, 4 broker error. *Validation:* each order-resolution branch, position divergence, CLI exit codes.
 
-**LR10 — Live startup reconcile gate.** *Build:* live `run` builds the broker, reconciles, and feeds `reconcile_clean` into `live_preflight`; unclean → refuse to start + `RECONCILE_MISMATCH` alert. *Validation:* clean → preflight passes that check; divergent → refuses + alerts.
+**LR10 — Live startup reconcile gate.** *Build:* live `run` builds the broker, reconciles, and feeds `reconcile_clean` into `live_preflight`; unclean → refuse to start + `RECONCILE_MISMATCH` alert. *As built:* `reconcile_before_live` runs after the static preflight, waiting out an open consistency window once. The `unknown` bucket became an operator-acknowledged baseline that only `trader reconcile --accept-positions` moves, so a change can't be silently accepted on a retry or restart. A refused start alerts once and latches the kill switch. *Validation:* clean → preflight passes that check; divergent → refuses + alerts.
 
 **LR11 — SchwabBroker crash-safe order mapping.** *Build:* optional durable `client_id_for` resolver (OrderRepository-backed); the in-memory map becomes a cache. *Validation:* a fresh broker instance builds a complete Fill for an order placed by a previous process.
 
@@ -1961,7 +1963,7 @@ M1/M3/M6/M7 were detailed by parallel agents against `design.md`; M0/M2/M4/M5 we
 
 **Build (files):**
 
-- `docs/runbooks/go-live.md` *(create)* — Go-live runbook: tiny size, single allowlisted symbol, monitoring checklist, abort/kill procedure, rollback to paper.
+- `docs/runbooks/go-live.md` *(created by LR14)* — Go-live runbook: tiny size, single allowlisted symbol, monitoring checklist, abort/kill procedure, rollback to paper.
 
 **Libraries:** —
 

@@ -55,6 +55,10 @@ execution:
   order_type: market
   poll_timeout_seconds: 60
   rate_limit_per_min: 100
+  # Fee ESTIMATE recorded on fills (commission per fill + sell-side regulatory bps). Schwab
+  # online equity trades are commission-free; set regulatory_bps to the current SEC fee
+  # rate [VERIFY]. Real fees are in Schwab's transaction history (not yet reconciled).
+  fees_model: { commission: 0, regulatory_bps: 0 }
 
 alerting:
   channels: [telegram, email]     # configure at least one in the secrets env file

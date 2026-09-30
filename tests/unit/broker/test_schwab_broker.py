@@ -209,3 +209,55 @@ def test_get_account_maps_balances() -> None:
     assert account.cash == Decimal("1000")
     assert account.buying_power == Decimal("5000")
     assert account.equity == Decimal("12345.67")
+
+
+# --- fee estimate (LR12) ---------------------------------------------------------- #
+
+
+def _fee_broker(client: _FakeTradingClient) -> SchwabBroker:
+    from trader.broker.sim import FeesModel
+
+    fees = FeesModel(commission=Decimal("1"), regulatory_bps=10.0)  # 10 bps on sells
+    return SchwabBroker(client, ACCT, clock=FakeClock(NOW), fees=fees)  # type: ignore[arg-type]
+
+
+def _status(side: Side | None, filled: int) -> SchwabOrderStatus:
+    status = OrderStatus.FILLED if filled else OrderStatus.WORKING
+    return SchwabOrderStatus(
+        "SCHWAB-1", status, "AAPL", 10, filled, Decimal("100"), status.value, side=side
+    )
+
+
+def test_buy_fill_pays_commission_only() -> None:
+    client = _FakeTradingClient()
+    client.set_status("SCHWAB-1", _status(Side.BUY, 10))
+    assert _fee_broker(client).get_order("SCHWAB-1").fees == Decimal("1")
+
+
+def test_sell_fill_pays_commission_plus_regulatory_bps() -> None:
+    client = _FakeTradingClient()
+    client.set_status("SCHWAB-1", _status(Side.SELL, 10))
+    # 10 shares * $100 = $1000 notional; 10 bps = $1.00; + $1 commission
+    assert _fee_broker(client).get_order("SCHWAB-1").fees == Decimal("2")
+
+
+def test_unfilled_order_has_no_fees() -> None:
+    client = _FakeTradingClient()
+    client.set_status("SCHWAB-1", _status(Side.SELL, 0))
+    assert _fee_broker(client).get_order("SCHWAB-1").fees == Decimal("0")
+
+
+def test_side_falls_back_to_the_order_sent_then_to_commission_only() -> None:
+    client = _FakeTradingClient()
+    broker = _fee_broker(client)
+    broker.submit_order(_order(side=Side.SELL))  # remembered side: SELL
+    client.set_status("SCHWAB-1", _status(None, 10))  # Schwab's instruction unrecognized
+    assert broker.get_order("SCHWAB-1").fees == Decimal("2")
+    fresh = _fee_broker(client)  # after a restart nothing is remembered: commission only
+    assert fresh.get_order("SCHWAB-1").fees == Decimal("1")
+
+
+def test_default_broker_estimates_zero_fees() -> None:
+    client = _FakeTradingClient()
+    client.set_status("SCHWAB-1", _status(Side.SELL, 10))
+    assert _broker(client).get_order("SCHWAB-1").fees == Decimal("0")

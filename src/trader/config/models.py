@@ -173,21 +173,24 @@ class StrategyBindingConfig(_Base):
         return self
 
 
+class FeesModelConfig(_Base):
+    commission: Decimal = Decimal("0")
+    regulatory_bps: float = Field(default=0.0, ge=0)
+
+
 class ExecutionConfig(_Base):
     order_type: OrderType = OrderType.MARKET
     poll_timeout_seconds: int = Field(default=60, gt=0)
     rate_limit_per_min: int = Field(default=100, gt=0, le=120)
+    # Fee estimate applied to paper (SimBroker) and live (SchwabBroker) fills so their P&L
+    # tracks real economics; the backtest has its own ``backtest.fees_model``.
+    fees_model: FeesModelConfig = Field(default_factory=FeesModelConfig)
 
     @field_validator("order_type", mode="before")
     @classmethod
     def _normalize_order_type(cls, v: object) -> object:
         # Config uses lowercase (order_type: market); OrderType values are UPPER.
         return v.upper() if isinstance(v, str) else v
-
-
-class FeesModelConfig(_Base):
-    commission: Decimal = Decimal("0")
-    regulatory_bps: float = Field(default=0.0, ge=0)
 
 
 class SlippageModelConfig(_Base):

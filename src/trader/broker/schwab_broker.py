@@ -22,7 +22,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from decimal import Decimal
 
+from trader.broker.sim import FeesModel
 from trader.core import Account, Fill, Order, Position
+from trader.core.enums import Side
 from trader.core.protocols import Clock
 from trader.observability.logging import get_logger
 from trader.schwab.errors import SchwabReadOnlyModeError
@@ -39,15 +41,19 @@ class SchwabBroker:
         *,
         clock: Clock,
         client_id_for: Callable[[str], str | None] | None = None,
+        fees: FeesModel | None = None,
     ) -> None:
         self._client = client
         self._account = account_hash
         self._clock = clock
-        # broker_order_id -> (client_order_id, symbol) for orders placed by THIS process.
-        # Schwab doesn't echo our client id; ``client_id_for`` (a durable lookup over the
-        # orders table) answers for orders placed before a restart.
-        self._submitted: dict[str, tuple[str, str]] = {}
+        # broker_order_id -> (client_order_id, symbol, side) for orders placed by THIS
+        # process. Schwab doesn't echo our client id; ``client_id_for`` (a durable lookup
+        # over the orders table) answers for orders placed before a restart.
+        self._submitted: dict[str, tuple[str, str, Side]] = {}
         self._client_id_for = client_id_for
+        # Fees are ESTIMATED with the same model as the simulator (commission + sell-side
+        # regulatory bps); a true-up from Schwab's transaction records is not implemented.
+        self._fees = fees or FeesModel()
         self._log = get_logger("broker.schwab")
 
     def submit_order(self, order: Order) -> str:
@@ -64,7 +70,7 @@ class SchwabBroker:
             limit_price=order.limit_price,
         )
         broker_order_id = self._client.place_order(self._account, order_json)
-        self._submitted[broker_order_id] = (order.client_order_id, order.symbol)
+        self._submitted[broker_order_id] = (order.client_order_id, order.symbol, order.side)
         self._log.info(
             "order submitted",
             cid=order.client_order_id,
@@ -75,9 +81,12 @@ class SchwabBroker:
 
     def get_order(self, broker_order_id: str) -> Fill:
         status = self._client.get_order(self._account, broker_order_id)
-        client_order_id, sent_symbol = self._submitted.get(broker_order_id, ("", ""))
+        client_order_id, sent_symbol, sent_side = self._submitted.get(
+            broker_order_id, ("", "", None)
+        )
         if not client_order_id and self._client_id_for is not None:
             client_order_id = self._client_id_for(broker_order_id) or ""
+        side = status.side or sent_side  # Schwab's instruction survives a restart
         if sent_symbol and status.symbol and sent_symbol != status.symbol:
             self._log.error(
                 "order status symbol differs from the order sent",
@@ -93,10 +102,18 @@ class SchwabBroker:
             symbol=status.symbol or sent_symbol,
             quantity=status.filled_quantity,  # 0 while still WORKING (valid; no fill yet)
             price=status.average_price,  # 0 until something fills
-            fees=Decimal(0),  # real fees come from the transaction record (reconciled later)
+            fees=self._estimate_fees(status.filled_quantity, status.average_price, side),
             ts=self._clock.now(),
             status=status.status,
         )
+
+    def _estimate_fees(self, quantity: int, price: Decimal, side: Side | None) -> Decimal:
+        if quantity == 0:
+            return Decimal(0)
+        if side is None:  # unknown instruction: commission only, never guess a side
+            self._log.warning("order side unknown; regulatory fees not estimated")
+            return self._fees.commission
+        return self._fees.fee(Decimal(quantity) * price, side)
 
     def cancel_order(self, broker_order_id: str) -> None:
         self._client.cancel_order(self._account, broker_order_id)

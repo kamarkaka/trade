@@ -19,9 +19,11 @@ synchronous SimBroker) keeps golden runs unchanged.
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from functools import partial
 from typing import Protocol
 
 from trader.core import Fill, Order
@@ -44,6 +46,9 @@ from trader.state.attribution import AttributionLedger
 
 _log = get_logger("execution.executor")
 
+_COMPLETE_ATTEMPTS = 3
+_COMPLETE_RETRY_SECONDS = 1.0
+
 
 class OrderUnresolvedError(Exception):
     """The order was placed (its broker id is recorded) but did not reach a terminal status
@@ -51,12 +56,23 @@ class OrderUnresolvedError(Exception):
     attributed."""
 
     def __init__(
-        self, client_order_id: str, broker_order_id: str, detail: str, last_fill: Fill | None
+        self,
+        client_order_id: str,
+        broker_order_id: str,
+        detail: str,
+        last_fill: Fill | None,
+        *,
+        cancel_attempted: bool = False,
+        cancel_accepted: bool = False,
     ) -> None:
         super().__init__(f"order {client_order_id} ({broker_order_id}) unresolved: {detail}")
         self.client_order_id = client_order_id
         self.broker_order_id = broker_order_id
         self.last_fill = last_fill
+        # Whether a cancel of the remainder went out — an unaccepted cancel means the order
+        # may still be resting at the broker.
+        self.cancel_attempted = cancel_attempted
+        self.cancel_accepted = cancel_accepted
 
 
 class OrderExecutor(Protocol):
@@ -105,7 +121,14 @@ class DurableOrderExecutor:
                 retryable=self._retryable,
             )
         except OrderStatusUnavailableError as exc:
-            raise OrderUnresolvedError(cid, broker_order_id, str(exc), exc.last_fill) from exc
+            raise OrderUnresolvedError(
+                cid,
+                broker_order_id,
+                str(exc),
+                exc.last_fill,
+                cancel_attempted=exc.cancel_attempted,
+                cancel_accepted=exc.cancel_accepted,
+            ) from exc
         fill = replace(result.fill, client_order_id=cid)  # the broker may not know our id
         if not result.terminal:
             _log.error(
@@ -116,15 +139,52 @@ class DurableOrderExecutor:
                 filled=fill.quantity,
             )
             raise OrderUnresolvedError(
-                cid, broker_order_id, f"still {fill.status.value} after polling", fill
+                cid,
+                broker_order_id,
+                f"still {fill.status.value} after polling",
+                fill,
+                cancel_attempted=result.cancel_attempted,
+                cancel_accepted=result.cancel_accepted,
             )
+        self._complete(order, broker_order_id, fill)
+        return fill
+
+    def _complete(self, order: Order, broker_order_id: str, fill: Fill) -> None:
+        """Record the terminal fill atomically. Completion is idempotent, so a transient
+        database failure (e.g. a busy lock) is retried a few times; if it still can't be
+        recorded — or the fill contradicts the order — the order is unresolved (raised),
+        never silently dropped."""
+        cid = order.client_order_id
         record = self._repo.get(cid)
         if record is None:  # pragma: no cover - place_idempotent just wrote it
             raise RuntimeError(f"order {cid} has no row")
-        self._repo.complete(
-            record, fill, lambda: self._attribution.apply(fill, order.strategy_id, order.side)
-        )
-        return fill
+        apply = partial(self._attribution.apply, fill, order.strategy_id, order.side)
+        last_error: Exception | None = None
+        for attempt in range(_COMPLETE_ATTEMPTS):
+            try:
+                self._repo.complete(record, fill, apply)
+                return
+            except sqlite3.OperationalError as exc:  # busy/locked or I/O: worth a retry
+                last_error = exc
+                _log.warning(
+                    "could not record a terminal fill; retrying",
+                    cid=cid,
+                    broker_order_id=broker_order_id,
+                    attempt=attempt + 1,
+                    error=type(exc).__name__,
+                )
+                self._sleep(_COMPLETE_RETRY_SECONDS)
+            except ValueError as exc:  # the fill contradicts the order: never attribute it
+                raise OrderUnresolvedError(
+                    cid, broker_order_id, f"fill rejected: {exc}", fill
+                ) from exc
+        raise OrderUnresolvedError(
+            cid,
+            broker_order_id,
+            f"{fill.status.value} {fill.quantity} filled but not recorded "
+            f"({type(last_error).__name__})",
+            fill,
+        ) from last_error
 
 
 def in_memory_reconciler(find_by_client_id: Callable[[str], Fill | None]) -> Reconciler:

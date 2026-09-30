@@ -122,3 +122,39 @@ def test_an_unknown_outcome_fails_the_cycle_before_any_further_order(tmp_path: P
     assert len(broker.submitted) == 1  # SPY was never sent while AAPL's fate is uncertain
     assert dict(_rows(conn, "SELECT client_order_id, status FROM orders")) == {"o0": "unknown"}
     assert attribution.get_attributed("s1") == []
+
+
+def test_a_kill_switch_engaged_mid_cycle_stops_the_remaining_orders(tmp_path: Path) -> None:
+    switch = {"on": False}
+
+    class _TripDuringFirst(FakeBroker):
+        def submit_order(self, order: Order) -> str:
+            switch["on"] = True  # e.g. `trader kill --on` while order 1 was being polled
+            return super().submit_order(order)
+
+    orch, _, _, audit = _setup(tmp_path, _TripDuringFirst())
+    orch._kill_switch = lambda: switch["on"]
+    decisions = [Decision(Action.BUY, "AAPL", 1), Decision(Action.BUY, "SPY", 1)]
+    result = orch.run_cycle(_Decide(decisions), ["AAPL", "SPY"], "s1", NOW)
+    assert [f.symbol for f in result.fills] == ["AAPL"] and result.halted
+    assert ("kill_switch_halt", "mid-cycle") in [(e.kind, e.detail) for e in audit.events]
+
+
+def test_the_gate_sees_a_fresh_quote_on_the_durable_path(tmp_path: Path) -> None:
+    # The snapshot quote went stale while earlier orders were polled; the gate re-reads it.
+    from datetime import timedelta
+
+    from trader.clock.virtual import VirtualClock
+    from trader.config.models import RiskConfig
+    from trader.risk.gate import RiskManager
+
+    orch, _, _, _ = _setup(tmp_path, FakeBroker())
+    later = NOW + timedelta(minutes=10)
+    fresh = Quote("SPY", later, Decimal("100"), Decimal("100"), Decimal("100"), 1000)
+    orch._data = FakeMarketDataProvider(quotes={"SPY": [_quote("SPY"), fresh]})
+    orch._clock = VirtualClock(later)
+    orch._risk = RiskManager(account_config=RiskConfig(), clock=orch._clock)
+    stale_snapshot_cycle = orch.run_cycle(
+        _Decide([Decision(Action.BUY, "SPY", 1)]), ["SPY"], "s1", NOW
+    )
+    assert [o.symbol for o in stale_snapshot_cycle.orders] == ["SPY"]  # not refused as stale

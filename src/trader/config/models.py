@@ -180,7 +180,8 @@ class FeesModelConfig(_Base):
 
 class ExecutionConfig(_Base):
     order_type: OrderType = OrderType.MARKET
-    # Bounded: the cycle (and the global cycle lock) waits at most this long per order.
+    # Bounds the polling per order (the cycle and the global cycle lock wait on it); broker
+    # calls add their own transport retries on top.
     poll_timeout_seconds: int = Field(default=60, gt=0, le=600)
     rate_limit_per_min: int = Field(default=100, gt=0, le=120)
     # How long after an unknown-outcome send the order listing must stay empty before the

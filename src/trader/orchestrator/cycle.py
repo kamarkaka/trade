@@ -246,7 +246,16 @@ class Orchestrator:
                 # Reconcile same-ticker conflicts across the cycle's decisions BEFORE sizing
                 # (net default), then route each resulting order through the chokepoint.
                 resolved = self._risk.resolve_conflicts([(strategy_id, d) for d in decisions])
-                for rd in resolved:
+                for i, rd in enumerate(resolved):
+                    if i and self._kill_switch_now():
+                        # Re-read before every further order: execution (polling) can take a
+                        # while, and an engage in the meantime must stop the rest of the cycle.
+                        self._log.warning("kill switch engaged mid-cycle; remaining orders dropped")
+                        self._audit.record(
+                            AuditEvent(cycle_id, strategy_id, "kill_switch_halt", "mid-cycle")
+                        )
+                        result.halted = True
+                        break
                     self._handle_resolved(rd, strategy_id, cycle_id, snapshot, ds, result)
             except Exception as exc:
                 # Strategy isolation (Appendix C#6): a failing cycle must never crash the
@@ -275,7 +284,7 @@ class Orchestrator:
         order = self._sizer(decision, strategy_id)
         if order is None:
             return
-        quote = snapshot.quotes.get(order.symbol)
+        quote = self._quote_for_gate(order.symbol, snapshot)
         if quote is None:
             # Fail closed: never trade a symbol we have no quote for (the gate would reject
             # anyway; do it here so check() keeps its non-optional Quote contract).
@@ -317,8 +326,8 @@ class Orchestrator:
         else:
             try:
                 # Completes atomically (terminal status + fill row + attribution). An unknown
-                # or unresolved outcome raises past here and fails the cycle (alerted), so no
-                # further order is sent while an order's fate is uncertain.
+                # or unresolved outcome raises past here and fails this cycle (alerted), so no
+                # further order is sent in it.
                 fill = self._executor.execute(final_order)
             except OrderNotPlacedError as exc:
                 self._not_placed(final_order, strategy_id, cycle_id, result, str(exc))
@@ -360,6 +369,21 @@ class Orchestrator:
             )
         )
         result.not_placed.append(order)
+
+    def _kill_switch_now(self) -> bool:
+        return bool(self._kill_switch()) if self._kill_switch is not None else False
+
+    def _quote_for_gate(self, symbol: str, snapshot: MarketSnapshot) -> Quote | None:
+        """The quote the gate checks an order against. On the durable (paper/live) path it is
+        re-read for each order — earlier orders' polling may have taken a while, and a stale
+        cycle-start quote would be refused (or worse, relied on). Backtests use the snapshot
+        (the virtual clock doesn't move within a cycle)."""
+        if self._executor is None:
+            return snapshot.quotes.get(symbol)
+        try:
+            return self._data.get_quote(symbol, self._clock.now())
+        except (LookupError, ValueError):
+            return None
 
     def _reject(
         self, order: Order, strategy_id: str, cycle_id: str, result: CycleResult, reason: str

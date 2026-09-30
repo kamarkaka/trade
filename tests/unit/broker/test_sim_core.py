@@ -8,7 +8,7 @@ import pytest
 
 from fakes import FakeClock, FakeMarketDataProvider
 from trader.broker import FeesModel, SimBroker, SlippageModel
-from trader.core import Order, Quote
+from trader.core import Order, OrderNotPlacedError, Quote
 from trader.core.enums import OrderType, Side
 from trader.core.protocols import Broker
 
@@ -201,8 +201,9 @@ def test_negative_fill_price_is_atomic() -> None:
     broker = _broker(
         bid="100", ask="100", cash="100000", slippage=SlippageModel("fixed", Decimal("200"))
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(OrderNotPlacedError) as excinfo:  # definitely not placed
         broker.submit_order(_order(Side.SELL, qty=1))
+    assert isinstance(excinfo.value.__cause__, ValueError)
     assert broker.get_account().cash == Decimal("100000")  # no state mutated
     assert broker.get_positions() == []
 
@@ -243,3 +244,17 @@ def test_find_by_client_id_is_the_paper_reconciliation_lookup() -> None:
     assert result.outcome is ReconcileOutcome.FOUND and result.broker_order_id == broker_order_id
     _Rec.client_order_id = "never-sent"
     assert reconcile(_Rec()).outcome is ReconcileOutcome.ABSENT  # type: ignore[arg-type]
+
+
+def test_order_ids_use_the_process_prefix() -> None:
+    data = FakeMarketDataProvider(quotes={"AAPL": [_quote("AAPL", bid="100", ask="100")]})
+    broker = SimBroker(data, FakeClock(NOW), starting_cash=Decimal("1000"), id_prefix="SIM-ab12")
+    assert broker.submit_order(_order(Side.BUY, qty=1, cid="p1")) == "SIM-ab12-1"
+
+
+def test_a_missing_quote_means_definitely_not_placed() -> None:
+    broker = SimBroker(FakeMarketDataProvider(), FakeClock(NOW), starting_cash=Decimal("1000"))
+    with pytest.raises(OrderNotPlacedError) as excinfo:
+        broker.submit_order(_order(Side.BUY, qty=1))
+    assert isinstance(excinfo.value.__cause__, LookupError)
+    assert broker.find_by_client_id("c1") is None

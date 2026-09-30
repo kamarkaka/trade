@@ -180,6 +180,10 @@ _COLUMNS = (
 )
 
 
+def _canon_symbol(symbol: str) -> str:
+    return symbol.strip().upper().replace("/", ".")
+
+
 def _iso(ts: datetime) -> str:
     return ts.astimezone(UTC).isoformat()
 
@@ -379,6 +383,10 @@ class OrderRepository:
                     f"fill for {fill.broker_order_id} does not belong to order "
                     f"{record.client_order_id} ({row[1]})"
                 )
+            if _canon_symbol(fill.symbol) != _canon_symbol(record.symbol):
+                raise ValueError(f"fill symbol {fill.symbol!r} != order symbol {record.symbol!r}")
+            if fill.quantity > record.quantity:
+                raise ValueError(f"filled {fill.quantity} > ordered {record.quantity}")
             if fill.quantity > 0:
                 self._conn.execute(
                     "INSERT INTO fills (client_order_id, broker_order_id, symbol, quantity, "

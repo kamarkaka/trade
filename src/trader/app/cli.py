@@ -168,6 +168,7 @@ def run(
     """Run the trading daemon. PAPER (default) uses SimBroker against live quotes (no real
     orders). LIVE places REAL orders and requires mode=live PLUS a second confirmation."""
     import time as _time
+    import uuid
 
     from trader.app.live_guard import announce_live, live_confirmed, live_preflight
     from trader.broker import FeesModel, SimBroker
@@ -313,7 +314,11 @@ def run(
         else:
             # PAPER: SimBroker, never real. It can't change state while we poll, so read once
             # and cancel any remainder (a resting limit order is never left WORKING).
-            sim = SimBroker(data, clock, starting_cash=cash, fees=fees)
+            # Each process gets its own order-id namespace: durable order rows outlive this
+            # in-memory broker, and a broker id may belong to only one order row.
+            sim = SimBroker(
+                data, clock, starting_cash=cash, fees=fees, id_prefix=f"SIM-{uuid.uuid4().hex[:8]}"
+            )
             broker = sim
             reconcile = in_memory_reconciler(sim.find_by_client_id)
             poll_policy = PollPolicy(timeout_seconds=0)

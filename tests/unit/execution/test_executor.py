@@ -240,3 +240,98 @@ def test_repository_lookups(tmp_path: Path) -> None:
     executor.execute(_order("c2"))
     assert repo.client_id_for("b-2") == "c2" and repo.client_id_for("nope") is None
     assert repo.bound_broker_ids() == {"b-1", "b-2"}
+
+
+# --- review follow-ups ------------------------------------------------------------ #
+
+
+def test_two_paper_processes_on_one_database_never_collide(tmp_path: Path) -> None:
+    # Every paper process restarts its in-memory SimBroker; with a per-process id prefix
+    # its orders never collide with the durable rows of an earlier process.
+    from fakes import FakeClock, FakeMarketDataProvider
+    from trader.broker import SimBroker
+    from trader.core import Quote
+    from trader.execution.executor import in_memory_reconciler
+
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn)
+    price = Decimal("100")
+    ts = FakeBroker().ts
+    data = FakeMarketDataProvider(quotes={"AAPL": [Quote("AAPL", ts, price, price, price, 1000)]})
+    repo, attribution = OrderRepository(conn), AttributionLedger(conn)
+    for run, prefix in enumerate(("SIM-aaaa", "SIM-bbbb")):
+        sim = SimBroker(data, FakeClock(ts), starting_cash=Decimal("100000"), id_prefix=prefix)
+        executor = DurableOrderExecutor(
+            broker=sim,
+            repo=repo,
+            attribution=attribution,
+            reconcile=in_memory_reconciler(sim.find_by_client_id),
+            poll_policy=PollPolicy(timeout_seconds=0),
+        )
+        fill = executor.execute(_order(f"run{run}", qty=5))
+        assert fill.status is OrderStatus.FILLED and fill.broker_order_id == f"{prefix}-1"
+    assert _attributed(attribution) == {"AAPL": 10}  # both processes' fills attributed
+
+
+def test_a_transient_completion_failure_is_retried(tmp_path: Path) -> None:
+    executor, _, repo, attribution, conn = _setup(tmp_path)
+    real_complete = repo.complete
+    calls = {"n": 0}
+
+    def flaky(*args: object, **kwargs: object) -> bool:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return real_complete(*args, **kwargs)  # type: ignore[arg-type]
+
+    repo.complete = flaky  # type: ignore[method-assign]
+    executor.execute(_order())
+    assert calls["n"] == 3 and _attributed(attribution) == {"AAPL": 10}
+    assert _status(repo)[0] == "FILLED" and len(_fill_rows(conn)) == 1
+
+
+def test_a_fill_that_cannot_be_recorded_is_unresolved_with_its_details(tmp_path: Path) -> None:
+    executor, _, repo, attribution, _ = _setup(tmp_path)
+
+    def stuck(*args: object, **kwargs: object) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    repo.complete = stuck  # type: ignore[method-assign]
+    with pytest.raises(OrderUnresolvedError, match="FILLED 10 filled but not recorded") as ei:
+        executor.execute(_order())
+    assert ei.value.last_fill is not None and ei.value.last_fill.quantity == 10
+    assert _status(repo) == (PLACED, "b-1") and _attributed(attribution) == {}
+
+
+def test_a_fill_that_contradicts_the_order_is_never_attributed(tmp_path: Path) -> None:
+    class _WrongSymbol(_CancellableBroker):
+        def get_order(self, broker_order_id: str) -> Fill:
+            f = super().get_order(broker_order_id)
+            return Fill(f.client_order_id, f.broker_order_id, "TSLA", f.quantity, f.price,
+                        f.fees, f.ts, f.status)  # fmt: skip
+
+    executor, _, _, attribution, conn = _setup(tmp_path, _WrongSymbol())
+    with pytest.raises(OrderUnresolvedError, match="fill rejected: fill symbol"):
+        executor.execute(_order())
+    assert _attributed(attribution) == {} and _fill_rows(conn) == []
+
+
+def test_completion_rejects_more_shares_than_ordered(tmp_path: Path) -> None:
+    _, broker, repo, _, _ = _setup(tmp_path)
+    repo._write_pending(_order(qty=10))
+    repo.record_placed("c1", "b-1")
+    record = repo.get("c1")
+    assert record is not None
+    too_many = Fill("c1", "b-1", "AAPL", 11, Decimal("100"), Decimal("0"), broker.ts,
+                    OrderStatus.FILLED)  # fmt: skip
+    with pytest.raises(ValueError, match="filled 11 > ordered 10"):
+        repo.complete(record, too_many, lambda: None)
+
+
+def test_an_unresolved_error_reports_whether_the_cancel_went_through(tmp_path: Path) -> None:
+    broker = FakeBroker()  # cancel is accepted but doesn't change the (partial) status
+    broker.fill_quantity = 4
+    executor, _, _, _, _ = _setup(tmp_path, broker)
+    with pytest.raises(OrderUnresolvedError) as ei:
+        executor.execute(_order())
+    assert ei.value.cancel_attempted and ei.value.cancel_accepted

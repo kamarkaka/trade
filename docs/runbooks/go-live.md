@@ -27,7 +27,8 @@ path end to end, then run live under docker compose.
    trades per day, pattern-day-trader, allowlist, kill switch); at-most-once placement (one
    send per `client_order_id`; an order whose outcome is unknown is never re-sent); bounded
    polling that cancels an unfinished remainder; and kill-switch auto-trips on a daily-loss
-   breach or an order of unknown/unresolved fate.
+   breach (once per session) or on any failure after an order is sent other than a definite
+   rejection (an unknown or unresolved outcome, a fill that couldn't be recorded).
 
 ---
 
@@ -40,8 +41,10 @@ path end to end, then run live under docker compose.
   list-orders endpoint (`fromEnteredTime`/`toEnteredTime` format and inclusivity, the ~60-day
   look-back, `maxResults`); the order JSON fields used for reconciliation (`enteredTime`
   format, `duration`, `session`, `orderStrategyType`, the leg quantity); a 4xx means the
-  order was not processed; the token lifetimes. Most can be checked read-only (quotes, the
-  account, listing your existing orders).
+  order was not processed; the token lifetimes; in the account response,
+  `initialBalances.liquidationValue` (used as the start-of-day equity for the daily-loss rail)
+  and `roundTrips` (the day-trade count used as a floor by the PDT rule). Most can be checked
+  read-only (quotes, the account, listing your existing orders).
 - **The account is ready.** Decide margin vs cash (the pattern-day-trader limit applies to a
   margin account under $25k). Pick a symbol you do **not** otherwise hold in this account.
   **Do not trade that symbol by hand during the verification**: an identical order entered
@@ -142,8 +145,16 @@ spans two sessions, so it is not a day-trade.
   entered at the same time), check the Schwab order history and settle it by hand:
   `trader reconcile --adopt CID=SCHWAB_ORDER_ID` or `--mark-not-placed CID`. Then
   `trader kill --off`.
-- **A daily-loss breach** engages the kill switch (source `auto`). Review, and release it with
-  `trader kill --off` when ready.
+- **A daily-loss breach** engages the kill switch (source `auto`), once per session. Review,
+  then `trader kill --off` lets exits through; the daily-loss rule keeps refusing new entries
+  for the rest of the session, and the switch does not re-trip that session.
+- **Alert "order execution halted: could not engage the kill switch …"**: an order's fate
+  became uncertain and the switch could not be written (e.g. the state volume is full or
+  read-only). That process refuses every order until restarted. Stop it, fix the volume,
+  `trader kill --on`, `trader reconcile`, then restart.
+- **Orders refused with "PDT: …"**: the account is at the pattern-day-trader limit while
+  under the equity threshold. New entries and same-session exits are refused until the
+  rolling window moves on; an exit of a position held overnight still goes through.
 - **Start refused: "startup reconciliation is not clean".** Run `trader reconcile` to see why:
   unresolved orders (above), or a new unexplained position change. Holdings that are yours and
   unchanged are reported as *standing* and do not block; after your own manual trade, re-run

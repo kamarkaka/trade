@@ -102,3 +102,28 @@ def test_orphaned_claimed_slot_recovery(tmp_path: Path) -> None:
     assert len(stale) == 1
     assert stale[0].strategy_id == "momentum"
     assert later.stale_claims(grace_seconds=10_000) == []  # within grace -> not stale
+
+
+def test_unexpected_failure_rolls_back_and_leaves_no_open_transaction(tmp_path: Path) -> None:
+    # A failure other than the duplicate-claim IntegrityError must not leave BEGIN IMMEDIATE
+    # open on the shared connection: later writes (e.g. order write-ahead rows) would join an
+    # uncommitted transaction, and every later claim would fail.
+    conn = connect(tmp_path / "s.sqlite")
+    run_migrations(conn)
+    calls = {"n": 0}
+
+    def flaky_now() -> datetime:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("clock read failed")  # raised inside the claim's transaction
+        return FIRE
+
+    ledger = FiredSlotLedger(conn, now=flaky_now)
+    try:
+        _claim(ledger)
+        raise AssertionError("expected the failure to propagate")
+    except OSError:
+        pass
+    assert not conn.in_transaction  # rolled back, connection usable
+    assert ledger.was_fired(DAY, "momentum", "open") is None  # nothing half-written
+    assert _claim(ledger) is True  # the next claim works normally

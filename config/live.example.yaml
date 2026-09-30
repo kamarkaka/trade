@@ -1,0 +1,66 @@
+# LIVE (REAL MONEY) configuration TEMPLATE for the guarded first rollout (M5.7).
+# Copy it (e.g. to deploy/config/live.yaml), review EVERY value, then pass --config.
+# Procedure: docs/runbooks/go-live.md.
+#
+# It is shaped to pass `live_preflight` (src/trader/app/live_guard.py — proven by
+# tests/unit/app/test_live_config_template.py):
+#   - effective per-strategy max_order_notional_usd <= 1000 and max_position_size_pct <= 5
+#   - max_gross_exposure_usd <= 5000, a non-empty allowlist, >= 1 alert channel
+# Going live ALSO requires: TRADER_CONFIRM_LIVE=I_UNDERSTAND (or --confirm-live), a valid
+# Schwab token, the kill switch released, a clean reconcile, and LIVE_ORDER_PATH_READY
+# (flipped only in the reviewed M5.7 change).
+
+mode: live
+
+account:
+  broker: schwab
+  account_ref: primary
+  secrets_ref: keychain           # credentials come from the environment, never this file
+
+schedule:
+  timezone: America/New_York
+  market_calendar: XNYS
+  base_seed: null
+  catch_up: false                 # a missed slot is skipped, never fired late
+  misfire_grace_seconds: 120
+
+strategies:
+  # ONE deterministic, long-only strategy on ONE symbol: buys `lot` shares when flat and
+  # sells exactly that many at the next session's slot (src/trader/strategy/strategies/
+  # canary.py). ONE slot per session, so it never day-trades.
+  # Pick a liquid symbol you do NOT otherwise hold in this account, whose 1-share price is
+  # under max_order_notional_usd AND under max_position_size_pct of the account equity.
+  - id: canary
+    name: canary
+    enabled: true
+    params: { lot: 1 }
+    universe: [SPY]
+    slots:
+      - { id: midday, time: "12:00", drift_max_minutes: 10, drift_direction: forward, distribution: uniform, on_overshoot: clamp }
+
+risk:                             # conservative: well inside the guarded-rollout ceilings
+  max_position_size_pct: 5
+  max_order_notional_usd: 1000
+  max_gross_exposure_usd: 2000
+  daily_loss_limit_pct: 1
+  max_trades_per_day: 2
+  max_staleness_seconds: 30
+  max_spread_pct: 0.5
+  allowlist: [SPY]                # default-deny: must cover the universe above
+  enforce_pdt: true
+  auto_flatten_on_kill: false
+  conflict_policy: net
+
+execution:
+  order_type: market
+  poll_timeout_seconds: 60
+  rate_limit_per_min: 100
+
+alerting:
+  channels: [telegram, email]     # configure at least one in the secrets env file
+  heartbeat_minutes: 15
+
+observability:
+  log_format: json
+  db_path: /state/trader.sqlite
+  data_cache: /data/

@@ -4,43 +4,44 @@ Answers the question the placement layer cannot: did an order whose outcome is u
 actually land? Implements the ``Reconciler`` contract in ``execution.idempotency``. A false
 ABSENT leaves a live order recorded ``not_placed``; a false FOUND attributes someone else's
 order (e.g. a manual trade) to a strategy. Schwab does not echo our ``client_order_id``, so
-the answer rests on the intent AND on when the order was entered:
+the answer rests on the intent and on WHEN each listed order was entered, against two
+windows derived from the row:
 
-- Only an ``unknown`` row is reconciled. Its send happened between the write-ahead
-  (``created_at``) and the unknown mark (``updated_at``, stamped after the send returned),
-  so Schwab's ``enteredTime`` for OUR order lies in that **send window** (± clock skew). An
-  identical order entered at any other time is not ours. (A ``pending`` row — sender died
-  mid-send — has no upper bound yet: INCONCLUSIVE; ``resolve`` re-anchors it.)
-- The listing is requested with a wide margin (± a day, within Schwab's look-back limit) and
-  filtered here on each order's own ``enteredTime`` — never trusting the server's reading of
-  the time bounds. It must include every local order already bound to a broker id inside the
-  send window, or it is treated as incomplete.
-- Both answers wait out the **consistency window** since ``updated_at``: until then our
-  order may simply not be visible, so neither "it's that one" nor "there's none" is safe.
-- **FOUND** only if exactly one unbound listed order could be ours, it is an exact match
-  (canonical symbol, the exact instruction we send, quantity, type, LIMIT price, entered in
-  the send window), and no other unresolved local order with the same intent could own it
-  (its own send window also contains that entry time).
-- **ABSENT** only if no unbound listed order could be ours and no unparseable one might be.
-- Otherwise **INCONCLUSIVE**, with a machine-readable ``code`` (``WINDOW_OPEN`` means "try
-  again later"; the rest need a human or a later listing).
+- the **found window** — when our order could have been in flight: from the write-ahead
+  (``created_at``) to the unknown mark (``updated_at``, stamped after the send returned) but
+  never later than ``created_at + max_send_duration``, ± clock skew. Only an order entered
+  here can be adopted, so an identical order typed in by hand later is not ours;
+- the **doubt window** — anywhere our order could have LANDED: the found window widened by
+  the consistency window on both sides (a lost response can still be processed server-side
+  after we gave up). Any order here that could be ours makes absence unprovable.
 
-"Could be ours" is deliberately loose — every field the listing reports must merely be
-compatible (unknown/empty fields, a short-sale spelling of our side, a price within a tick,
-a top-level or leg quantity equal to ours, ``BRK.B`` vs ``BRK/B``) — so doubt blocks ABSENT
-instead of producing it.
+Rules: only ``unknown`` rows (``pending`` → NOT_SETTLED; ``resolve`` re-anchors them); both
+answers wait out the consistency window since ``updated_at``; the listing is requested with
+a wide margin and filtered locally on each order's own ``enteredTime``; it must include the
+orders we placed in the doubt window, whose entry times also check our clock against the
+broker's. FOUND needs exactly one candidate in the doubt window, inside the found window,
+an exact match (canonical symbol, the exact instruction, quantity, type, LIMIT price, and
+the DAY/NORMAL/SINGLE shape we always send), not a REPLACED original, and no other
+unresolved local order that could own it. ABSENT needs no candidate and no unparseable
+order that might be one. Everything else is INCONCLUSIVE with a machine-readable ``code``
+(``WINDOW_OPEN`` = retry later). An identical order entered by someone else inside the
+found window cannot be told apart from ours — the go-live runbook forbids manual trading in
+the traded symbols for that reason.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from datetime import datetime, timedelta
 from decimal import Decimal
+
+import httpx
 
 from trader.core.enums import OrderType
 from trader.core.protocols import Clock
 from trader.execution.idempotency import UNKNOWN, OrderRecord, ReconcileResult
 from trader.observability.logging import get_logger
+from trader.schwab.errors import SchwabError
 from trader.schwab.orders import SchwabOrderStatus, SchwabTradingClient
 
 # Reason codes on INCONCLUSIVE results.
@@ -49,11 +50,14 @@ NOT_SETTLED = "not_settled"  # not an 'unknown' row (e.g. pending: resolve re-an
 AMBIGUOUS = "ambiguous"  # a listed order might be ours but can't be proven to be
 LISTING_FAILED = "listing_failed"  # the listing errored or may be truncated
 LISTING_INCOMPLETE = "listing_incomplete"  # an order we know of is missing from the listing
+CLOCK_SKEW = "clock_skew"  # our known orders' entry times disagree with our clock
 TOO_OLD = "too_old"  # beyond the broker's listing look-back: resolve manually
 
 LOOKBACK_LIMIT = timedelta(days=59)  # Schwab lists at most ~60 days back [VERIFY]
 LISTING_MARGIN = timedelta(days=1)  # server-side bounds are only a coarse prefilter
 PRICE_TICK = Decimal("0.01")  # a LIMIT price within a tick may be the broker's rounding
+# The order shape we always send (schwab.orders.build_order_json).
+_SENT_DURATION, _SENT_SESSION, _SENT_STRATEGY = "DAY", "NORMAL", "SINGLE"
 
 _log = get_logger("execution.schwab_reconciler")
 
@@ -68,48 +72,75 @@ class SchwabOrderReconciler:
         *,
         clock: Clock,
         bound_broker_ids: Callable[[], Collection[str]],
-        bound_broker_ids_created_between: Callable[[datetime, datetime], Collection[str]],
+        bound_orders_created_between: Callable[[datetime, datetime], Mapping[str, datetime]],
         awaiting_resolution: Callable[[], Collection[OrderRecord]],
         consistency_window: timedelta = timedelta(minutes=5),
         clock_skew: timedelta = timedelta(minutes=2),
+        max_send_duration: timedelta = timedelta(minutes=5),
     ) -> None:
         if consistency_window <= timedelta(0):
             raise ValueError("consistency_window must be positive")
         if clock_skew < timedelta(0):
             raise ValueError("clock_skew must be non-negative")
+        if max_send_duration <= timedelta(0):
+            raise ValueError("max_send_duration must be positive")
         self._client = client
         self._account = account_hash
         self._clock = clock
         self._bound_broker_ids = bound_broker_ids
-        self._bound_created_between = bound_broker_ids_created_between
+        self._bound_created_between = bound_orders_created_between
         self._awaiting_resolution = awaiting_resolution
         self._window = consistency_window
         self._skew = clock_skew
+        self._max_send = max_send_duration
+
+    def found_window(self, record: OrderRecord) -> tuple[datetime, datetime]:
+        """When ``record``'s order could have been in flight (± skew)."""
+        in_flight_until = record.created_at + self._max_send
+        if record.status == UNKNOWN:
+            in_flight_until = min(record.updated_at, in_flight_until)
+        return record.created_at - self._skew, in_flight_until + self._skew
+
+    def doubt_window(self, record: OrderRecord) -> tuple[datetime, datetime]:
+        """Anywhere ``record``'s order could have landed: the found window widened by the
+        consistency window on both sides (and never ending before ``updated_at``)."""
+        lo, hi = self.found_window(record)
+        return lo - self._window, max(hi, record.updated_at + self._skew) + self._window
 
     def __call__(self, record: OrderRecord) -> ReconcileResult:
         if record.status != UNKNOWN:
             return ReconcileResult.inconclusive(
-                f"status {record.status!r} has no send window yet", NOT_SETTLED
+                f"status {record.status!r} has no settled send window yet", NOT_SETTLED
             )
         snapshot = self._clock.now()  # the local time the listing is requested
-        send_lo, send_hi = record.created_at - self._skew, record.updated_at + self._skew
-        if snapshot - send_lo > LOOKBACK_LIMIT:
+        waited = snapshot - record.updated_at
+        if waited < self._window:
+            return ReconcileResult.inconclusive(
+                f"inside the consistency window ({waited.total_seconds():.0f}s elapsed)",
+                WINDOW_OPEN,
+            )
+        found_lo, found_hi = self.found_window(record)
+        doubt_lo, doubt_hi = self.doubt_window(record)
+        if snapshot - doubt_lo > LOOKBACK_LIMIT:
             return ReconcileResult.inconclusive(
                 "the order is older than the broker's listing look-back", TOO_OLD
             )
         try:
             listing = self._client.get_orders(
                 self._account,
-                from_entered=max(send_lo - LISTING_MARGIN, snapshot - LOOKBACK_LIMIT),
-                to_entered=snapshot + LISTING_MARGIN,
+                from_entered=max(doubt_lo - LISTING_MARGIN, snapshot - LOOKBACK_LIMIT),
+                to_entered=doubt_hi + LISTING_MARGIN,
             )
-        except Exception as exc:  # a failed or possibly-truncated listing proves nothing
+        except (SchwabError, httpx.HTTPError, OSError) as exc:  # proves nothing
             return ReconcileResult.inconclusive(
                 f"order listing failed ({type(exc).__name__})", LISTING_FAILED
             )
 
-        listed = {o.order_id for o in listing.orders} | {u.order_id for u in listing.unparsed}
-        missing = set(self._bound_created_between(send_lo, send_hi)) - listed
+        # Self-checks with the orders we know we placed near this one.
+        listed = {o.order_id: o for o in listing.orders}
+        known = self._bound_created_between(doubt_lo, doubt_hi)
+        present = listed.keys() | {u.order_id for u in listing.unparsed}
+        missing = set(known) - present
         if missing:
             _log.error(
                 "order listing is missing orders we placed; not trusting it",
@@ -119,46 +150,54 @@ class SchwabOrderReconciler:
             return ReconcileResult.inconclusive(
                 f"{len(missing)} known order(s) missing from the listing", LISTING_INCOMPLETE
             )
-        waited = snapshot - record.updated_at
-        if waited < self._window:
-            return ReconcileResult.inconclusive(
-                f"inside the consistency window ({waited.total_seconds():.0f}s elapsed)",
-                WINDOW_OPEN,
-            )
+        for broker_order_id, written_at in known.items():
+            entered = listed[broker_order_id].entered_time if broker_order_id in listed else None
+            if entered is not None and not (
+                written_at - self._skew <= entered <= written_at + self._max_send + self._skew
+            ):
+                _log.error("broker entry times disagree with our clock", cid=record.client_order_id)
+                return ReconcileResult.inconclusive(
+                    "a known order's entry time is outside its send window", CLOCK_SKEW
+                )
 
         bound = set(self._bound_broker_ids())
-        candidates = [
+        doubt = [
             o
             for o in listing.orders
             if o.order_id not in bound
             and _could_be(o, record)
-            and _entered_within(o, send_lo, send_hi)
+            and _entered_within(o, doubt_lo, doubt_hi)
         ]
         if any(
-            u.order_id not in bound and _canon(u.symbol) in ("", _canon(record.symbol))
+            u.order_id not in bound
+            and _canon(u.symbol) in ("", _canon(record.symbol))
+            and (u.entered_time is None or doubt_lo <= u.entered_time <= doubt_hi)
             for u in listing.unparsed
         ):
             return ReconcileResult.inconclusive(
                 "an unparseable listed order may be this one", AMBIGUOUS
             )
-        if not candidates:
+        if not doubt:
             return ReconcileResult.absent("no listed order could be this one")
-        if len(candidates) > 1:
+        if len(doubt) > 1:
             return ReconcileResult.inconclusive(
-                f"{len(candidates)} listed orders may be this one", AMBIGUOUS
+                f"{len(doubt)} listed orders may be this one", AMBIGUOUS
             )
-        (only,) = candidates
-        if not _exact_match(only, record, send_lo, send_hi):
+        (only,) = doubt
+        if (
+            not _exact_match(only, record, found_lo, found_hi)
+            or only.raw_status.upper() == "REPLACED"
+        ):
             return ReconcileResult.inconclusive("a similar listed order may be this one", AMBIGUOUS)
         for rival in self._awaiting_resolution():
-            if rival.client_order_id == record.client_order_id or not _same_intent(rival, record):
+            if rival.client_order_id == record.client_order_id or not _could_be(only, rival):
                 continue
-            rival_hi = rival.updated_at if rival.status == UNKNOWN else snapshot
-            if _entered_within(only, rival.created_at - self._skew, rival_hi + self._skew):
+            rival_lo, rival_hi = self.doubt_window(rival)
+            if _entered_within(only, rival_lo, rival_hi):
                 return ReconcileResult.inconclusive(
                     "another unresolved local order may own the matching order", AMBIGUOUS
                 )
-        return ReconcileResult.found(only.order_id, "unique intent match in the send window")
+        return ReconcileResult.found(only.order_id, "unique intent match in the found window")
 
 
 def _canon(symbol: str) -> str:
@@ -171,18 +210,9 @@ def _entered_within(o: SchwabOrderStatus, lo: datetime, hi: datetime) -> bool:
     return o.entered_time is None or lo <= o.entered_time <= hi
 
 
-def _same_intent(a: OrderRecord, b: OrderRecord) -> bool:
-    return (
-        _canon(a.symbol) == _canon(b.symbol)
-        and a.side is b.side
-        and a.quantity == b.quantity
-        and a.order_type is b.order_type
-        and a.limit_price == b.limit_price
-    )
-
-
 def _exact_match(o: SchwabOrderStatus, record: OrderRecord, lo: datetime, hi: datetime) -> bool:
-    """Every field known and equal to the intent, entered inside the send window."""
+    """Every field known and equal to the intent (and to the order shape we always send),
+    entered inside the found window."""
     return (
         _canon(o.symbol) == _canon(record.symbol)
         and o.instruction == record.side.value
@@ -190,6 +220,9 @@ def _exact_match(o: SchwabOrderStatus, record: OrderRecord, lo: datetime, hi: da
         and o.leg_quantity in (0, record.quantity)
         and o.order_type == record.order_type.value
         and (record.order_type is not OrderType.LIMIT or o.price == record.limit_price)
+        and o.duration == record.tif.value == _SENT_DURATION
+        and o.session == _SENT_SESSION
+        and o.strategy_type == _SENT_STRATEGY
         and o.entered_time is not None
         and lo <= o.entered_time <= hi
     )
@@ -216,6 +249,7 @@ def _could_be(o: SchwabOrderStatus, record: OrderRecord) -> bool:
 
 __all__ = [
     "AMBIGUOUS",
+    "CLOCK_SKEW",
     "LISTING_FAILED",
     "LISTING_INCOMPLETE",
     "NOT_SETTLED",

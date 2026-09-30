@@ -141,15 +141,16 @@ class OrderRecord:
 
 # Looks up whether an order for this intent exists at the broker. Contract — ABSENT marks an
 # order not_placed, so a false ABSENT leaves a real order untracked. An implementation must:
-# - list the broker's orders (every status) over [record.created_at - clock skew, snapshot],
-#   the snapshot being the local time the listing was requested;
-# - return FOUND only for a unique match of the intent (symbol, side, quantity, type, limit
-#   price) whose broker id is not already bound to another local order, and only when no
-#   OTHER unresolved local order has the same intent (else it can't tell whose order it is);
-# - return ABSENT only when the listing is complete (not truncated; every unparseable item
-#   provably not a match) AND snapshot - record.updated_at >= a consistency window that
-#   covers the broker's listing lag, server-side processing after a lost response, and clock
-#   skew between us and the broker (a forward jump of the local clock shortens it);
+# - reconcile only an 'unknown' row (its updated_at is stamped after the send returned);
+# - wait until snapshot - record.updated_at >= a consistency window covering the broker's
+#   listing lag and server-side processing after a lost response (the snapshot is the local
+#   time the listing is requested; a forward jump of the local clock shortens it);
+# - return FOUND only when exactly one broker order could be this one, it matches the
+#   intent exactly, was entered while this order could have been in flight, and no other
+#   unresolved local order could own it;
+# - return ABSENT only when the listing is complete and NO broker order that could be this
+#   one was entered anywhere it could have landed (the send window widened by the
+#   consistency window on both sides);
 # - otherwise return INCONCLUSIVE.
 Reconciler = Callable[[OrderRecord], ReconcileResult]
 
@@ -201,15 +202,16 @@ class OrderRepository:
         ).fetchall()
         return {str(r[0]) for r in rows}
 
-    def bound_broker_ids_created_between(self, start: datetime, end: datetime) -> set[str]:
-        """Broker ids of local orders written within [start, end] — the broker's listing of
-        that span must include them (a coverage self-check for reconciliation)."""
+    def bound_orders_created_between(self, start: datetime, end: datetime) -> dict[str, datetime]:
+        """Broker id -> write-ahead time of local orders written within [start, end]. The
+        broker's listing of that span must include them (a coverage self-check) and their
+        entry times calibrate our clock against the broker's."""
         rows = self._conn.execute(
-            "SELECT broker_order_id FROM orders WHERE broker_order_id IS NOT NULL "
+            "SELECT broker_order_id, created_at FROM orders WHERE broker_order_id IS NOT NULL "
             "AND julianday(created_at) >= julianday(?) AND julianday(created_at) <= julianday(?)",
             (_iso(start), _iso(end)),
         ).fetchall()
-        return {str(r[0]) for r in rows}
+        return {str(r[0]): _parse_ts(r[1]) for r in rows}
 
     def awaiting_resolution(self) -> list[OrderRecord]:
         """Rows whose placement outcome is not settled: pending/unknown with no broker id."""

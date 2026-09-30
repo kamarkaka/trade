@@ -389,3 +389,21 @@ def test_leg_quantity_is_parsed_and_lenient_when_polling() -> None:
     assert parse_order_status({**base, "orderLegCollection": bad}).leg_quantity == 0
     with pytest.raises(SchwabBadResponseError, match="leg quantity"):
         parse_order_status({**base, "orderLegCollection": bad}, strict_intent=True)
+
+
+def test_order_shape_fields_and_lenient_unparsed_entry_time() -> None:
+    shaped = parse_order_status(
+        {"orderId": "1", "status": "WORKING", "duration": "day", "session": "normal",
+         "orderStrategyType": "single"}
+    )  # fmt: skip
+    assert (shaped.duration, shaped.session, shaped.strategy_type) == ("DAY", "NORMAL", "SINGLE")
+    listing = parse_order_list(
+        [
+            {"orderId": "7", "quantity": 0.5, "enteredTime": "2026-06-29T14:00:00Z",
+             "orderLegCollection": [{"instrument": {"symbol": "NVDA"}}]},
+            {"orderId": "8", "enteredTime": "garbage"},
+        ]
+    )  # fmt: skip
+    first, second = listing.unparsed
+    assert first.entered_time == datetime(2026, 6, 29, 14, 0, tzinfo=UTC)
+    assert second.entered_time is None  # unparseable time -> unknown (blocks conservatively)

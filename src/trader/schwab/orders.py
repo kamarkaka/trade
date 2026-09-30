@@ -140,6 +140,9 @@ class SchwabOrderStatus:
     order_type: str = ""  # raw Schwab orderType, upper-cased (MARKET, LIMIT…)
     price: Decimal | None = None  # the order's price field (None for MARKET / absent)
     leg_quantity: int = 0  # the first leg's quantity (0 if absent)
+    duration: str = ""  # DAY, GTC… (upper-cased; "" if absent)
+    session: str = ""  # NORMAL, AM, PM, SEAMLESS… (upper-cased; "" if absent)
+    strategy_type: str = ""  # orderStrategyType: SINGLE, OCO, TRIGGER… ("" if absent)
 
 
 def _first_leg(data: Any) -> dict[str, Any] | None:
@@ -249,6 +252,9 @@ def parse_order_status(data: Any, *, strict_intent: bool = False) -> SchwabOrder
         order_type=order_type,
         price=price,
         leg_quantity=leg_quantity,
+        duration=str(data.get("duration") or "").upper(),
+        session=str(data.get("session") or "").upper(),
+        strategy_type=str(data.get("orderStrategyType") or "").upper(),
     )
 
 
@@ -261,12 +267,20 @@ class SchwabUnparsedOrder:
     order_id: str  # "" if absent
     symbol: str  # best effort from the first leg ("" if unknown)
     error: str
+    entered_time: datetime | None = None  # best effort (None if absent or unparseable)
 
 
 @dataclass(frozen=True)
 class OrderListing:
     orders: tuple[SchwabOrderStatus, ...]
     unparsed: tuple[SchwabUnparsedOrder, ...] = ()
+
+
+def _lenient_entered(item: Any) -> datetime | None:
+    try:
+        return _entered_time_of(item)
+    except SchwabBadResponseError:
+        return None
 
 
 def parse_order_list(data: Any) -> OrderListing:
@@ -282,7 +296,9 @@ def parse_order_list(data: Any) -> OrderListing:
             orders.append(parse_order_status(item, strict_intent=True))
         except (SchwabBadResponseError, AttributeError, TypeError) as exc:
             order_id = str(item.get("orderId", "")) if isinstance(item, dict) else ""
-            unparsed.append(SchwabUnparsedOrder(order_id, _symbol_of(item), str(exc)))
+            unparsed.append(
+                SchwabUnparsedOrder(order_id, _symbol_of(item), str(exc), _lenient_entered(item))
+            )
     return OrderListing(tuple(orders), tuple(unparsed))
 
 

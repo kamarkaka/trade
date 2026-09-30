@@ -1,8 +1,13 @@
 """Strategy registry + built-in strategies. Importing this package registers the
-built-ins (threshold, zscore_revert, template) into ``REGISTRY``."""
+built-ins (threshold, zscore_revert, template, canary) into ``REGISTRY``."""
 
 from .bindings import load_bindings
 from .registry import REGISTRY, StrategyRegistry
-from .strategies import template, threshold, zscore_revert  # noqa: F401 - register on import
+from .strategies import (  # noqa: F401 - register on import
+    canary,
+    template,
+    threshold,
+    zscore_revert,
+)
 
 __all__ = ["REGISTRY", "StrategyRegistry", "load_bindings"]

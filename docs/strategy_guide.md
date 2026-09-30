@@ -73,8 +73,8 @@ from trader.strategy.registry import REGISTRY
 class MyStrategy: ...
 ```
 
-Then import the module in `src/trader/strategy/__init__.py` (next to `template`,
-`threshold`, `zscore_revert`) so the decorator runs on package import.
+Then import the module in `src/trader/strategy/__init__.py` (next to `canary`,
+`template`, `threshold`, `zscore_revert`) so the decorator runs on package import.
 
 ## 6. Wire a config binding
 

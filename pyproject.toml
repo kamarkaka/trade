@@ -40,7 +40,7 @@ dev = [
   "pytest>=9.1.1",
   "pytest-cov>=7.1.0",
   "pre-commit>=4.6.0",
-  "types-PyYAML>=6",  # mypy stubs for pyyaml
+  "types-PyYAML>=6.0.12.20260906",  # mypy stubs for pyyaml
   "respx>=0.23.1",  # httpx mocking for Schwab contract tests (M1.4)
 ]
 

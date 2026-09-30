@@ -2,7 +2,9 @@
 
 WAL mode lets the future read-only web reader (M7) read concurrently with the
 daemon writer; ``busy_timeout`` absorbs brief write contention; foreign keys are
-enforced. Connections run in **autocommit** mode (``isolation_level=None``) so
+enforced. ``synchronous=FULL`` makes every commit durable before it returns: the order
+write-ahead row must survive a power loss once the order has been sent (WAL's default
+NORMAL may lose the last commits). Connections run in **autocommit** mode (``isolation_level=None``) so
 transactions are controlled explicitly (e.g. the migration runner) rather than by
 sqlite3's implicit management. Money is stored as TEXT (Decimal string) by callers
 to avoid binary floats.
@@ -15,7 +17,8 @@ from pathlib import Path
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    """Open a read/write connection with WAL, a busy timeout, and FK enforcement.
+    """Open a read/write connection with WAL, durable commits, a busy timeout, and FK
+    enforcement.
 
     ``check_same_thread=False`` so the connection (created on the main thread) is usable
     from the scheduler's worker thread (M3.11). Concurrent use is avoided by design — the
@@ -27,6 +30,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
     )  # autocommit; explicit BEGIN/COMMIT
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")  # a commit is on disk before it returns
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

@@ -37,7 +37,7 @@ trader research sweep --strategy zscore_revert --grid lookback=10,20 --data /dat
 trader run                                      # paper daemon: live quotes, simulated fills
 trader run --once                               # fire each slot once and exit
 trader kill --on --reason "why"                 # halt all new orders (persisted); --off releases
-trader reconcile -c config/live.yaml            # live: settle open orders, true positions
+trader reconcile -c config/live.yaml            # live: settle open orders, check positions
 ```
 
 `backtest` and `research` are fully offline and read only the local data cache. `run` in paper mode uses live Schwab quotes with simulated fills — no real orders. Going live starts from [`config/live.example.yaml`](config/live.example.yaml) and follows [`docs/runbooks/go-live.md`](docs/runbooks/go-live.md).

@@ -63,12 +63,19 @@ def test_resource_limits_enforced_under_compose_up(service: dict[str, Any]) -> N
     assert service["mem_limit"] and service["cpus"]
 
 
-def test_mounted_config_writes_land_on_named_volumes() -> None:
-    # The durability invariant: the MOUNTED config must point db_path under /state and
-    # data_cache under /data, else the named volumes are mounted but unused (state lost on
-    # recreate). The compose binds config/default.yaml -> /config/trader.yaml.
+def test_config_mount_defaults_to_the_paper_config(service: dict[str, Any]) -> None:
+    # TRADER_CONFIG_FILE (shell) selects the mounted file; unset => the paper default.
+    mounts = [m for m in service["volumes"] if ":/config/trader.yaml" in m]
+    assert mounts == ["${TRADER_CONFIG_FILE:-../config/default.yaml}:/config/trader.yaml:ro"]
+
+
+@pytest.mark.parametrize("config_name", ["default.yaml", "live.example.yaml"])
+def test_mounted_config_writes_land_on_named_volumes(config_name: str) -> None:
+    # The durability invariant: any config meant to be MOUNTED must point db_path under
+    # /state and data_cache under /data, else the named volumes are mounted but unused
+    # (state lost on recreate).
     cfg = yaml.safe_load(
-        (COMPOSE_PATH.parents[1] / "config" / "default.yaml").read_text(encoding="utf-8")
+        (COMPOSE_PATH.parents[1] / "config" / config_name).read_text(encoding="utf-8")
     )
     obs = cfg["observability"]
     assert obs["db_path"].startswith("/state"), obs["db_path"]

@@ -2,14 +2,15 @@
 
 **Goal.** Run the whole system in paper mode against **live Schwab quotes** with **simulated
 fills (SimBroker)** for ≥3 market days, exercising the scheduler/jitter/calendar, risk gate,
-attribution, durable audit, alerting, heartbeat/healthcheck, state durability, and the weekly
-re-auth — with **zero real orders**. This is the gate that clears the system for guarded live
-trading (M5).
+the durable order path (write-ahead order rows, bounded polling, atomic completion into
+`orders`/`fills` + attribution), the daily counters, the kill switch, durable audit, alerting,
+heartbeat/healthcheck, state durability, and the weekly re-auth — with **zero real orders**.
+This is the gate that clears the system for guarded live trading ([go-live.md](go-live.md)).
 
-> Safety: paper mode uses `SimBroker` only. The daemon **refuses `mode: live`** until M5, and
-> there is no real-order code path before M5 (CI tripwire `test_no_real_order_path_pre_m5`).
-> The kill switch and the `reconcile`/`kill` CLI commands land in M5 — this soak validates
-> everything that exists in M4.
+> Safety: paper mode uses `SimBroker` only. Live trading needs `mode: live`, a second
+> confirmation, a guarded preflight and the `LIVE_ORDER_PATH_READY` lock (off in the
+> repository). The paper daemon runs the **same** execution path as live — only the broker
+> differs — so this soak exercises it. `trader reconcile` applies to live accounts only.
 
 ---
 
@@ -104,6 +105,25 @@ You should see `order_pending`/`fill` for trades the strategies decide to make, 
 `rejected` rows (with the reason in `payload`) for anything the risk gate blocks. **No real
 order is ever sent** — fills come from SimBroker.
 
+### Orders, fills and daily counters
+Every approved order gets a durable `orders` row (written before the send) that ends in a
+terminal status, with a `fills` row when anything filled; `daily_counters` tracks the
+session's start-of-day equity, trades and loss (paper counters are per process, since
+SimBroker restarts flat). The web UI shows the same data.
+
+```sh
+docker compose exec trader python - <<'PY'
+import sqlite3
+c = sqlite3.connect("file:/state/trader.sqlite?mode=ro", uri=True)
+for r in c.execute("SELECT created_at, strategy_id, symbol, side, quantity, status FROM orders ORDER BY created_at DESC LIMIT 20"):
+    print(r)
+for r in c.execute("SELECT * FROM daily_counters ORDER BY trading_date DESC, updated_at DESC LIMIT 3"):
+    print(tuple(r))
+PY
+```
+A paper order never stays `WORKING`: a resting limit order is cancelled at once (SimBroker
+can't fill it later), so expect `CANCELED` rows for limits that didn't cross.
+
 ### Alerts
 Confirm the configured channels actually deliver (send yourself a known event, e.g. by inducing
 a skipped slot below). A `skipped_slot` (WARNING) fires on non-session days; `crash` (CRITICAL)
@@ -146,7 +166,12 @@ on a cycle exception.
    errors + a `crash` alert each cycle — same net effect, not formal safe mode.) Recover via
    [weekly-reauth.md](weekly-reauth.md).
 
-5. **Liveness (healthcheck).** The dedicated heartbeat executor keeps liveness independent of
+5. **Kill switch.** `docker compose exec trader trader kill --on --reason soak-drill`, wait for
+   the next slot, and confirm an `audit_log` row `kill_switch_halt` and no new orders; then
+   `trader kill --off`. The switch also engages itself on a daily-loss breach (once per
+   session) and on an order of uncertain fate.
+
+6. **Liveness (healthcheck).** The dedicated heartbeat executor keeps liveness independent of
    cycle work, so a healthy-but-busy daemon stays `healthy`. Note the restart semantics:
    `restart: unless-stopped` restarts the container only when the process **exits** — a hung
    but still-running container is surfaced as `unhealthy` by the healthcheck (and via alerts)
@@ -160,15 +185,17 @@ on a cycle exception.
 - [ ] Triggers fire once per session on schedule **with drift**; no slot fires twice.
 - [ ] `audit_log` accumulates correlated chains; `rejected` rows carry a reason.
 - [ ] Heartbeat stays fresh; `status --healthcheck` is 0 while running; container is `healthy`.
-- [ ] **Zero real orders** — only SimBroker fills; no `SchwabBroker`/order endpoint exists.
+- [ ] **Zero real orders** — only SimBroker fills (`mode: paper`).
+- [ ] Every approved order ends in a terminal `orders` row; fills and attribution tie out.
+- [ ] The kill switch halts the next slot and releases cleanly.
 - [ ] State (audit, ledger, token age) **survives** a mid-soak `compose down && up -d` and an
       abrupt `docker kill` + restart.
 - [ ] Alerts deliver on at least one channel; a skipped slot / cycle error is never silent.
 - [ ] The re-auth reminder fires ahead of refresh-token expiry; weekly re-auth works.
 
 Record results (dates, anomalies, alert screenshots) in the soak log. When every box is checked,
-the system is cleared to begin **guarded** live trading (M5), which still requires a separate
-double-confirm and starts at the smallest size.
+the system is cleared to begin **guarded** live trading ([go-live.md](go-live.md)), which still
+requires a separate double-confirm and starts at the smallest size.
 
 ---
 
